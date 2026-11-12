@@ -20,6 +20,8 @@ import { Response } from 'express';
 import * as fs from 'fs';
 import * as path from 'path';
 import { MemeEngineService } from '../services/meme-engine.service';
+import { ViralMemeAnalyzerService } from '../services/viral-meme-analyzer.service';
+import { SubjectDiscoveryService } from '../services/subject-discovery.service';
 import { GenerateMemeDto } from '../dto/generate-meme.dto';
 import { UploadedAsset } from '../types/meme.types';
 
@@ -52,7 +54,11 @@ const multerStorage = diskStorage({
 
 @Controller('api/memes')
 export class MemeController {
-  constructor(private readonly memeEngine: MemeEngineService) {}
+  constructor(
+    private readonly memeEngine: MemeEngineService,
+    private readonly viralAnalyzer: ViralMemeAnalyzerService,
+    private readonly subjectDiscovery: SubjectDiscoveryService
+  ) {}
 
   /**
    * List all memes with optional search, category filter and sorting
@@ -248,6 +254,141 @@ export class MemeController {
       design,
       layout
     });
+  }
+
+  /**
+   * Viral Meme Adaptation:
+   * Only three user inputs required:
+   * 1. Viral Meme Reference Screenshot
+   * 2. Meme Reacting Image
+   * 3. Exact Reacting Image Punchline Text
+   *
+   * AI is strictly used for reference structure & subject identification.
+   * Normal backend logic matches existing high-res subject assets and renders via deterministic Canvas Engine.
+   */
+  @Post('adapt-viral')
+  @UseInterceptors(
+    FileFieldsInterceptor(
+      [
+        { name: 'referenceImage', maxCount: 1 },
+        { name: 'reactionImage', maxCount: 1 },
+      ],
+      {
+        storage: multerStorage,
+        limits: { fileSize: 25 * 1024 * 1024 },
+      }
+    )
+  )
+  async adaptViralMeme(
+    @UploadedFiles()
+    files: {
+      referenceImage?: MulterUploadedFile[];
+      reactionImage?: MulterUploadedFile[];
+    },
+    @Body('punchline') punchline?: string,
+    @Body('reactionContext') reactionContext?: string,
+    @Body('fontFamily') preferredFont?: string
+  ) {
+    if (!files?.referenceImage || files.referenceImage.length === 0) {
+      throw new BadRequestException('Input 1 missing: Viral Meme Reference screenshot is required.');
+    }
+    if (!files?.reactionImage || files.reactionImage.length === 0) {
+      throw new BadRequestException('Input 2 missing: Meme Reacting Image is required.');
+    }
+    if (!punchline || !punchline.trim()) {
+      throw new BadRequestException('Input 3 missing: Reacting Image Text (punchline) is required.');
+    }
+
+    const refFile = files.referenceImage[0];
+    const rxFile = files.reactionImage[0];
+
+    // 1. AI Vision Analysis (Identifies layout archetype, subject entities, and overlays)
+    const analysis = await this.viralAnalyzer.analyzeViralReference(refFile.path);
+
+    // 2. Normal Backend Subject Discovery (Matches existing high-res subject assets)
+    const subjectAssets = await this.subjectDiscovery.matchSubjectsToAssets(
+      analysis.subjects,
+      analysis.subjectCount
+    );
+
+    // 3. User's Uploaded Reaction Image (Used exactly as supplied without modification)
+    const reactionAsset: UploadedAsset = {
+      id: randomUUID(),
+      originalName: rxFile.originalname,
+      filename: rxFile.filename,
+      path: rxFile.path,
+      mimeType: rxFile.mimetype,
+      role: 'reaction_punchline',
+      orderIndex: 99
+    };
+
+    // 4. Content Assembly (Exact user punchline preserved verbatim)
+    const content = {
+      topic: `Viral Adaptation: ${analysis.headline || analysis.subjects.join(' & ')}`,
+      headline: analysis.headline,
+      bulletPoints: analysis.bulletPoints,
+      statement: analysis.statement,
+      reactionContext: reactionContext?.trim() || analysis.referenceReactionContext || undefined,
+      punchline: punchline.trim(), // Exact user text preserved
+      itemLabels: analysis.itemLabels
+    };
+
+    // 5. Design Specifications (Existing preferred font & styling settings)
+    const design = {
+      fontFamily: (preferredFont as any) || 'Arial Black',
+      teluguFontFamily: 'Ramabhadra' as const,
+      canvasPreset: 'portrait_4_5' as const,
+      width: 1080,
+      height: 1350,
+      primaryTextColor: '#FFE500',
+      secondaryTextColor: '#FFFFFF',
+      headerBgColor: '#000000',
+      headerTextColor: '#FFE500',
+      outlineColor: '#000000',
+      outlineThickness: 8,
+      shadowColor: 'rgba(0,0,0,0.95)',
+      shadowBlur: 8,
+      shadowOffsetX: 3,
+      shadowOffsetY: 3,
+      fontSizeScale: 1.0
+    };
+
+    // 6. Layout Configuration
+    const layout = {
+      memeType: analysis.memeType,
+      arrangement: analysis.arrangement,
+      canvasPreset: 'portrait_4_5' as const,
+      hasHeader: Boolean(analysis.headline),
+      hasStatement: Boolean(analysis.statement),
+      hasBulletPoints: Boolean(analysis.bulletPoints && analysis.bulletPoints.length > 0),
+      hasReactionContext: Boolean(reactionContext || analysis.referenceReactionContext),
+      hasPunchline: true
+    };
+
+    // 7. Deterministic Canvas Engine Generation
+    const result = await this.memeEngine.generateMeme({
+      content,
+      assets: {
+        subjectImages: subjectAssets,
+        reactionImage: reactionAsset
+      },
+      design,
+      layout
+    });
+
+    return {
+      ...result,
+      adaptationMetadata: {
+        referenceImageFilename: refFile.filename,
+        detectedMemeType: analysis.memeType,
+        detectedArrangement: analysis.arrangement,
+        identifiedSubjects: analysis.subjects,
+        matchedSubjectAssets: subjectAssets.map(s => ({
+          originalName: s.originalName,
+          label: s.label
+        }))
+      }
+    };
   }
 
   /**
