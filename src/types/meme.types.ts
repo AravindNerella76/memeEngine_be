@@ -64,6 +64,9 @@ export interface UploadedAsset {
   role: SectionRole;               // Explicit section mapping ('subject_primary', 'reaction_punchline', etc.)
   orderIndex: number;              // Position in sequence (0, 1, 2, ...)
   label?: string;                  // Content label bound directly to this asset
+  sourceUrl?: string;              // Internet source URL
+  attribution?: string;            // Photographer / Creator attribution
+  license?: string;                // Creative Commons or Public Domain license
 }
 
 export interface MemeAssets {

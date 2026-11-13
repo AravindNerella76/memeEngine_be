@@ -22,6 +22,7 @@ import * as path from 'path';
 import { MemeEngineService } from '../services/meme-engine.service';
 import { ViralMemeAnalyzerService } from '../services/viral-meme-analyzer.service';
 import { SubjectDiscoveryService } from '../services/subject-discovery.service';
+import { InternetSubjectDiscoveryService } from '../services/internet-subject-discovery.service';
 import { GenerateMemeDto } from '../dto/generate-meme.dto';
 import { UploadedAsset } from '../types/meme.types';
 
@@ -57,7 +58,8 @@ export class MemeController {
   constructor(
     private readonly memeEngine: MemeEngineService,
     private readonly viralAnalyzer: ViralMemeAnalyzerService,
-    private readonly subjectDiscovery: SubjectDiscoveryService
+    private readonly subjectDiscovery: SubjectDiscoveryService,
+    private readonly internetSubjectDiscovery: InternetSubjectDiscoveryService
   ) {}
 
   /**
@@ -305,10 +307,12 @@ export class MemeController {
     // 1. AI Vision Analysis (Identifies layout archetype, subject entities, and overlays)
     const analysis = await this.viralAnalyzer.analyzeViralReference(refFile.path);
 
-    // 2. Normal Backend Subject Discovery (Matches existing high-res subject assets)
-    const subjectAssets = await this.subjectDiscovery.matchSubjectsToAssets(
+    // 2. EXCLUSIVE Internet Image Discovery (No MongoDB or local subject library lookups)
+    const subjectAssets = await this.internetSubjectDiscovery.discoverSubjectImages(
       analysis.subjects,
-      analysis.subjectCount
+      analysis.subjectCount,
+      analysis.headline || analysis.statement,
+      analysis.itemLabels
     );
 
     // 3. User's Uploaded Reaction Image (Used exactly as supplied without modification)
@@ -376,16 +380,24 @@ export class MemeController {
       layout
     });
 
+    const plainResult = (typeof (result as any)?.toObject === 'function')
+      ? (result as any).toObject()
+      : result;
+
     return {
-      ...result,
+      ...plainResult,
       adaptationMetadata: {
         referenceImageFilename: refFile.filename,
         detectedMemeType: analysis.memeType,
         detectedArrangement: analysis.arrangement,
         identifiedSubjects: analysis.subjects,
+        discoverySource: 'internet_only',
         matchedSubjectAssets: subjectAssets.map(s => ({
           originalName: s.originalName,
-          label: s.label
+          label: s.label,
+          sourceUrl: s.sourceUrl,
+          license: s.license,
+          attribution: s.attribution
         }))
       }
     };

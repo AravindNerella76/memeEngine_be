@@ -8,6 +8,7 @@ import { MemeEngineService } from './services/meme-engine.service';
 import { RegenerationService } from './services/regeneration.service';
 import { ViralMemeAnalyzerService } from './services/viral-meme-analyzer.service';
 import { SubjectDiscoveryService } from './services/subject-discovery.service';
+import { InternetSubjectDiscoveryService } from './services/internet-subject-discovery.service';
 import { Meme, MemeSchema } from './schemas/meme.schema';
 
 @Module({
@@ -26,7 +27,8 @@ import { Meme, MemeSchema } from './schemas/meme.schema';
     MemeEngineService,
     RegenerationService,
     ViralMemeAnalyzerService,
-    SubjectDiscoveryService
+    SubjectDiscoveryService,
+    InternetSubjectDiscoveryService
   ],
 })
 export class AppModule {}

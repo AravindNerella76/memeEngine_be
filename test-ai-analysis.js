@@ -48,3 +48,4 @@ execFile(agyPath, ['--dangerously-skip-permissions', '--print', prompt], { timeo
     console.error('Failed to parse JSON:', parseErr.message);
   }
 });
+

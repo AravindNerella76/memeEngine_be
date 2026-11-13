@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "memeType": {
+      "type": "string",
+      "enum": ["movie_update", "facts_collage", "comparison", "trending_news", "custom"]
+    },
+    "arrangement": {
+      "type": "string",
+      "enum": ["side_by_side", "columns_3", "columns_4", "grid_2x2", "stacked_rows", "single_hero"]
+    },
+    "subjectCount": {
+      "type": "integer"
+    },
+    "subjects": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "headline": {
+      "type": ["string", "null"]
+    },
+    "bulletPoints": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "statement": {
+      "type": ["string", "null"]
+    },
+    "itemLabels": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "referenceReactionContext": {
+      "type": ["string", "null"]
+    }
+  },
+  "required": ["memeType", "arrangement", "subjectCount", "subjects"]
+}
+

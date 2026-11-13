@@ -76,6 +76,15 @@ export class UploadedAssetSchema {
 
   @Prop()
   label?: string;
+
+  @Prop()
+  sourceUrl?: string;
+
+  @Prop()
+  attribution?: string;
+
+  @Prop()
+  license?: string;
 }
 
 @Schema({ _id: false })

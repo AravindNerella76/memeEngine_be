@@ -45,8 +45,10 @@ export class SubjectDiscoveryService {
     const selectedAssets: UploadedAsset[] = [];
     const usedPaths = new Set<string>();
 
-    for (let i = 0; i < Math.max(identifiedSubjects.length, targetCount); i++) {
-      const subjectName = identifiedSubjects[i] || identifiedSubjects[0];
+    const countToMatch = Math.max(1, targetCount || identifiedSubjects.length);
+
+    for (let i = 0; i < countToMatch; i++) {
+      const subjectName = identifiedSubjects[i] || identifiedSubjects[identifiedSubjects.length - 1];
       const match = this.findBestMatchingAsset(subjectName, libraryAssets, usedPaths);
 
       if (!match) {
@@ -125,8 +127,8 @@ export class SubjectDiscoveryService {
         { file: 'movie_subject2.jpg', name: 'Pawan Kalyan', topic: 'OG Censor Report / Pawan Kalyan', label: 'OG Poster 2' },
         { file: 'stacked_row1.jpg', name: 'Thalapathy Vijay', topic: 'Thalapathy Vijay Crowd Comparison', label: 'THALAPATHY AT THE AGE 50' },
         { file: 'stacked_row2.jpg', name: 'Jr NTR', topic: 'Jr NTR Simhadri Crowd Comparison', label: 'NTR AT AGE OF 19' },
-        { file: 'compare_col1.jpg', name: 'YS Jagan Mohan Reddy', topic: 'Chief Ministers Net Worth', label: '931 CRORES' },
-        { file: 'compare_col2.jpg', name: 'Pema Khandu', topic: 'Chief Ministers Net Worth', label: '30 CRORES' },
+        { file: 'compare_col1.jpg', name: 'N. Chandrababu Naidu', topic: 'Chief Ministers Net Worth', label: '931 CRORES' },
+        { file: 'compare_col2.jpg', name: 'A. Revanth Reddy', topic: 'Chief Ministers Net Worth', label: '30 CRORES' },
         { file: 'compare_col3.jpg', name: 'Mamata Banerjee', topic: 'Chief Ministers Net Worth', label: '15 LAKHS' },
         { file: 'news_subject1.jpg', name: 'Producer Anil Sunkara', topic: 'Producer Anil Sunkara Statement', label: 'Anil Sunkara' },
         { file: 'news_subject2.jpg', name: 'Akhil Akkineni', topic: 'Producer Anil Sunkara Statement', label: 'Akhil Akkineni' },
@@ -208,8 +210,15 @@ export class SubjectDiscoveryService {
           (cSubject.includes('vishnu') || cTopic.includes('vishnu'))) {
         score += 35;
       }
-      if ((q.includes('jagan') || q.includes('chief minister') || q.includes('cm')) &&
-          (cSubject.includes('jagan') || cTopic.includes('chief minister'))) {
+      if ((q.includes('chandrababu') || q.includes('naidu') || q.includes('cbn') || q.includes('jagan')) &&
+          (cSubject.includes('naidu') || cSubject.includes('jagan') || cTopic.includes('chief minister'))) {
+        score += 35;
+      }
+      if ((q.includes('revanth') || q.includes('khandu') || q.includes('reddy')) &&
+          (cSubject.includes('revanth') || cSubject.includes('khandu') || cTopic.includes('chief minister'))) {
+        score += 35;
+      }
+      if (q.includes('mamata') && (cSubject.includes('mamata') || cTopic.includes('chief minister'))) {
         score += 35;
       }
       if (q.includes('sunkara') && (cSubject.includes('sunkara') || cTopic.includes('sunkara'))) {
@@ -238,6 +247,8 @@ export class SubjectDiscoveryService {
     if (t.includes('pawan') || t.includes('og')) return 'Pawan Kalyan';
     if (t.includes('thalapathy') || t.includes('vijay')) return 'Thalapathy Vijay';
     if (t.includes('ntr') || t.includes('simhadri')) return 'Jr NTR';
+    if (t.includes('chandrababu') || t.includes('naidu') || t.includes('cbn')) return 'N. Chandrababu Naidu';
+    if (t.includes('revanth')) return 'A. Revanth Reddy';
     if (t.includes('jagan')) return 'YS Jagan Mohan Reddy';
     if (t.includes('khandu')) return 'Pema Khandu';
     if (t.includes('mamata')) return 'Mamata Banerjee';
