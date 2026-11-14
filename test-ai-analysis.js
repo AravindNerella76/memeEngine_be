@@ -1,7 +1,25 @@
 const { execFile } = require('child_process');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
-const agyPath = 'C:\\Users\\hp\\.gemini\\bin\\agy.exe';
+function resolveAgyPath() {
+  if (process.env.AGY_PATH && fs.existsSync(process.env.AGY_PATH)) {
+    return process.env.AGY_PATH;
+  }
+  const binaryName = process.platform === 'win32' ? 'agy.exe' : 'agy';
+  const homePath = path.join(os.homedir(), '.gemini', 'bin', binaryName);
+  if (fs.existsSync(homePath)) return homePath;
+  if (process.env.USERPROFILE) {
+    const profilePath = path.join(process.env.USERPROFILE, '.gemini', 'bin', binaryName);
+    if (fs.existsSync(profilePath)) return profilePath;
+  }
+  const legacyHpPath = 'C:\\Users\\hp\\.gemini\\bin\\agy.exe';
+  if (fs.existsSync(legacyHpPath)) return legacyHpPath;
+  return homePath;
+}
+
+const agyPath = resolveAgyPath();
 const testImagePath = 'D:/memes/portfolio/samples/WhatsApp Image 2026-11-12 at 9.23.53 PM.jpeg';
 
 const prompt = `Analyze this viral meme reference screenshot at: ${testImagePath}

@@ -81,10 +81,46 @@ export class UploadedAssetSchema {
   sourceUrl?: string;
 
   @Prop()
+  sourcePage?: string;
+
+  @Prop()
+  sha256?: string;
+
+  @Prop()
+  focalX?: number;
+
+  @Prop()
+  focalY?: number;
+
+  @Prop()
   attribution?: string;
 
   @Prop()
   license?: string;
+
+  /** Search provider that found an internet-discovered image. */
+  @Prop()
+  provider?: string;
+
+  /** Rights record (classification, label, basis, whether the source link could be stored). */
+  @Prop({ type: Object })
+  rights?: Record<string, unknown>;
+
+  /** same_picture | same_scene | different | unknown (relation to the reference picture). */
+  @Prop()
+  referenceMatch?: string;
+
+  /** ai_discovery | online_search | user_upload */
+  @Prop()
+  sourceType?: string;
+
+  /** ai | user */
+  @Prop()
+  selectedBy?: string;
+
+  /** True only when the AI visually verified the picture. */
+  @Prop()
+  aiVerified?: boolean;
 }
 
 @Schema({ _id: false })
@@ -146,11 +182,19 @@ export class DesignSpecificationsSchema {
   @Prop({ default: 1.0 })
   fontSizeScale: number;
 
+  /** Per-element text multipliers: { headline, statement, bullets, labels, reactionContext, punchline } */
+  @Prop({ type: Object })
+  textScales?: Record<string, number>;
+
   @Prop({ default: 'center' })
   textAlignment: TextAlignment;
 
   @Prop()
   customInstructions?: string;
+
+  /** Settings snapshot taken at generation (absent on older memes). */
+  @Prop({ type: Object })
+  style?: Record<string, unknown>;
 }
 
 @Schema({ _id: false })
@@ -178,6 +222,10 @@ export class LayoutConfigurationSchema {
 
   @Prop({ default: 3 })
   gapSize: number;
+
+  /** Relative row heights / slot widths for custom_grid and unequal layouts */
+  @Prop({ type: Object })
+  grid?: { rows: { heightWeight: number; slots: { widthWeight: number }[] }[] };
 }
 
 @Schema({ _id: false })
@@ -205,6 +253,26 @@ export class MemeVersionRecordSchema {
 
   @Prop({ type: Object, required: true })
   outputUrls: { png: string; jpeg: string };
+
+  /** Structured changes applied by this version's instruction */
+  @Prop({ type: [String], default: [] })
+  appliedChanges?: string[];
+
+  /** 'ai' | 'keyword' | 'initial' */
+  @Prop()
+  interpreter?: string;
+
+  /** Snapshot of the images used by this version (so restoring brings back replaced images) */
+  @Prop({ type: Object })
+  assets?: Record<string, unknown>;
+
+  /** Images replaced by this version (previous and replacement, source, rights, slot, time) */
+  @Prop({ type: [Object], default: [] })
+  imageChanges?: Record<string, unknown>[];
+
+  /** Direct Instagram publishing record for this specific version */
+  @Prop({ type: Object })
+  instagramPublish?: Record<string, unknown>;
 }
 
 @Schema({ timestamps: true })
@@ -235,6 +303,22 @@ export class Meme {
 
   @Prop({ type: [MemeVersionRecordSchema], default: [] })
   versions: MemeVersionRecordSchema[];
+
+  /** 'manual' | 'viral_adaptation_v2' | 'reference_sample' */
+  @Prop()
+  pipeline?: string;
+
+  /** Private copy of the viral reference screenshot (never served publicly) */
+  @Prop({ type: UploadedAssetSchema })
+  referenceImage?: UploadedAssetSchema;
+
+  /** Explainability record of the viral pipeline: analysis, identities, queries, candidates, decisions */
+  @Prop({ type: Object })
+  generationReport?: Record<string, any>;
+
+  /** Direct Instagram publishing record */
+  @Prop({ type: Object })
+  instagramPublish?: Record<string, any>;
 }
 
 export const MemeSchema = SchemaFactory.createForClass(Meme);

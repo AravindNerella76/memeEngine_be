@@ -32,3 +32,6 @@ Thumbs.db
 .vscode/
 .idea/
 
+
+# Vision CLI sandbox workspaces (per-run, auto-cleaned)
+.vision/

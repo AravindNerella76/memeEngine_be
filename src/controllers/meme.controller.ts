@@ -10,7 +10,8 @@ import {
   NotFoundException,
   UseInterceptors,
   UploadedFiles,
-  Res
+  Res,
+  HttpCode
 } from '@nestjs/common';
 import { FileFieldsInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
@@ -20,13 +21,35 @@ import { Response } from 'express';
 import * as fs from 'fs';
 import * as path from 'path';
 import { MemeEngineService } from '../services/meme-engine.service';
-import { ViralMemeAnalyzerService } from '../services/viral-meme-analyzer.service';
-import { SubjectDiscoveryService } from '../services/subject-discovery.service';
-import { InternetSubjectDiscoveryService } from '../services/internet-subject-discovery.service';
-import { GenerateMemeDto } from '../dto/generate-meme.dto';
+import { ViralAdaptationService } from '../services/viral-adaptation.service';
 import { UploadedAsset } from '../types/meme.types';
+import { getConfig } from '../config/app-config';
+import {
+  OUTPUT_ROOT,
+  UPLOADS_ROOT,
+  resolveApprovedFile,
+  safeDeleteFile,
+  sanitizeDisplayName
+} from '../security/path-guard';
+import {
+  ACCEPTED_EXTS_BY_TYPE,
+  EXT_BY_TYPE,
+  ImageValidationError,
+  MAX_UPLOAD_BYTES,
+  verifyImageFile
+} from '../security/image-verify';
+import {
+  MemeIdPipe,
+  parseVersionNumber,
+  validateGenerateBody,
+  validateInstruction,
+  validateListQuery,
+  validateUploadPayload,
+  validateViralFields,
+  validateViralOverrides
+} from '../security/request-validation';
 
-interface MulterUploadedFile {
+export interface MulterUploadedFile {
   fieldname: string;
   originalname: string;
   encoding: string;
@@ -38,55 +61,145 @@ interface MulterUploadedFile {
   buffer?: Buffer;
 }
 
-const uploadsDir = path.join(__dirname, '..', '..', 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+if (!fs.existsSync(UPLOADS_ROOT)) {
+  fs.mkdirSync(UPLOADS_ROOT, { recursive: true });
 }
+
+// Uploads: first gate (cheap) on declared extension + MIME type. The real gate is the content
+// check in verifyAndNormalizeUploads(); a declared type is never trusted on its own.
+// .jfif / .jpe are real-world JPEG extensions (Windows saves .jfif); the content check decides what is truly an image
+const ALLOWED_UPLOAD_EXTS = new Set(['.jpg', '.jpeg', '.jfif', '.jpe', '.png', '.webp']);
+const ALLOWED_UPLOAD_MIMES = new Set(['image/jpeg', 'image/pjpeg', 'image/png', 'image/webp']);
 
 const multerStorage = diskStorage({
   destination: (req, file, cb) => {
-    cb(null, uploadsDir);
+    cb(null, UPLOADS_ROOT);
   },
   filename: (req, file, cb) => {
-    const ext = extname(file.originalname);
-    cb(null, `upload_${randomUUID()}${ext}`);
+    // The stored name is always server-generated. The client's file name is never used on disk.
+    const ext = extname(file.originalname).toLowerCase();
+    cb(null, `upload_${randomUUID()}${ALLOWED_UPLOAD_EXTS.has(ext) ? ext : '.bin'}`);
   }
 });
+
+const imageFileFilter = (
+  req: unknown,
+  file: { originalname: string; mimetype: string },
+  cb: (error: Error | null, acceptFile?: boolean) => void
+) => {
+  const ext = extname(file.originalname).toLowerCase();
+  if (!ALLOWED_UPLOAD_EXTS.has(ext) || !ALLOWED_UPLOAD_MIMES.has(file.mimetype)) {
+    return cb(new BadRequestException('Only JPEG, PNG and WebP images are accepted'), false);
+  }
+  cb(null, true);
+};
+
+export const uploadOptions = {
+  storage: multerStorage,
+  fileFilter: imageFileFilter,
+  limits: {
+    fileSize: MAX_UPLOAD_BYTES,   // 20 MB per file
+    files: 12,
+    fields: 20,
+    fieldSize: 128 * 1024,        // the JSON payload field
+    parts: 40
+  }
+};
+
+export const flattenUploads = (files: Record<string, MulterUploadedFile[] | undefined> | undefined): MulterUploadedFile[] =>
+  Object.values(files || {}).flatMap(list => list || []);
+
+/** Removes files multer just wrote for a request that is being rejected (they are referenced by nothing). */
+export function discardUploads(files: MulterUploadedFile[]): void {
+  for (const f of files) safeDeleteFile(f.path, UPLOADS_ROOT);
+}
+
+/**
+ * Verifies the ACTUAL content of every uploaded file (JPEG/PNG/WebP, sane dimensions, decodes) and
+ * normalises the stored extension to the detected type. HTML, SVG, GIF, scripts etc. are rejected
+ * even when named .jpg with an image/jpeg MIME type.
+ */
+export async function verifyAndNormalizeUploads(files: MulterUploadedFile[]): Promise<void> {
+  // Settings > Advanced > maximum image size (can only be lower than the 20 MB upload limit)
+  const maxBytes = getConfig().limits.maxUploadBytes;
+  for (const f of files) {
+    if (typeof f.size === 'number' && f.size > maxBytes) {
+      throw new BadRequestException(
+        `"${sanitizeDisplayName(f.originalname)}" is ${(f.size / (1024 * 1024)).toFixed(1)} MB; the maximum image size is ${Math.round(maxBytes / (1024 * 1024))} MB (Settings > Advanced).`
+      );
+    }
+  }
+  for (const f of files) {
+    try {
+      const verified = await verifyImageFile(f.path);
+      const currentExt = extname(f.path).toLowerCase();
+      if (!ACCEPTED_EXTS_BY_TYPE[verified.type].includes(currentExt)) {
+        const fixed = path.join(path.dirname(f.path), path.parse(f.path).name + EXT_BY_TYPE[verified.type]);
+        fs.renameSync(f.path, fixed);
+        f.path = fixed;
+        f.filename = path.basename(fixed);
+      }
+      f.mimetype = verified.mime;
+    } catch (err: any) {
+      const name = sanitizeDisplayName(f.originalname);
+      if (err instanceof ImageValidationError) {
+        throw new BadRequestException(`"${name}" was rejected: ${err.message}`);
+      }
+      throw err;
+    }
+  }
+}
 
 @Controller('api/memes')
 export class MemeController {
   constructor(
     private readonly memeEngine: MemeEngineService,
-    private readonly viralAnalyzer: ViralMemeAnalyzerService,
-    private readonly subjectDiscovery: SubjectDiscoveryService,
-    private readonly internetSubjectDiscovery: InternetSubjectDiscoveryService
+    private readonly viralAdaptation: ViralAdaptationService
   ) {}
 
   /**
    * List all memes with optional search, category filter and sorting
    */
   @Get()
-  async getMemes(
-    @Query('search') search?: string,
-    @Query('type') type?: string,
-    @Query('sort') sort?: 'newest' | 'oldest'
-  ) {
-    return this.memeEngine.getAllMemes({ search, type, sort });
+  async getMemes(@Query() query: unknown) {
+    // Every value must be a plain string from the allowed set: no arrays, no operator objects
+    return this.memeEngine.getAllMemes(validateListQuery(query));
   }
 
   /**
    * Get single meme by ID
    */
   @Get(':id')
-  async getMemeById(@Param('id') id: string) {
+  async getMemeById(@Param('id', MemeIdPipe) id: string) {
     return this.memeEngine.getMemeById(id);
+  }
+
+  /**
+   * Generation details (explainability report) of a meme
+   */
+  @Get(':id/report')
+  async getMemeReport(@Param('id', MemeIdPipe) id: string) {
+    return this.memeEngine.getReport(id);
+  }
+
+  /**
+   * One of the meme's source images (subject-N, reaction or reference), for the local details view.
+   * Uploads are not public; this streams only verified images that belong to the meme.
+   */
+  @Get(':id/assets/:which')
+  async getMemeAsset(@Param('id', MemeIdPipe) id: string, @Param('which') which: string, @Res() res: Response) {
+    const file = await this.memeEngine.resolveAssetFile(id, which);
+    res.setHeader('Content-Type', file.mime);
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('Content-Disposition', 'inline');
+    res.sendFile(file.path);
   }
 
   /**
    * Get version history of a meme
    */
   @Get(':id/versions')
-  async getMemeVersions(@Param('id') id: string) {
+  async getMemeVersions(@Param('id', MemeIdPipe) id: string) {
     const meme = await this.memeEngine.getMemeById(id);
     return meme.versions || [];
   }
@@ -96,13 +209,10 @@ export class MemeController {
    */
   @Post(':id/regenerate')
   async regenerateMeme(
-    @Param('id') id: string,
-    @Body('instruction') instruction: string
+    @Param('id', MemeIdPipe) id: string,
+    @Body('instruction') instruction: unknown
   ) {
-    if (!instruction || !instruction.trim()) {
-      throw new BadRequestException('Regeneration instruction text is required');
-    }
-    return this.memeEngine.regenerateWithInstruction(id, instruction.trim());
+    return this.memeEngine.regenerateWithInstruction(id, validateInstruction(instruction));
   }
 
   /**
@@ -110,21 +220,43 @@ export class MemeController {
    */
   @Post(':id/restore/:version')
   async restoreVersion(
-    @Param('id') id: string,
+    @Param('id', MemeIdPipe) id: string,
     @Param('version') version: string
   ) {
-    const versionNum = parseInt(version, 10);
-    if (isNaN(versionNum) || versionNum < 1) {
-      throw new BadRequestException('Valid version number is required');
-    }
-    return this.memeEngine.restoreVersion(id, versionNum);
+    return this.memeEngine.restoreVersion(id, parseVersionNumber(version));
+  }
+
+  /**
+   * Replace Image, step 1: pictures already found for this image during the original discovery
+   * (the AI's first pick and its verified alternates), staged for preview.
+   */
+  @Post(':id/slots/:slot/candidates')
+  @HttpCode(200)
+  async slotCandidates(@Param('id', MemeIdPipe) id: string, @Param('slot') slot: string) {
+    return this.memeEngine.getSlotCandidates(id, Number(slot));
+  }
+
+  /** Replace Image, preview: the whole meme with the pending replacements, rendered in memory (nothing saved). */
+  @Post(':id/image-replace/preview')
+  @HttpCode(200)
+  async previewImageReplace(@Param('id', MemeIdPipe) id: string, @Body() body: unknown) {
+    const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+    return this.memeEngine.previewImageReplacement(id, b.changes, b.baseVersion);
+  }
+
+  /** Replace Image, apply: only the chosen images change; creates a new version. Body: { changes: [{ slot, token }], baseVersion }. */
+  @Post(':id/image-replace')
+  @HttpCode(200)
+  async applyImageReplace(@Param('id', MemeIdPipe) id: string, @Body() body: unknown) {
+    const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+    return this.memeEngine.applyImageReplacement(id, b.changes, b.baseVersion);
   }
 
   /**
    * Delete meme and clean up version outputs safely
    */
   @Delete(':id')
-  async deleteMeme(@Param('id') id: string) {
+  async deleteMeme(@Param('id', MemeIdPipe) id: string) {
     return this.memeEngine.deleteMeme(id);
   }
 
@@ -133,32 +265,37 @@ export class MemeController {
    */
   @Get(':id/download/:format')
   async downloadMeme(
-    @Param('id') id: string,
+    @Param('id', MemeIdPipe) id: string,
     @Param('format') format: string,
-    @Query('version') version: string,
+    @Query('version') version: unknown,
     @Res() res: Response
   ) {
+    if (!['png', 'jpeg', 'jpg'].includes(format)) {
+      throw new BadRequestException('Format must be png, jpeg or jpg');
+    }
     const meme = await this.memeEngine.getMemeById(id);
 
     let targetPaths = meme.outputPaths;
     let targetVersion = meme.currentVersion;
 
-    if (version) {
-      const vNum = parseInt(version, 10);
+    if (version !== undefined) {
+      const vNum = parseVersionNumber(version);
       const snapshot = meme.versions?.find(v => v.versionNumber === vNum);
-      if (snapshot && snapshot.outputPaths) {
-        targetPaths = snapshot.outputPaths;
-        targetVersion = vNum;
+      if (!snapshot || !snapshot.outputPaths) {
+        throw new NotFoundException(`Version ${vNum} does not exist for this meme`);
       }
+      targetPaths = snapshot.outputPaths;
+      targetVersion = vNum;
     }
 
-    const filePath = format === 'jpeg' || format === 'jpg' ? targetPaths.jpeg : targetPaths.png;
-    if (!fs.existsSync(filePath)) {
+    // Only files inside the output directory are ever sent, whatever the stored path says
+    const isJpeg = format === 'jpeg' || format === 'jpg';
+    const filePath = resolveApprovedFile(isJpeg ? targetPaths?.jpeg : targetPaths?.png, [OUTPUT_ROOT]);
+    if (!filePath) {
       throw new NotFoundException(`Image file for version ${targetVersion} not found on disk`);
     }
 
-    const ext = format === 'jpeg' || format === 'jpg' ? 'jpeg' : 'png';
-    const filename = `kanyaraasi_${meme.memeId.substring(0, 8)}_v${targetVersion}.${ext}`;
+    const filename = `kanyaraasi_${meme.memeId.substring(0, 8)}_v${targetVersion}.${isJpeg ? 'jpeg' : 'png'}`;
     res.download(filePath, filename);
   }
 
@@ -166,16 +303,13 @@ export class MemeController {
    * Direct JSON generation endpoint
    */
   @Post('generate')
-  async generateMeme(@Body() dto: GenerateMemeDto) {
-    if (!dto.content || !dto.assets) {
-      throw new BadRequestException('Content and assets are required for meme generation');
-    }
-    return this.memeEngine.generateMeme(dto);
+  async generateMeme(@Body() body: unknown) {
+    return this.memeEngine.generateMeme(validateGenerateBody(body));
   }
 
   @Post('preview')
-  async previewMeme(@Body() dto: GenerateMemeDto) {
-    return this.memeEngine.generateMeme(dto);
+  async previewMeme(@Body() body: unknown) {
+    return this.memeEngine.generateMeme(validateGenerateBody(body));
   }
 
   /**
@@ -188,7 +322,7 @@ export class MemeController {
         { name: 'subjectImages', maxCount: 10 },
         { name: 'reactionImage', maxCount: 1 }
       ],
-      { storage: multerStorage }
+      uploadOptions
     )
   )
   async uploadAndGenerate(
@@ -197,65 +331,54 @@ export class MemeController {
       subjectImages?: MulterUploadedFile[];
       reactionImage?: MulterUploadedFile[];
     },
-    @Body('payload') rawPayload: string
+    @Body('payload') rawPayload: unknown
   ) {
-    if (!rawPayload) {
-      throw new BadRequestException('JSON payload is required with form upload');
-    }
-
-    let parsedPayload: any;
+    const uploaded = flattenUploads(files);
     try {
-      parsedPayload = JSON.parse(rawPayload);
-    } catch (e: any) {
-      throw new BadRequestException('Invalid JSON payload: ' + e.message);
-    }
+      await verifyAndNormalizeUploads(uploaded);
+      const { content, design, layout, subjectLabels } = validateUploadPayload(rawPayload);
 
-    const { content, design, layout, subjectLabels } = parsedPayload;
-
-    if (!content || !content.punchline) {
-      throw new BadRequestException('Meme punchline is required');
-    }
-
-    const subjectImages: UploadedAsset[] = [];
-    if (files.subjectImages && files.subjectImages.length > 0) {
-      files.subjectImages.forEach((f, idx) => {
-        const customLabel = Array.isArray(subjectLabels) && subjectLabels[idx] ? subjectLabels[idx] : undefined;
+      const subjectImages: UploadedAsset[] = [];
+      (files?.subjectImages || []).forEach((f, idx) => {
         subjectImages.push({
           id: randomUUID(),
-          originalName: f.originalname,
+          originalName: sanitizeDisplayName(f.originalname),
           filename: f.filename,
           path: f.path,
           mimeType: f.mimetype,
           role: idx === 0 ? 'subject_primary' : (idx === 1 ? 'subject_secondary' : 'subject_item'),
           orderIndex: idx,
-          label: customLabel
+          label: subjectLabels[idx] || undefined
         });
       });
-    }
 
-    let reactionImage: UploadedAsset | undefined;
-    if (files.reactionImage && files.reactionImage.length > 0) {
-      const rx = files.reactionImage[0];
-      reactionImage = {
-        id: randomUUID(),
-        originalName: rx.originalname,
-        filename: rx.filename,
-        path: rx.path,
-        mimeType: rx.mimetype,
-        role: 'reaction_punchline',
-        orderIndex: 99
-      };
-    }
+      let reactionImage: UploadedAsset | undefined;
+      if (files?.reactionImage && files.reactionImage.length > 0) {
+        const rx = files.reactionImage[0];
+        reactionImage = {
+          id: randomUUID(),
+          originalName: sanitizeDisplayName(rx.originalname),
+          filename: rx.filename,
+          path: rx.path,
+          mimeType: rx.mimetype,
+          role: 'reaction_punchline',
+          orderIndex: 99
+        };
+      }
 
-    return this.memeEngine.generateMeme({
-      content,
-      assets: {
-        subjectImages,
-        reactionImage
-      },
-      design,
-      layout
-    });
+      return await this.memeEngine.generateMeme({
+        content,
+        assets: {
+          subjectImages,
+          reactionImage
+        },
+        design,
+        layout
+      });
+    } catch (err) {
+      discardUploads(uploaded);
+      throw err;
+    }
   }
 
   /**
@@ -265,9 +388,29 @@ export class MemeController {
    * 2. Meme Reacting Image
    * 3. Exact Reacting Image Punchline Text
    *
-   * AI is strictly used for reference structure & subject identification.
-   * Normal backend logic matches existing high-res subject assets and renders via deterministic Canvas Engine.
+   * AI (sandboxed) analyses the reference and visually verifies candidate images; subject images
+   * come ONLY from internet discovery; rendering is deterministic. The punchline is never modified.
    */
+  /**
+   * Optional first step of Viral Adaptation (to choose your own pictures): analyses the reference once and
+   * returns its image slots. Pass the returned draftId (and slotOverrides) to adapt-viral afterwards.
+   */
+  @Post('viral-analyze')
+  @HttpCode(200)
+  @UseInterceptors(FileFieldsInterceptor([{ name: 'referenceImage', maxCount: 1 }], uploadOptions))
+  async analyzeViralReference(@UploadedFiles() files: { referenceImage?: MulterUploadedFile[] }) {
+    const uploaded = flattenUploads(files);
+    try {
+      if (!files?.referenceImage?.length) throw new BadRequestException('Input 1 missing: Viral Meme Reference screenshot is required.');
+      await verifyAndNormalizeUploads(uploaded);
+      const f = files.referenceImage[0];
+      return await this.viralAdaptation.analyzeDraft({ path: f.path, filename: f.filename, originalName: f.originalname, mimeType: f.mimetype });
+    } catch (err) {
+      discardUploads(uploaded);
+      throw err;
+    }
+  }
+
   @Post('adapt-viral')
   @UseInterceptors(
     FileFieldsInterceptor(
@@ -275,10 +418,7 @@ export class MemeController {
         { name: 'referenceImage', maxCount: 1 },
         { name: 'reactionImage', maxCount: 1 },
       ],
-      {
-        storage: multerStorage,
-        limits: { fileSize: 25 * 1024 * 1024 },
-      }
+      uploadOptions
     )
   )
   async adaptViralMeme(
@@ -287,120 +427,73 @@ export class MemeController {
       referenceImage?: MulterUploadedFile[];
       reactionImage?: MulterUploadedFile[];
     },
-    @Body('punchline') punchline?: string,
-    @Body('reactionContext') reactionContext?: string,
-    @Body('fontFamily') preferredFont?: string
+    @Body('punchline') punchline?: unknown,
+    @Body('reactionContext') reactionContext?: unknown,
+    @Body('fontFamily') preferredFont?: unknown,
+    @Body('selectedProviders') selectedProviders?: unknown,
+    @Body('draftId') draftId?: unknown,
+    @Body('slotOverrides') slotOverrides?: unknown
   ) {
-    if (!files?.referenceImage || files.referenceImage.length === 0) {
-      throw new BadRequestException('Input 1 missing: Viral Meme Reference screenshot is required.');
-    }
-    if (!files?.reactionImage || files.reactionImage.length === 0) {
-      throw new BadRequestException('Input 2 missing: Meme Reacting Image is required.');
-    }
-    if (!punchline || !punchline.trim()) {
-      throw new BadRequestException('Input 3 missing: Reacting Image Text (punchline) is required.');
-    }
-
-    const refFile = files.referenceImage[0];
-    const rxFile = files.reactionImage[0];
-
-    // 1. AI Vision Analysis (Identifies layout archetype, subject entities, and overlays)
-    const analysis = await this.viralAnalyzer.analyzeViralReference(refFile.path);
-
-    // 2. EXCLUSIVE Internet Image Discovery (No MongoDB or local subject library lookups)
-    const subjectAssets = await this.internetSubjectDiscovery.discoverSubjectImages(
-      analysis.subjects,
-      analysis.subjectCount,
-      analysis.headline || analysis.statement,
-      analysis.itemLabels
-    );
-
-    // 3. User's Uploaded Reaction Image (Used exactly as supplied without modification)
-    const reactionAsset: UploadedAsset = {
-      id: randomUUID(),
-      originalName: rxFile.originalname,
-      filename: rxFile.filename,
-      path: rxFile.path,
-      mimeType: rxFile.mimetype,
-      role: 'reaction_punchline',
-      orderIndex: 99
-    };
-
-    // 4. Content Assembly (Exact user punchline preserved verbatim)
-    const content = {
-      topic: `Viral Adaptation: ${analysis.headline || analysis.subjects.join(' & ')}`,
-      headline: analysis.headline,
-      bulletPoints: analysis.bulletPoints,
-      statement: analysis.statement,
-      reactionContext: reactionContext?.trim() || analysis.referenceReactionContext || undefined,
-      punchline: punchline.trim(), // Exact user text preserved
-      itemLabels: analysis.itemLabels
-    };
-
-    // 5. Design Specifications (Existing preferred font & styling settings)
-    const design = {
-      fontFamily: (preferredFont as any) || 'Arial Black',
-      teluguFontFamily: 'Ramabhadra' as const,
-      canvasPreset: 'portrait_4_5' as const,
-      width: 1080,
-      height: 1350,
-      primaryTextColor: '#FFE500',
-      secondaryTextColor: '#FFFFFF',
-      headerBgColor: '#000000',
-      headerTextColor: '#FFE500',
-      outlineColor: '#000000',
-      outlineThickness: 8,
-      shadowColor: 'rgba(0,0,0,0.95)',
-      shadowBlur: 8,
-      shadowOffsetX: 3,
-      shadowOffsetY: 3,
-      fontSizeScale: 1.0
-    };
-
-    // 6. Layout Configuration
-    const layout = {
-      memeType: analysis.memeType,
-      arrangement: analysis.arrangement,
-      canvasPreset: 'portrait_4_5' as const,
-      hasHeader: Boolean(analysis.headline),
-      hasStatement: Boolean(analysis.statement),
-      hasBulletPoints: Boolean(analysis.bulletPoints && analysis.bulletPoints.length > 0),
-      hasReactionContext: Boolean(reactionContext || analysis.referenceReactionContext),
-      hasPunchline: true
-    };
-
-    // 7. Deterministic Canvas Engine Generation
-    const result = await this.memeEngine.generateMeme({
-      content,
-      assets: {
-        subjectImages: subjectAssets,
-        reactionImage: reactionAsset
-      },
-      design,
-      layout
-    });
-
-    const plainResult = (typeof (result as any)?.toObject === 'function')
-      ? (result as any).toObject()
-      : result;
-
-    return {
-      ...plainResult,
-      adaptationMetadata: {
-        referenceImageFilename: refFile.filename,
-        detectedMemeType: analysis.memeType,
-        detectedArrangement: analysis.arrangement,
-        identifiedSubjects: analysis.subjects,
-        discoverySource: 'internet_only',
-        matchedSubjectAssets: subjectAssets.map(s => ({
-          originalName: s.originalName,
-          label: s.label,
-          sourceUrl: s.sourceUrl,
-          license: s.license,
-          attribution: s.attribution
-        }))
+    const uploaded = flattenUploads(files);
+    try {
+      const own = validateViralOverrides({ draftId, slotOverrides });
+      if (!own.draftId && (!files?.referenceImage || files.referenceImage.length === 0)) {
+        throw new BadRequestException('Input 1 missing: Viral Meme Reference screenshot is required.');
       }
-    };
+      if (!files?.reactionImage || files.reactionImage.length === 0) {
+        throw new BadRequestException('Input 2 missing: Meme Reacting Image is required.');
+      }
+      if (typeof punchline !== 'string' || !punchline.trim()) {
+        throw new BadRequestException('Input 3 missing: Reacting Image Text (punchline) is required.');
+      }
+      const fields = validateViralFields({
+        punchline,
+        reactionContext,
+        fontFamily: preferredFont,
+        selectedProviders
+      });
+
+      await verifyAndNormalizeUploads(uploaded);
+
+      return await this.runViralAdaptation(
+        own.draftId ? undefined : files.referenceImage![0],
+        files.reactionImage[0],
+        fields.punchline,
+        fields.reactionContext,
+        fields.fontFamily,
+        fields.selectedProviders,
+        own
+      );
+    } catch (err) {
+      // Nothing references these files yet: do not leave rejected or failed uploads on disk
+      discardUploads(uploaded);
+      throw err;
+    }
+  }
+
+  private async runViralAdaptation(
+    refFile: MulterUploadedFile | undefined,
+    rxFile: MulterUploadedFile,
+    punchline: string,
+    reactionContext: string | undefined,
+    preferredFont: string | undefined,
+    selectedProviders?: string[],
+    own: { draftId?: string; overrides?: { slot: number; token: string }[] } = {}
+  ) {
+    // The orchestrator runs: analysis -> identity -> internet discovery + visual verification ->
+    // layout -> render -> persistence (with the generation report). The punchline is passed verbatim.
+    const { meme, adaptationMetadata } = await this.viralAdaptation.adapt({
+      reference: refFile ? { path: refFile.path, filename: refFile.filename, originalName: refFile.originalname, mimeType: refFile.mimetype } : undefined,
+      draftId: own.draftId,
+      overrides: own.overrides,
+      reaction: { path: rxFile.path, filename: rxFile.filename, originalName: rxFile.originalname, mimeType: rxFile.mimetype },
+      punchline,
+      reactionContext,
+      fontFamily: preferredFont,
+      selectedProviders
+    });
+    const { generationReport, ...rest } = meme;
+    return { ...rest, adaptationMetadata };
   }
 
   /**

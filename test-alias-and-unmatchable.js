@@ -43,7 +43,8 @@ async function runAll() {
   // Test 1: Anna Konidala -> Pawan Kalyan
   const t1 = await testSingleSubject('Anna Konidala', 'OG Movie Update');
 
-  // Test 2: Power Star -> Pawan Kalyan
+  // Test 2: bare "Power Star" is AMBIGUOUS (also used for other actors). It must halt unless the
+  // context proves who it is ("OG Movie Update" is a Pawan Kalyan cue, "Tollywood Box Office" is not).
   const t2 = await testSingleSubject('Power Star', 'Tollywood Box Office');
 
   // Test 3: Thalapathy -> Vijay
@@ -59,7 +60,7 @@ async function runAll() {
   console.log('SUMMARY OF ALIAS RESOLUTION TESTS');
   console.log('############################################################');
   console.log('1. Anna Konidala -> Pawan Kalyan: ', t1.ok ? 'PASSED' : 'FAILED');
-  console.log('2. Power Star -> Pawan Kalyan:    ', t2.ok ? 'PASSED' : 'FAILED');
+  console.log('2. Bare "Power Star" w/o evidence:', !t2.ok && /ambiguous/.test(t2.error) ? 'PASSED (halted as ambiguous)' : 'FAILED');
   console.log('3. Thalapathy -> Vijay:           ', t3.ok ? 'PASSED' : 'FAILED');
   console.log('4. Tarak -> Jr NTR:               ', t4.ok ? 'PASSED' : 'FAILED');
   console.log('5. Genuinely Unknown Person Guard:', !t5.ok ? 'PASSED (Halted with clear error)' : 'FAILED');

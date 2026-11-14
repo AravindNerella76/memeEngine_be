@@ -1,3 +1,4 @@
+import type { StyleSnapshot } from '../design/render-style';
 /**
  * Meme Domain Models - Strict Separation of Concerns
  * 1. Content: What the meme says (Telugu / English text, headlines, punchlines)
@@ -13,7 +14,7 @@ export type MemeType =
   | 'movie_update'
   | 'custom';
 
-export type CanvasDimensionPreset = 'portrait_4_5' | 'square_1_1'; // 1080x1350 or 1080x1080
+export type CanvasDimensionPreset = 'portrait_4_5' | 'square_1_1' | 'story_9_16'; // 1080x1350, 1080x1080 or 1080x1920
 
 export type TextAlignment = 'center' | 'left' | 'right';
 
@@ -24,14 +25,31 @@ export type ImageArrangementMode =
   | 'columns_4'     // 4 vertical columns
   | 'grid_2x2'      // 2x2 grid
   | 'stacked_rows'  // Horizontal rows stacked
-  | 'single_hero';  // Full width single subject
+  | 'single_hero'   // Full width single subject
+  | 'custom_grid';  // Rows with their own slot counts and relative sizes (derived from the reference)
+
+/** Relative row heights and slot widths for 'custom_grid' (and for unequal standard layouts). */
+export interface GridSpec {
+  rows: { heightWeight: number; slots: { widthWeight: number }[] }[];
+}
+
+/** Per-element text size multipliers (applied on top of fontSizeScale). */
+export interface TextScales {
+  headline?: number;
+  statement?: number;
+  bullets?: number;
+  labels?: number;
+  reactionContext?: number;
+  punchline?: number;
+}
 
 export type SectionRole =
   | 'header'
   | 'subject_primary'
   | 'subject_secondary'
   | 'subject_item'
-  | 'reaction_punchline';
+  | 'reaction_punchline'
+  | 'reference';          // private copy of the viral reference screenshot (never rendered)
 
 /**
  * 1. Meme Content - Pure textual information
@@ -64,9 +82,55 @@ export interface UploadedAsset {
   role: SectionRole;               // Explicit section mapping ('subject_primary', 'reaction_punchline', etc.)
   orderIndex: number;              // Position in sequence (0, 1, 2, ...)
   label?: string;                  // Content label bound directly to this asset
-  sourceUrl?: string;              // Internet source URL
+  sourceUrl?: string;              // Internet source URL (the image file)
+  sourcePage?: string;             // Human-readable page the image came from
+  sha256?: string;                 // Content hash (re-verifies alternates and detects duplicates)
+  focalX?: number;                 // Subject focus (0-1) used to centre the crop
+  focalY?: number;
   attribution?: string;            // Photographer / Creator attribution
-  license?: string;                // Creative Commons or Public Domain license
+  license?: string;                // Licence as given by the source (or "Unknown ...")
+  provider?: string;               // Search provider that found the image (internet discovery)
+  /**
+   * Rights record of an internet-discovered image: "open_license", "open_license_restricted" or
+   * "copyrighted_unconfirmed" (reuse permission not confirmed), with label, basis and whether the
+   * source link could be stored under the provider's terms.
+   */
+  rights?: AssetRights;
+  /** How the image relates to the reference picture: same_picture | same_scene | different | unknown. */
+  referenceMatch?: string;
+  /** Where the picture came from: AI discovery, an online search the user ran, or the user's own upload. */
+  sourceType?: ImageSourceType;
+  /** Who chose it. A user choice is never replaced silently by the AI. */
+  selectedBy?: 'ai' | 'user';
+  /** True only when the AI visually verified this picture (never for a user's own choice). */
+  aiVerified?: boolean;
+}
+
+export type ImageSourceType = 'ai_discovery' | 'online_search' | 'user_upload';
+
+/** One replaced image, stored in the new version (history keeps every earlier version untouched). */
+export interface ImageChangeRecord {
+  slot: number;
+  at: string;
+  sourceType: ImageSourceType;
+  sourceUrl?: string;
+  previous: { assetId?: string; filename?: string; sha256?: string; sourceType?: ImageSourceType; sourceUrl?: string; provider?: string };
+  replacement: { assetId: string; filename: string; originalName: string; sha256?: string; provider?: string; sourcePage?: string; license?: string; rights?: AssetRights; width?: number; height?: number };
+}
+
+export interface AssetRights {
+  classification: 'open_license' | 'open_license_restricted' | 'copyrighted_unconfirmed';
+  label: string;
+  license?: string;
+  licenseUrl?: string;
+  attributionRequired: boolean;
+  shareAlike: boolean;
+  restriction?: string;
+  attribution?: string;
+  provider: string;
+  basis: string;
+  sourceStored: boolean;
+  storageNote?: string;
 }
 
 export interface MemeAssets {
@@ -102,10 +166,17 @@ export interface DesignSpecifications {
 
   // Typography scaling
   fontSizeScale: number;           // 1.0 default (0.7 to 1.5 for regeneration tuning)
+  textScales?: TextScales;         // Per-element multipliers (headline, punchline, ...)
   textAlignment: TextAlignment;
 
   // Custom free-form design instructions for regeneration
   customInstructions?: string;
+
+  /**
+   * Snapshot of the Settings (typography, effects, canvas, image processing) taken when the meme was
+   * generated. Absent on memes created before Settings existed (they keep the original style).
+   */
+  style?: StyleSnapshot;
 }
 
 /**
@@ -125,6 +196,7 @@ export interface LayoutConfiguration {
   
   gridColumns?: number;            // For collage or comparison (e.g. 2, 3, 4)
   gridRows?: number;
+  grid?: GridSpec;                 // Relative row/slot sizes ('custom_grid' or unequal layouts)
   gapSize: number;                 // Border spacing between cells (0 or 2-4px)
 }
 

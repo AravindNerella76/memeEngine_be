@@ -1,39 +1,164 @@
-# Meme Generator Backend (`memeEngine_be`)
+# Meme Engine backend (`memeEngine_be`)
 
-High-performance NestJS backend engine leveraging `@napi-rs/canvas` for server-side dynamic meme composition and MongoDB for state persistence.
+NestJS + `@napi-rs/canvas` + MongoDB. Turns three inputs (a viral meme screenshot, your reaction
+image, your exact punchline) into a finished meme (1080x1350 by default) in your page's style.
 
-## Features
-
-- **Dynamic Layout Engine**: Standardized archetypes (Trending News, Comparison Columns, Facts Collage, Movie Updates, Stacked Comparison).
-- **Multilingual Canvas Typography**: Native text wrapping, metrics calculation, and rendering with embedded fonts (Mandali, Ramabhadra, Noto Sans Telugu, Intrepid ExtraBold, Impact, Anton, Arial Black).
-- **Intelligent Image Processing**: Automatic focal-point aspect-ratio cropping, badge rendering, watermark stamping, and dual JPEG/PNG outputs.
-- **Meme Lifecycle & Regeneration**: Versioned regeneration pipeline (`v1`, `v2`, `v3`, etc.) with MongoDB persistence.
-- **RESTful API**: Endpoints for meme creation, image uploads, regeneration, fetching, listing, and deletion.
-
-## Tech Stack
-
-- NestJS 10 (Express platform)
-- TypeScript
-- `@napi-rs/canvas`
-- MongoDB & Mongoose
-- Multer
-
-## Getting Started
-
-### Prerequisites
-
-- Node.js (v18+)
-- MongoDB running locally at `mongodb://localhost:27017/meme_engine` (or configured via environment)
-
-### Setup & Run
+## Run
 
 ```bash
-# Install dependencies
 npm install
-
-# Start backend server
-npx ts-node src/main.ts
+npm run build      # TypeScript -> dist/
+npm start          # http://127.0.0.1:3000
+# or: npm run start:dev   (build + start)
 ```
 
-The API server runs on `http://localhost:3000`.
+Needs MongoDB at `mongodb://127.0.0.1:27017/kanyaraasi_memes` and the Antigravity CLI (`agy`)
+signed in once (run `agy` in a terminal). Settings: copy `.env.example` to `.env`.
+`npx ts-node src/main.ts` no longer works (ts-node does not support the installed TypeScript 7).
 
+## Viral adaptation pipeline (`POST /api/memes/adapt-viral`)
+
+| Step | Who | What |
+|---|---|---|
+| 1 Reference analysis | vision model (sandboxed) | per-slot structure, subjects, context, text; reaction panel and its punchline ignored |
+| 2 Identity | code | whole-phrase names, verified aliases, Telugu names, film characters, AI identification only above a confidence threshold; ambiguous = stop and explain |
+| 3 Content | code | reference headline/labels/bullets + **your exact punchline** (never rewritten) |
+| 4 Design + layout | code | your saved Settings (house style); deterministic layout from the reference's relative structure |
+| 5 Discovery | code + vision model | internet only: grounded queries, providers, ranking, safe downloads, duplicate checks, visual verification |
+| 6 Render | canvas | text fitting (never truncates), focal-point cropping, structural output checks |
+
+Every meme stores a **generation report** (analysis, identity decisions, queries, candidates,
+rejections with reasons, licences, timings): `GET /api/memes/:id/report`.
+
+## Settings (`/api/settings`, frontend `/settings`)
+
+One record in the existing `design_profiles` collection (`profileId: kanyaraasi-default`) holds
+the settings: `settings` stores only the values that differ from the defaults, and `profile` keeps
+the older flat profile in sync (`GET/PUT /api/design-profile`, `POST /api/design-profile/reset`
+still work and map onto the settings). A record holding only an older profile is migrated on read.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/settings` | settings, defaults, allowed ranges (schema), installed fonts, effective pipeline values, provider availability and monthly usage (no keys) |
+| `PUT /api/settings` | partial update; every value is validated (unknown keys, fonts, ranges, min/max sizes) and nothing is saved if one is invalid |
+| `POST /api/settings/reset` | `{ "section": "typography" \| "effects" \| "canvas" \| "imageProcessing" \| "discovery" \| "advanced" \| "all" }` |
+| `POST /api/settings/preview` | renders a sample meme with unsaved settings through the real layout engine and renderer; in memory only (no record, no file) |
+
+Sections: typography and text effects per text role (heading, subject labels, supporting text,
+punchline, captions), canvas and layout, image processing, image discovery, advanced.
+
+- **Visual settings** are copied into each new meme (`design.style`). Existing memes and their
+  versions keep the style they were made with; regeneration re-renders a meme with its own copy.
+  Memes made before Settings existed have no copy and render with the original constants
+  (pixel-identical).
+- **Pipeline settings** (providers, rights policy, search effort, thresholds, timeouts, limits,
+  diagnostics, log level) apply at once on top of `.env`. They can only switch providers off, raise
+  thresholds or lower limits; keys and monthly caps stay in `.env`.
+
+## Replacing images (no manual editor)
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/staged-images/upload` | your own picture (multipart `image`): checked by content, previewed, kept in memory for 15 min |
+| `POST /api/staged-images/search` | `{ query }`: searches through the enabled providers (their monthly caps apply), downloads results safely, returns previews |
+| `DELETE /api/staged-images/:token` | cancel a choice |
+| `POST /api/memes/:id/slots/:slot/candidates` | pictures found during the original discovery (the AI's first pick and its verified alternates) |
+| `POST /api/memes/:id/image-replace/preview` | `{ changes: [{ slot, token }] }` renders the whole meme in memory |
+| `POST /api/memes/:id/image-replace` | applies the change: only those images change (layout, text, punchline, reaction image and styling are reused) and a new version is created with an `imageChanges` record |
+| `POST /api/memes/viral-analyze` | optional first step of viral adaptation: analyses the reference once and returns its image slots; `adapt-viral` then accepts `draftId` + `slotOverrides` and does not analyse again |
+
+A picture you choose is recorded as yours (`sourceType`: `user_upload` / `online_search`,
+`selectedBy: user`, `aiVerified: false`): it gets technical validation (real image, size, decodes) but
+no identity check, and the AI regeneration never replaces it. Earlier versions are never modified.
+
+## Security model (summary)
+
+- The vision CLI runs without `--dangerously-skip-permissions`, with an isolated per-run profile
+  (your CLI plugins and global permissions are not loaded), commands/URLs/MCP/writes denied, and
+  file reads confined to a per-run folder holding only the images. Text inside screenshots is
+  treated as data; every answer must echo a random code drawn on the image.
+- Outbound HTTP refuses private/loopback/metadata addresses (checked at connection time), caps size
+  and time, and re-validates redirects. Uploads are checked by content; uploads are not public.
+- The API listens on 127.0.0.1 and refuses foreign Host/Origin headers.
+- Every route needs a signed-in session (see **Login**). Only these are public, and each protects itself:
+  `GET /api/health`, `/api/auth/me|login|logout`, the WhatsApp webhook (Meta signature / verify token) and
+  the Instagram OAuth callback (`state`). Generated memes under `/output/` stay public on purpose (Meta
+  fetches them); their names contain a random UUID and only `.png/.jpg` is served.
+
+## Login
+
+One owner account, signed in with a username (or e-mail) and password. There is no sign-up page: the owner
+is created from the command line, on the machine that runs the server.
+
+```bash
+npm run build
+npm run auth:create-owner     # asks for username + password (typed hidden)
+npm start                     # then open the studio and sign in
+npm run auth:reset-password   # forgot it: sets a new one and signs out every device
+npm run auth:status           # is an owner set up?
+```
+
+How it works: passwords are hashed with scrypt (salted, memory-hard); a sign-in creates a server-side session
+whose random token lives in an `HttpOnly`, `SameSite=Lax` cookie (`__Host-` prefixed and `Secure` on HTTPS) and
+only its SHA-256 is stored; sessions end after 7 idle days or 30 days total, on sign-out, or when the password
+changes. Wrong passwords are limited per username+address (5, then a 15-minute lock), per address, and per
+username overall; real and unknown usernames behave identically. On top of the Origin allow-list, a
+state-changing request the browser labels cross-site is refused.
+
+| `.env` setting | Default | Meaning |
+|---|---|---|
+| `AUTH_ENABLED` | `true` | `false` turns login off. The server refuses to start that way if it is reachable from outside. |
+| `APP_PUBLIC_URL` | `http://localhost:5173` | Where the browser opens the studio (the Instagram OAuth callback returns here). |
+| `APP_HOSTS` | empty | Host names that serve the whole app behind login (hosting). |
+| `TRUST_PROXY` | `0` | Reverse proxies in front of the server (`1` behind Caddy/nginx). |
+| `AUTH_COOKIE_SECURE` | `true` if `APP_PUBLIC_URL` is https | Send the cookie over HTTPS only. |
+| `AUTH_SESSION_IDLE_DAYS` / `AUTH_SESSION_MAX_DAYS` | `7` / `30` | Session lifetime. |
+| `AUTH_MAX_FAILURES` / `AUTH_LOCK_MINUTES` | `5` / `15` | Wrong-password limit and lock time. |
+
+Running it on a public address: see [DEPLOY.md](DEPLOY.md).
+
+## Tests
+
+| Command | Kind | Needs |
+|---|---|---|
+| `npm test` | offline unit + mocked pipeline tests | nothing |
+| `MONGO_TEST_URI=mongodb://127.0.0.1:27999/meme_test npm run test:integration` | integration | a scratch MongoDB |
+| `npm run live:analyze -- <image>` | LIVE vision analysis | agy signed in |
+| `npm run live:viral -- --base http://127.0.0.1:3000 --reference <ref> --reaction <img> --punchline "..."` | LIVE end-to-end | running server, agy, internet, `SESSION_COOKIE="me_session=..."` (copy it from the browser) |
+| `npm run live:regenerate -- --meme <id> --instruction "..."` | LIVE regeneration | running server, agy, `SESSION_COOKIE` as above |
+| `test-security-e2e.js` | attack suite against a scratch server (started with `AUTH_ENABLED=false`) | see the file header |
+
+## Image sources, rights and provider terms
+
+**Rights policy** (`DISCOVERY_RIGHTS_POLICY`, default `allow_copyrighted`): copyrighted images
+(film stills, studio promotional images, celebrity, news and editorial photos) may be discovered and
+used. Every selected image carries a rights record (`asset.rights`, and `rights` in the generation
+report) with one of three labels:
+
+| Label | Meaning |
+|---|---|
+| `open_license` | public domain, CC0, CC BY, CC BY-SA, GFDL ... (credit / share-alike conditions recorded) |
+| `open_license_restricted` | an open licence that does not cover this use (NonCommercial, NoDerivatives) |
+| `copyrighted_unconfirmed` | everything else, or no licence information: reuse permission NOT confirmed |
+
+`open_license_only` restricts discovery to the first class. Identity, visual verification, relevance
+and quality checks are identical in both modes; rights never change the ranking.
+
+**Providers**
+
+| Provider | Finds | Needs | Storage under its terms |
+|---|---|---|---|
+| Wikimedia Commons, Wikipedia, Openverse | licensed portraits and event photos; Wikipedia's non-free film posters (labelled copyrighted) | nothing | stored |
+| Google Cloud Vision reverse image search | the exact underlying picture of each reference slot, and the pages carrying it | `GOOGLE_CLOUD_VISION_API_KEY`; capped at 1000/month (the free tier) | stored |
+| Brave Image Search | web images by text (stills, promotional and news photos) | `BRAVE_SEARCH_API_KEY`; capped at 1000/month (about the free credit) | used during the run only: titles and links are never stored |
+| TMDB | film backdrops, posters, actor photos | a key AND `TMDB_COMMERCIAL_AGREEMENT=true` (a written agreement; the standard terms forbid AI-based and derivative use) | per agreement |
+| Google Programmable Search | web images | existing keys only; ends 2027-01-01 | run only |
+| DuckDuckGo (unofficial) | web images | `DISCOVERY_ALLOW_UNOFFICIAL=true` | run only |
+
+Paid providers are capped per calendar month (MongoDB collection `provider_usage`): requests stop at
+the cap and the report says so. `GET /api/system/status` shows this month's usage. Only the subject
+slot's crop is sent to reverse image search (never the reaction image or the punchline).
+
+**Reference match**: among verified candidates, clean pictures come first, then the exact underlying
+picture of the reference, then the same scene, then the best score. It is a preference only; the
+acceptance rules do not change.

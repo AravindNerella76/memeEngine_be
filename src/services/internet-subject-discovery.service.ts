@@ -1,15 +1,34 @@
-import { Injectable, BadRequestException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, Logger, Optional, OnModuleInit } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
-import { loadImage } from '@napi-rs/canvas';
 import { UploadedAsset } from '../types/meme.types';
+import {
+  ImageValidationError,
+  MAX_UPLOAD_BYTES,
+  VerifiedImage,
+  verifyImageBuffer
+} from '../security/image-verify';
 import {
   resolveSubjectIdentity,
   buildSubjectSearchQueries,
   getSubjectVerificationTokens,
+  scoreSubjectRelevance,
+  formatAmbiguityMessage,
+  RELEVANCE_ACCEPT_THRESHOLD,
   SubjectProfile
 } from './subject-alias-resolver';
+import { getConfig, getEnvConfig } from '../config/app-config';
+import { politeFetch } from '../security/polite-fetch';
+import { VisionCliRunner } from '../vision/vision-cli.runner';
+import { DiscoveryEngine, DiscoveryRunResult, rightsForCandidate } from '../discovery/discovery-engine';
+import { rightsAllowed } from '../discovery/rights';
+import { ImageCandidate } from '../discovery/discovery.types';
+import { SlotDiscoveryPlan, ImageSearchProvider } from '../discovery/discovery.types';
+import { AgyVisualVerifier } from '../discovery/visual-verifier';
+import { WikidataGrounding, WikimediaRightsLookup } from '../discovery/providers/wikimedia.providers';
+import { createProviderSet, describeProviders } from '../discovery/providers';
+import { InMemoryProviderUsageStore, ProviderUsageService, UsageGuard } from '../discovery/provider-usage';
 
 export interface InternetImageCandidate {
   title: string;
@@ -20,16 +39,164 @@ export interface InternetImageCandidate {
   license?: string;
   attribution?: string;
   sourceDomain: string;
+  /** Identity relevance score (0-100) assigned by scoreSubjectRelevance(). */
+  relevanceScore?: number;
 }
 
 @Injectable()
-export class InternetSubjectDiscoveryService {
+export class InternetSubjectDiscoveryService implements OnModuleInit {
   private readonly logger = new Logger(InternetSubjectDiscoveryService.name);
   private readonly storageDir = path.join(__dirname, '..', '..', 'uploads', 'internet-discovered');
-  private readonly userAgent = 'TeluguMemeEngine/1.0 (contact: admin@kanyaraasi.local; Automated Meme Studio)';
+  private readonly userAgent = 'MemeAdaptationEngine/2.0 (local meme layout tool; non-commercial)';
+  private providers: ImageSearchProvider[] | null = null;
+  private guards: UsageGuard[] = [];
+  private readonly grounding = new WikidataGrounding();
+  private readonly rightsLookup = new WikimediaRightsLookup();
 
-  constructor() {
+  constructor(@Optional() private readonly runner?: VisionCliRunner, @Optional() private readonly usage?: ProviderUsageService) {
     this.ensureStorageDir();
+  }
+
+  async onModuleInit() {
+    this.probePaidProviders();
+  }
+
+  private probePaidProviders() {
+    for (const p of this.getProviders()) {
+      if (typeof (p as any).probe === 'function') {
+        (p as any).probe().catch((err: any) => {
+          this.logger.warn(`Provider probe for ${p.id} failed: ${err?.message || err}`);
+        });
+      }
+    }
+  }
+
+  private getProviders(): ImageSearchProvider[] {
+    if (!this.providers) {
+      // Monthly caps of paid providers are persisted in MongoDB when available.
+      const set = createProviderSet(getConfig, undefined, this.usage || new InMemoryProviderUsageStore());
+      this.providers = set.providers;
+      this.guards = set.guards;
+    }
+    return this.providers;
+  }
+
+  /** Enabled/disabled state of every provider (for the status endpoint and reports). */
+  describeProviders() {
+    this.probePaidProviders();
+    const envEnabled = getEnvConfig().discovery.enabledProviders;
+    const effective = getConfig().discovery.enabledProviders;
+    return describeProviders(this.getProviders()).map(p => ({
+      ...p,
+      // allowed by .env but switched off in Settings (as opposed to a missing key or a provider error)
+      turnedOffInSettings: envEnabled.includes(p.id) && !effective.includes(p.id)
+    }));
+  }
+
+  /**
+   * "Find another image online": a free-text search through the same enabled providers (and their
+   * monthly caps) the discovery uses. Returns candidates only; nothing is downloaded or verified by
+   * the AI here, and the user's choice is recorded as the user's own selection.
+   */
+  async searchForUser(query: string, limit = 16): Promise<{ candidates: ImageCandidate[]; providers: string[]; errors: string[] }> {
+    const cfg = getConfig().discovery;
+    const providers = this.getProviders().filter(p => p.isEnabled() && (p.capability || 'text') === 'text');
+    if (!providers.length) throw new BadRequestException('No image search source is available right now (see Settings > Image Discovery).');
+    const plan: any = {
+      slotId: 'user-search',
+      index: 0,
+      identity: { status: 'resolved', searchName: query, profile: undefined, candidates: [], reasons: [], warnings: [] },
+      subjectName: query,
+      subjectKind: 'person',
+      desiredImageType: 'portrait',
+      context: { movieTitle: null, eventName: null, characterName: null, evidence: 'none' },
+      label: null,
+      visualPurpose: '',
+      visualCharacteristics: [],
+      orientation: 'portrait',
+      targetWidth: 540,
+      targetHeight: 720,
+      aiSearchTerms: [],
+      groundingText: query
+    };
+    const deadline = cfg.requestTimeoutMs * 2 + 2000;
+    const settled = await Promise.allSettled(
+      providers.map(p =>
+        Promise.race([
+          p.search({ query, plan, limit, mode: 'text' }),
+          new Promise<ImageCandidate[]>((_, rej) => setTimeout(() => rej(new Error('timed out')), deadline))
+        ])
+      )
+    );
+    const out: ImageCandidate[] = [];
+    const errors: string[] = [];
+    const seen = new Set<string>();
+    settled.forEach((r, i) => {
+      if (r.status === 'rejected') {
+        errors.push(`${providers[i].label}: ${String((r.reason as Error)?.message || r.reason).slice(0, 120)}`);
+        return;
+      }
+      for (const c of r.value) {
+        const rights = rightsForCandidate(c);
+        if (!rightsAllowed(cfg.rightsPolicy, rights.classification)) continue;
+        const key = c.imageUrl.split('?')[0];
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ ...c, rights });
+      }
+    });
+    return { candidates: out.slice(0, limit * 2), providers: providers.map(p => p.id), errors };
+  }
+
+  /** Safe, size-capped download (private/loopback addresses refused; redirects re-validated). */
+  async downloadForUser(url: string): Promise<Buffer> {
+    const cfg = getConfig().discovery;
+    return (await politeFetch(url, { timeoutMs: cfg.downloadTimeoutMs, maxBytes: Math.min(MAX_UPLOAD_BYTES, getConfig().limits.maxUploadBytes), userAgent: cfg.userAgent })).body;
+  }
+
+  /** This month's usage of the paid providers against their caps (no secrets). */
+  async describeUsage(): Promise<{ provider: string; used: number | null; limit: number; month: string | null; error?: string }[]> {
+    this.getProviders();
+    return Promise.all(
+      this.guards.map(g =>
+        g.status().catch((e: any) => ({ provider: g.providerId, used: null, limit: NaN, month: null, error: String(e?.message || e).slice(0, 120) }))
+      )
+    );
+  }
+
+  /**
+   * v2 discovery used by the viral adaptation pipeline: per-slot planning, multi-provider search,
+   * metadata ranking, safe downloads, duplicate detection and visual verification.
+   * Throws SlotDiscoveryError (with the per-slot report) when a slot cannot be filled safely.
+   */
+  async discoverForSlots(
+    plans: SlotDiscoveryPlan[],
+    referencePath: string | null,
+    enabledProviderIds?: string[]
+  ): Promise<DiscoveryRunResult> {
+    const cfg = getConfig();
+    let providers = this.getProviders();
+    if (enabledProviderIds && enabledProviderIds.length > 0) {
+      const allowed = new Set(enabledProviderIds.map(s => s.toLowerCase()));
+      const filtered = providers.filter(p => allowed.has(p.id.toLowerCase()) && p.isEnabled());
+      if (filtered.length === 0) {
+        throw new BadRequestException('None of the selected search providers are currently enabled or available on the server.');
+      }
+      providers = filtered;
+    }
+    this.logger.log(`Active discovery providers for this run: ${providers.map(p => p.id).join(', ')}`);
+    const engine = new DiscoveryEngine({
+      providers,
+      grounding: this.grounding,
+      verifier: cfg.vision.verifyCandidates === 'off' || !this.runner ? null : new AgyVisualVerifier(this.runner),
+      download: async url => (await politeFetch(url, { timeoutMs: cfg.discovery.downloadTimeoutMs, maxBytes: MAX_UPLOAD_BYTES, userAgent: cfg.discovery.userAgent })).body,
+      config: cfg.discovery,
+      verifyMode: cfg.vision.verifyCandidates,
+      storageDir: this.storageDir,
+      log: m => this.logger.log(m),
+      rightsLookup: this.rightsLookup
+    });
+    return engine.run(plans, referencePath);
   }
 
   /**
@@ -58,14 +225,28 @@ export class InternetSubjectDiscoveryService {
 
     this.logger.log(`Starting internet image discovery for ${countToDiscover} subject slots (Raw Subjects: ${identifiedSubjects.join(', ')})`);
 
-    for (let i = 0; i < countToDiscover; i++) {
-      // Pick subject name for this slot (or cycle if multiple slots for same subject)
+    // Pre-flight: resolve every slot's identity BEFORE any network call. If any subject is
+    // ambiguous we stop here (fail safe) instead of searching for a guessed person.
+    const slotPlans = Array.from({ length: countToDiscover }, (_, i) => {
       const rawSubjectName = identifiedSubjects[i] || identifiedSubjects[identifiedSubjects.length - 1];
       const slotLabel = itemLabels && itemLabels[i] ? itemLabels[i] : undefined;
+      const evidence = [context, slotLabel].filter(v => typeof v === 'string' && v.trim()).join(' ');
+      return { rawSubjectName, slotLabel, profile: resolveSubjectIdentity(rawSubjectName, evidence) };
+    });
+
+    const ambiguous = slotPlans.filter(p => p.profile.status === 'ambiguous');
+    if (ambiguous.length > 0) {
+      const message = ambiguous.map(p => formatAmbiguityMessage(p.profile)).join(' ');
+      this.logger.warn(`Aborting discovery: ${message}`);
+      throw new BadRequestException(message);
+    }
+
+    for (let i = 0; i < countToDiscover; i++) {
+      const { rawSubjectName, slotLabel, profile } = slotPlans[i];
 
       this.logger.log(`\n[Slot ${i + 1}/${countToDiscover}] Resolving and searching internet for subject: "${rawSubjectName}"`);
 
-      const asset = await this.discoverSingleSubject(rawSubjectName, context, slotLabel, i, usedUrls);
+      const asset = await this.discoverSingleSubject(rawSubjectName, context, slotLabel, i, usedUrls, profile);
 
       usedUrls.add(asset.sourceUrl || asset.path);
       selectedAssets.push(asset);
@@ -91,16 +272,21 @@ export class InternetSubjectDiscoveryService {
     context: string | undefined,
     label: string | undefined,
     slotIndex: number,
-    usedUrls: Set<string>
+    usedUrls: Set<string>,
+    resolvedProfile?: SubjectProfile
   ): Promise<UploadedAsset> {
-    // 1. Intelligent Subject Name Resolution
-    const profile: SubjectProfile = resolveSubjectIdentity(rawSubjectName, context);
+    // 1. Strict Subject Identity Resolution (whole-phrase, verified aliases only)
+    const profile: SubjectProfile = resolvedProfile
+      || resolveSubjectIdentity(rawSubjectName, [context, label].filter(Boolean).join(' '));
+    if (profile.status === 'ambiguous') {
+      throw new BadRequestException(formatAmbiguityMessage(profile));
+    }
     const searchQueries: string[] = buildSubjectSearchQueries(rawSubjectName, context, label);
     const verificationTokens: string[] = getSubjectVerificationTokens(rawSubjectName, profile);
 
-    this.logger.log(`  Resolved Identity: "${rawSubjectName}" -> Canonical: "${profile.canonicalName}" (Known: ${profile.isKnownEntity})`);
+    this.logger.log(`  Resolved Identity: "${rawSubjectName}" -> Canonical: "${profile.canonicalName}" (Known: ${profile.isKnownEntity}, Match: ${profile.matchType})`);
     this.logger.log(`  Generated Search Variations (${searchQueries.length}): ${searchQueries.map(q => `"${q}"`).join(', ')}`);
-    this.logger.log(`  Identity Verification Tokens: ${verificationTokens.join(', ')}`);
+    this.logger.log(`  Identity name words: ${verificationTokens.join(', ')}`);
 
     const attemptedProviders = new Set<string>();
     let candidates: InternetImageCandidate[] = [];
@@ -155,7 +341,7 @@ export class InternetSubjectDiscoveryService {
       attemptedProviders.add('DuckDuckGo Web Search');
       for (const q of searchQueries) {
         try {
-          const ddgResults = await this.searchDuckDuckGo(q, verificationTokens);
+          const ddgResults = await this.searchDuckDuckGo(q, profile);
           candidates.push(...ddgResults);
           if (candidates.length >= 4) break;
         } catch (err: any) {
@@ -167,10 +353,24 @@ export class InternetSubjectDiscoveryService {
     // Filter out previously used URLs for deduplication
     const freshCandidates = candidates.filter(c => !usedUrls.has(c.sourceUrl));
 
-    // Verify candidate relevance against resolved tokens (never use unrelated or uncertain images)
-    const relevantCandidates = freshCandidates.filter(c => this.isCandidateRelevant(c, verificationTokens));
+    // Score every candidate's identity relevance (never use unrelated or uncertain images).
+    // Best score first; Array.sort is stable so equal scores keep provider order.
+    let rejectedLogged = 0;
+    const relevantCandidates = freshCandidates
+      .map(c => {
+        const result = scoreSubjectRelevance(c, profile);
+        c.relevanceScore = result.score;
+        if (!result.accepted && rejectedLogged < 8) {
+          rejectedLogged++;
+          this.logger.log(`  ✗ Rejected (score ${result.score} < ${RELEVANCE_ACCEPT_THRESHOLD}): "${c.title}" - ${result.reasons.join('; ')}`);
+        }
+        return { candidate: c, result };
+      })
+      .filter(x => x.result.accepted)
+      .sort((a, b) => b.result.score - a.result.score)
+      .map(x => x.candidate);
 
-    this.logger.log(`  Discovered ${candidates.length} total candidates -> ${relevantCandidates.length} relevant and fresh.`);
+    this.logger.log(`  Discovered ${candidates.length} total candidates -> ${relevantCandidates.length} relevant (score >= ${RELEVANCE_ACCEPT_THRESHOLD}) and fresh.`);
 
     if (relevantCandidates.length === 0) {
       throw new BadRequestException(
@@ -224,57 +424,53 @@ export class InternetSubjectDiscoveryService {
   private async downloadAndVerifyCandidate(
     candidate: InternetImageCandidate
   ): Promise<{ savedPath: string; mimeType: string; width: number; height: number; aspectRatio: number } | null> {
+    // The timeout covers the whole download (headers AND body), and the body is size-capped so a
+    // hostile or huge remote file cannot exhaust memory or hang the request.
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
+    const timeout = setTimeout(() => controller.abort(), 15000);
 
-    let res: Response;
+    let buffer: Buffer;
     try {
-      res = await fetch(candidate.sourceUrl, {
+      const res = await fetch(candidate.sourceUrl, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
         },
         signal: controller.signal
       });
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+
+      const declared = Number(res.headers.get('content-length'));
+      if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+        throw new Error(`Remote file too large (${declared} bytes), limit ${MAX_UPLOAD_BYTES}.`);
+      }
+      buffer = await this.readBodyCapped(res, MAX_UPLOAD_BYTES);
     } finally {
       clearTimeout(timeout);
     }
-
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    }
-
-    const arrayBuffer = await res.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
 
     if (buffer.length < 20000) {
       throw new Error(`File size too small (${buffer.length} bytes), minimum 20KB required.`);
     }
 
-    // Verify magic bytes (JPEG, PNG, WEBP)
-    let ext = 'jpg';
-    let mimeType = 'image/jpeg';
-    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
-      ext = 'png';
-      mimeType = 'image/png';
-    } else if (buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') {
-      ext = 'webp';
-      mimeType = 'image/webp';
-    } else if (buffer[0] === 0xFF && buffer[1] === 0xD8) {
-      ext = 'jpg';
-      mimeType = 'image/jpeg';
-    } else {
-      throw new Error('Unsupported image format; magic bytes do not match JPEG, PNG, or WEBP.');
+    // Content verification (magic bytes, sane dimensions BEFORE decoding, real decode): JPEG, PNG or WebP only
+    let verified: VerifiedImage;
+    try {
+      verified = await verifyImageBuffer(buffer);
+    } catch (err: any) {
+      throw new Error(err instanceof ImageValidationError ? err.message : `Image verification failed: ${err.message}`);
+    }
+    if (verified.width < 250 || verified.height < 250) {
+      throw new Error(`Invalid resolution (${verified.width}x${verified.height}); minimum 250x250 required.`);
     }
 
-    // Canvas Engine verification: Decode with Skia Canvas
-    const canvasImg = await loadImage(buffer);
-    if (!canvasImg.width || !canvasImg.height || canvasImg.width < 250 || canvasImg.height < 250) {
-      throw new Error(`Invalid resolution (${canvasImg.width}x${canvasImg.height}); minimum 250x250 required.`);
-    }
-
-    const width = canvasImg.width;
-    const height = canvasImg.height;
+    const ext = verified.ext.slice(1);
+    const mimeType = verified.mime;
+    const width = verified.width;
+    const height = verified.height;
     const aspectRatio = Number((width / height).toFixed(4));
 
     // Save verified image to isolated storage directory
@@ -290,6 +486,25 @@ export class InternetSubjectDiscoveryService {
       height,
       aspectRatio
     };
+  }
+
+  /** Reads a response body, aborting as soon as it exceeds maxBytes. */
+  private async readBodyCapped(res: Response, maxBytes: number): Promise<Buffer> {
+    if (!res.body) return Buffer.alloc(0);
+    const reader = res.body.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`Remote file exceeds the ${maxBytes} byte limit.`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks);
   }
 
   /**
@@ -358,7 +573,7 @@ export class InternetSubjectDiscoveryService {
   /**
    * Tier 3: Search DuckDuckGo Images
    */
-  private async searchDuckDuckGo(query: string, verificationTokens?: string[]): Promise<InternetImageCandidate[]> {
+  private async searchDuckDuckGo(query: string, profile: SubjectProfile): Promise<InternetImageCandidate[]> {
     try {
       const tokenRes = await fetch(`https://duckduckgo.com/?q=${encodeURIComponent(query)}&iax=images&ia=images`, {
         headers: {
@@ -382,10 +597,7 @@ export class InternetSubjectDiscoveryService {
       const rawResults = (data.results || []).slice(0, 8);
 
       return rawResults
-        .filter((r: any) => {
-          if (!verificationTokens || verificationTokens.length === 0) return false;
-          return this.isCandidateRelevant({ title: r.title, sourceUrl: r.image }, verificationTokens);
-        })
+        .filter((r: any) => scoreSubjectRelevance({ title: r.title, sourceUrl: r.image }, profile).accepted)
         .map((r: any) => ({
           title: r.title,
           sourceUrl: r.image,
@@ -452,28 +664,6 @@ export class InternetSubjectDiscoveryService {
       attribution: val.hostPageDisplayUrl || 'Bing',
       sourceDomain: val.hostPageDisplayUrl || 'bing'
     }));
-  }
-
-  /**
-   * Verifies that the candidate image title, snippet, or URL is strictly relevant to the subject.
-   * Compares against all resolved verification tokens (including aliases, canonical name, and nicknames).
-   */
-  private isCandidateRelevant(
-    candidate: Partial<InternetImageCandidate>,
-    verificationTokens: string[]
-  ): boolean {
-    if (!verificationTokens || verificationTokens.length === 0) return false;
-
-    const candidateText = ((candidate.title || '') + ' ' + (candidate.sourceUrl || '')).toLowerCase();
-
-    // Check if at least one meaningful token matches
-    return verificationTokens.some(token => {
-      const cleanTok = token.toLowerCase().replace(/[^a-z]/g, '');
-      if (['ntr', 'cbn', 'pk'].includes(cleanTok)) {
-        return candidateText.includes(cleanTok);
-      }
-      return cleanTok.length >= 4 && candidateText.includes(cleanTok);
-    });
   }
 
   private ensureStorageDir(): void {

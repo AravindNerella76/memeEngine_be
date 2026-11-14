@@ -4,8 +4,39 @@ import {
   ImageArrangementMode,
   LayoutConfiguration,
   BoundingBox,
-  CanvasDimensionPreset
+  CanvasDimensionPreset,
+  GridSpec
 } from '../types/meme.types';
+import type { LayoutStyle } from '../design/render-style';
+
+const MIN_SLOT_PX = 140;
+const clampW = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(4, Math.max(0.25, v)) : 1);
+
+/**
+ * Validates a relative grid against the number of images: 1-4 rows, 1-4 slots per row, weights
+ * clamped to [0.25, 4]. Returns null when it cannot describe `subjectCount` slots.
+ */
+export function sanitizeGrid(grid: GridSpec | undefined | null, subjectCount: number): GridSpec | null {
+  if (!grid || !Array.isArray(grid.rows) || grid.rows.length < 1 || grid.rows.length > 4) return null;
+  const rows = grid.rows.map(r => ({
+    heightWeight: clampW(r?.heightWeight),
+    slots: Array.isArray(r?.slots) ? r.slots.slice(0, 4).map(sl => ({ widthWeight: clampW(sl?.widthWeight) })) : []
+  }));
+  if (rows.some(r => r.slots.length < 1)) return null;
+  const total = rows.reduce((a, r) => a + r.slots.length, 0);
+  if (total !== subjectCount || total > 8) return null;
+  return { rows };
+}
+
+/** Same structure with equal sizes. */
+export function equalizeGrid(grid: GridSpec): GridSpec {
+  return { rows: grid.rows.map(r => ({ heightWeight: 1, slots: r.slots.map(() => ({ widthWeight: 1 })) })) };
+}
+
+export function gridIsUniform(grid: GridSpec): boolean {
+  const hs = grid.rows.map(r => r.heightWeight);
+  return hs.every(h => Math.abs(h - hs[0]) < 1e-6) && grid.rows.every(r => r.slots.every(sl => Math.abs(sl.widthWeight - r.slots[0].widthWeight) < 1e-6));
+}
 
 export interface CalculatedSlot {
   index: number;
@@ -50,7 +81,13 @@ export interface LayoutCalculationParams {
   reactionHeightRatio?: number;
   headerHeightRatio?: number;
   subjectAspectRatios?: number[];  // Detected width / height of subject images (e.g. 0.75 for 3:4, 0.67 for 2:3)
+  grid?: GridSpec;                 // Relative row/slot sizes for 'custom_grid' or unequal standard layouts
   reactionAspectRatio?: number;    // Detected width / height of reaction image (e.g. 1.78 for 16:9)
+  /**
+   * Geometry from the meme's settings snapshot (safe margin, gaps, punchline share, minimum slot
+   * size, default header share). Omitted for memes made before Settings: the original values apply.
+   */
+  style?: LayoutStyle;
 }
 
 @Injectable()
@@ -62,7 +99,14 @@ export class LayoutEngineService {
    */
   calculateLayout(params: LayoutCalculationParams): ComputedMemeLayout {
     const width = params.width || 1080;
-    const height = params.height || (params.canvasPreset === 'square_1_1' ? 1080 : 1350);
+    const height = params.height || (params.canvasPreset === 'square_1_1' ? 1080 : params.canvasPreset === 'story_9_16' ? 1920 : 1350);
+    const st = params.style;
+    const safe = Math.max(0, st?.safeMargin ?? 0);
+    const sectionGap = Math.max(0, Math.round(st?.sectionGap ?? 0));
+    const imageGap = Math.max(0, Math.round(st?.imageGap ?? 0));
+    const minSlot = st?.minSlotSize ?? MIN_SLOT_PX;
+    /** Horizontal text inset: the layout's own inset, or the safe margin when that is larger. */
+    const inset = (own: number) => Math.max(own, safe);
     const {
       memeType,
       subjectCount,
@@ -80,11 +124,12 @@ export class LayoutEngineService {
     let headerTextBox: BoundingBox | null = null;
 
     if (hasHeader) {
-      const headerRatio = params.headerHeightRatio || (height >= 1350 ? 0.082 : 0.092);
+      const headerRatio = params.headerHeightRatio || st?.defaultHeaderRatio || (height >= 1350 ? 0.082 : 0.092);
       const headerH = Math.round(height * headerRatio);
       headerBox = { x: 0, y: 0, width, height: headerH };
-      headerTextBox = { x: 20, y: 8, width: width - 40, height: headerH - 16 };
-      currentY += headerH;
+      const hx = inset(20);
+      headerTextBox = { x: hx, y: 8, width: width - 2 * hx, height: headerH - 16 };
+      currentY += headerH + sectionGap;
     }
 
     // 2. Calculate Reaction Box (Adaptive to 16:9 / Landscape Aspect Ratio)
@@ -111,26 +156,30 @@ export class LayoutEngineService {
     reactionBox = { x: 0, y: reactionY, width, height: computedReactionH };
 
     if (hasReactionContext) {
+      const tx = inset(40);
       reactionTagBox = {
-        x: 40,
+        x: tx,
         y: reactionY + 14,
-        width: width - 80,
+        width: width - 2 * tx,
         height: 48
       };
     }
 
     if (hasPunchline) {
-      const punchlineH = Math.min(145, Math.round(computedReactionH * 0.38));
+      // Share of the reaction panel (0.38 originally); the 145 px cap scales with it.
+      const share = st?.punchlineRatio ?? 0.38;
+      const punchlineH = Math.min(Math.round((145 * share) / 0.38), Math.round(computedReactionH * share));
+      const px = inset(30);
       punchlineBox = {
-        x: 30,
+        x: px,
         y: reactionY + computedReactionH - punchlineH - 8,
-        width: width - 60,
+        width: width - 2 * px,
         height: punchlineH
       };
     }
 
     // 3. Subject Section (Remaining height between header and reaction)
-    const subjectSectionH = reactionY - currentY;
+    const subjectSectionH = reactionY - sectionGap - currentY;
     const subjectSectionBox: BoundingBox = {
       x: 0,
       y: currentY,
@@ -161,10 +210,22 @@ export class LayoutEngineService {
     }
 
     // 5. Calculate Subject Slots with Seamless Joining (0 gaps, zero divider lines)
-    const subjectSlots: CalculatedSlot[] = [];
+    let subjectSlots: CalculatedSlot[] = [];
     const gap = 0;
 
-    if (arrangement === 'stacked_rows') {
+    const grid = sanitizeGrid(params.grid, subjectCount);
+    if (arrangement === 'custom_grid' && !grid) {
+      // No usable grid: fall back to the closest standard arrangement
+      arrangement = subjectCount <= 1 ? 'single_hero' : subjectCount === 2 ? 'side_by_side' : subjectCount === 3 ? 'columns_3' : subjectCount === 4 ? 'grid_2x2' : 'stacked_rows';
+    }
+
+    if (grid && (arrangement === 'custom_grid' || !gridIsUniform(grid))) {
+      subjectSlots = this.gridSlots(subjectSectionBox, grid);
+      if (subjectSlots.some(sl => sl.box.width < minSlot || sl.box.height < minSlot)) {
+        subjectSlots = this.gridSlots(subjectSectionBox, equalizeGrid(grid));
+      }
+      if (arrangement !== 'custom_grid' && !gridIsUniform(grid)) arrangement = 'custom_grid';
+    } else if (arrangement === 'stacked_rows') {
       const rowCount = Math.max(subjectCount, 2);
       const rowH = Math.floor(subjectSectionBox.height / rowCount);
       for (let i = 0; i < rowCount; i++) {
@@ -288,26 +349,31 @@ export class LayoutEngineService {
       }
     }
 
+    // Gaps between subject images (the background colour shows through) and the safe margin
+    if (imageGap > 0 || safe > 0) subjectSlots = subjectSlots.map(sl => this.applySlotSpacing(sl, subjectSectionBox, imageGap, safe, width));
+
     // 6. Statement and Bullet Point Overlays
     let statementOverlayBox: BoundingBox | null = null;
     let bulletOverlayBox: BoundingBox | null = null;
 
     if (hasStatement) {
       const overlayH = Math.min(230, Math.round(subjectSectionBox.height * 0.42));
+      const ox = inset(40);
       statementOverlayBox = {
-        x: 40,
+        x: ox,
         y: subjectSectionBox.y + subjectSectionBox.height - overlayH - 15,
-        width: width - 80,
+        width: width - 2 * ox,
         height: overlayH
       };
     }
 
     if (hasBulletPoints) {
       const bulletH = Math.min(240, Math.round(subjectSectionBox.height * 0.44));
+      const bx = inset(40);
       bulletOverlayBox = {
-        x: 40,
+        x: bx,
         y: subjectSectionBox.y + subjectSectionBox.height - bulletH - 15,
-        width: width - 80,
+        width: width - 2 * bx,
         height: bulletH
       };
     }
@@ -327,5 +393,57 @@ export class LayoutEngineService {
       reactionTagBox,
       punchlineBox
     };
+  }
+
+  /**
+   * Shrinks a slot at its inner edges so neighbouring images are `gap` px apart (outer edges stay
+   * flush with the section), and keeps its label at least `safe` px from the canvas sides.
+   */
+  private applySlotSpacing(sl: CalculatedSlot, section: BoundingBox, gap: number, safe: number, canvasWidth: number): CalculatedSlot {
+    const b = sl.box;
+    const half = Math.floor(gap / 2);
+    const left = b.x > section.x ? half : 0;
+    const right = b.x + b.width < section.x + section.width ? gap - half : 0;
+    const top = b.y > section.y ? half : 0;
+    const bottom = b.y + b.height < section.y + section.height ? gap - half : 0;
+    const box = { x: b.x + left, y: b.y + top, width: Math.max(1, b.width - left - right), height: Math.max(1, b.height - top - bottom) };
+    let labelBox = sl.labelBox;
+    if (labelBox) {
+      labelBox = { x: labelBox.x + left, y: labelBox.y - bottom, width: labelBox.width - left - right, height: labelBox.height };
+      if (labelBox.x < safe) {
+        labelBox.width -= safe - labelBox.x;
+        labelBox.x = safe;
+      }
+      if (labelBox.x + labelBox.width > canvasWidth - safe) labelBox.width = canvasWidth - safe - labelBox.x;
+      labelBox.width = Math.max(40, labelBox.width);
+    }
+    return { ...sl, box, labelBox, targetAspectRatio: box.width / box.height };
+  }
+
+  /** Deterministic tiling of the subject section from relative weights (exact, no gaps, no overlaps). */
+  gridSlots(section: BoundingBox, grid: GridSpec): CalculatedSlot[] {
+    const slots: CalculatedSlot[] = [];
+    const totalH = grid.rows.reduce((a, r) => a + r.heightWeight, 0);
+    let y = section.y;
+    let index = 0;
+    grid.rows.forEach((row, ri) => {
+      const h = ri === grid.rows.length - 1 ? section.y + section.height - y : Math.round((section.height * row.heightWeight) / totalH);
+      const totalW = row.slots.reduce((a, sl) => a + sl.widthWeight, 0);
+      let x = section.x;
+      row.slots.forEach((sl, ci) => {
+        const w = ci === row.slots.length - 1 ? section.x + section.width - x : Math.round((section.width * sl.widthWeight) / totalW);
+        const lh = Math.min(110, Math.max(50, Math.round(h * 0.2)));
+        slots.push({
+          index: index++,
+          role: `subject_r${ri + 1}c${ci + 1}`,
+          box: { x, y, width: w, height: h },
+          labelBox: { x: x + 8, y: y + h - lh - 8, width: Math.max(40, w - 16), height: lh },
+          targetAspectRatio: w / h
+        });
+        x += w;
+      });
+      y += h;
+    });
+    return slots;
   }
 }
