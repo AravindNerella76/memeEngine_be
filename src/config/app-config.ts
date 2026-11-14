@@ -205,8 +205,13 @@ export interface RuntimeOverrides {
 const MODEL_RE = /^[a-z0-9][a-z0-9._-]{1,63}$/i;
 
 function str(env: NodeJS.ProcessEnv, key: string): string | undefined {
-  const v = env[key];
-  return typeof v === 'string' && v.trim() ? v.trim() : undefined;
+  let v = env[key];
+  if (typeof v !== 'string') return undefined;
+  v = v.trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    v = v.slice(1, -1).trim();
+  }
+  return v ? v : undefined;
 }
 
 function int(env: NodeJS.ProcessEnv, key: string, def: number, min: number, max: number): number {
@@ -314,7 +319,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const verifyRaw = (str(env, 'VISION_VERIFY_CANDIDATES') || 'required').toLowerCase();
 
   return {
-    mongoUri: str(env, 'MONGO_URI') || 'mongodb://127.0.0.1:27017/kanyaraasi_memes',
+    mongoUri:
+      str(env, 'MONGO_URI') ||
+      str(env, 'MONGODB_URI') ||
+      'mongodb://127.0.0.1:27017/kanyaraasi_memes',
     host: str(env, 'HOST') || (env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1'),
     port: int(env, 'PORT', 3000, 1, 65535),
     adaptationMaxConcurrent: int(env, 'ADAPTATION_MAX_CONCURRENT', 1, 1, 4),
