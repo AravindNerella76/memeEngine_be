@@ -1,4 +1,4 @@
-import { HttpException, Injectable, Logger, UnauthorizedException, BadRequestException } from '@nestjs/common';
+import { HttpException, Injectable, Logger, OnModuleInit, UnauthorizedException, BadRequestException, ConflictException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import type { Request } from 'express';
@@ -6,7 +6,7 @@ import { getConfig } from '../config/app-config';
 import { AttemptTracker } from './attempt-tracker';
 import { AuthSession, AuthSessionDocument, AuthUser, AuthUserDocument } from './auth.schemas';
 import { readCookie, sessionCookieName } from './cookies';
-import { dummyHash, hashPassword, passwordProblems, verifyPassword } from './password';
+import { dummyHash, hashPassword, MAX_PASSWORD_LENGTH, passwordProblems, verifyPassword } from './password';
 import { hashToken, isWellFormedToken, newSessionToken } from './session-token';
 
 export interface AuthContext {
@@ -45,7 +45,7 @@ export function normalizeUsername(raw: unknown): string | null {
 }
 
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleInit {
   private readonly logger = new Logger(AuthService.name);
   private ownerKnown = false;
 
@@ -69,6 +69,50 @@ export class AuthService {
   }
 
   // ---- owner -------------------------------------------------------------------------------------
+
+  async onModuleInit(): Promise<void> {
+    await this.ensureStaticOwner();
+  }
+
+  /**
+   * Fixed login from the environment (AUTH_STATIC_USERNAME / AUTH_STATIC_PASSWORD): makes sure its account
+   * exists and matches the configured password, so there is nothing to run on a host without a shell.
+   * Change the password in the environment and restart: the old password stops working and the sessions end.
+   */
+  async ensureStaticOwner(): Promise<void> {
+    const c = getConfig().auth;
+    if (!c.staticUsername || !c.staticPassword) return;
+    const username = normalizeUsername(c.staticUsername);
+    if (!username) {
+      this.logger.error('AUTH_STATIC_USERNAME is not a valid username (3-100 characters: letters, digits and . _ @ + -). The static login is NOT active.');
+      return;
+    }
+    if (c.staticPassword.length > MAX_PASSWORD_LENGTH) {
+      this.logger.error(`AUTH_STATIC_PASSWORD is longer than ${MAX_PASSWORD_LENGTH} characters. The static login is NOT active.`);
+      return;
+    }
+    const existing = await this.users.findOne({ username });
+    if (!existing) {
+      await this.users.create({ username, passwordHash: await hashPassword(c.staticPassword), passwordChangedAt: new Date() });
+    } else if (!(await verifyPassword(c.staticPassword, existing.passwordHash)).ok) {
+      await this.users.updateOne({ _id: existing._id }, { $set: { passwordHash: await hashPassword(c.staticPassword), passwordChangedAt: new Date() } });
+      await this.logoutOthers(String(existing._id));
+    }
+    this.ownerKnown = true;
+    const weak = passwordProblems(c.staticPassword, username).length > 0;
+    this.logger.warn(
+      `STATIC login is active for "${username}" (AUTH_STATIC_USERNAME / AUTH_STATIC_PASSWORD)${weak ? ' and its password is weak' : ''}. ` +
+        `Anyone who knows this address and these credentials can sign in${c.appHosts.length ? ' (this server has a PUBLIC host: APP_HOSTS)' : ''}. ` +
+        'Fine for development; before sharing the address remove both settings and run: npm run auth:create-owner'
+    );
+  }
+
+  /** Flags for the app, only when this user is the fixed login (never the credentials themselves). */
+  staticFlags(username: string): { staticCredentials?: true; staticWeak?: boolean } {
+    const c = getConfig().auth;
+    if (!c.staticUsername || !c.staticPassword || normalizeUsername(c.staticUsername) !== username) return {};
+    return { staticCredentials: true, staticWeak: passwordProblems(c.staticPassword, username).length > 0 };
+  }
 
   async ownerExists(): Promise<boolean> {
     if (this.ownerKnown) return true;
@@ -184,6 +228,13 @@ export class AuthService {
   // ---- password ----------------------------------------------------------------------------------
 
   async changePassword(ctx: AuthContext, current: unknown, next: unknown, client: ClientInfo): Promise<{ otherSessionsEnded: number }> {
+    if (this.staticFlags(ctx.username).staticCredentials) {
+      throw new ConflictException({
+        statusCode: 409,
+        code: 'static_credentials',
+        message: 'This login is fixed by the server settings (AUTH_STATIC_USERNAME / AUTH_STATIC_PASSWORD). Change it there, or remove them and run: npm run auth:create-owner'
+      });
+    }
     const key = `pw|${ctx.userId}|${client.ip}`;
     const c = this.byUserAndIp.check(key);
     if (c.blocked) throw new TooManyAttemptsException(c.retryAfterSec);

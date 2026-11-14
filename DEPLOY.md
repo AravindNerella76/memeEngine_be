@@ -39,6 +39,21 @@ npm start            # run under a process manager (pm2, systemd, a Windows serv
 The server prints a warning at start if `APP_HOSTS` is set without `TRUST_PROXY`, or the cookie is not `Secure`,
 and refuses to start at all if login is off while it is reachable from outside.
 
+### Hosts without a shell (e.g. Render): the static login
+
+If you cannot run `npm run auth:create-owner`, set two environment variables in the host's dashboard instead:
+
+```ini
+AUTH_STATIC_USERNAME=admin
+AUTH_STATIC_PASSWORD=admin        # fine for a private test, NOT for a link you share
+```
+
+The server creates that account at start. Treat it as a placeholder: on a public address a guessable password
+lets anyone sign in. When you are ready, put a long password in `AUTH_STATIC_PASSWORD` (a few random words),
+or delete both variables and create a private owner (`node dist/auth/cli.js create-owner` in the host's shell, or
+from your PC with `MONGO_URI` pointed at the hosted database). Changing the variable and restarting signs
+everyone out.
+
 ## 2. Frontend
 
 ```bash

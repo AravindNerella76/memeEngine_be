@@ -214,3 +214,87 @@ describe('sign-in over HTTP (integration)', { skip }, () => {
     assert.equal((await login(OWNER, PASSWORD)).status, 200);
   });
 });
+
+describe('static login from the environment (integration)', { skip }, () => {
+  let app: any;
+  let base = '';
+  let svc: AuthService;
+  const call = async (path: string, init: { method?: string; body?: unknown; cookie?: string } = {}) => {
+    const res = await fetch(base + path, {
+      method: init.method || 'GET',
+      headers: { 'Content-Type': 'application/json', ...(init.cookie ? { cookie: init.cookie } : {}) },
+      body: init.body === undefined ? undefined : JSON.stringify(init.body)
+    });
+    const json: any = await res.json().catch(() => null);
+    return { status: res.status, json, cookie: (res.headers.get('set-cookie') || '').split(';')[0] };
+  };
+  const login = (username: string, password: string) => call('/api/auth/login', { method: 'POST', body: { username, password } });
+  const env = (password: string) => loadConfig({ AUTH_STATIC_USERNAME: 'Admin', AUTH_STATIC_PASSWORD: password });
+
+  before(async () => {
+    Logger.overrideLogger(false);
+    setConfigForTests(env('admin'));
+    @Module({
+      imports: [MongooseModule.forRoot(URI as string), MongooseModule.forFeature([{ name: AuthUser.name, schema: AuthUserSchema }, { name: AuthSession.name, schema: AuthSessionSchema }])],
+      controllers: [AuthController, ProbeController],
+      providers: [AuthService, { provide: APP_GUARD, useClass: AuthGuard }]
+    })
+    class StaticModule {}
+    app = await NestFactory.create(StaticModule, { logger: false });
+    await app.listen(0, '127.0.0.1');
+    base = `http://127.0.0.1:${app.getHttpServer().address().port}`;
+    svc = app.get(AuthService);
+    await svc['users'].deleteMany({});
+    await svc['sessions'].deleteMany({});
+    await svc.ensureStaticOwner();
+  });
+
+  after(async () => {
+    await svc?.['users'].deleteMany({});
+    await svc?.['sessions'].deleteMany({});
+    await app?.close();
+    await mongoose.disconnect().catch(() => undefined);
+    setConfigForTests(null);
+  });
+
+  it('admin / admin signs in (the username is not case-sensitive) and the app is told it is a weak static login', async () => {
+    const r = await login('ADMIN', 'admin');
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, { authenticated: true, username: 'admin', staticCredentials: true, staticWeak: true });
+    const me = await call('/api/auth/me', { cookie: r.cookie });
+    assert.equal(me.json.staticCredentials, true);
+    assert.equal((await call('/api/secret', { cookie: r.cookie })).status, 200);
+  });
+
+  it('a wrong password is still refused', async () => {
+    assert.equal((await login('admin', 'Admin')).status, 401);
+    assert.equal((await login('admin', 'admin ')).status, 401);
+  });
+
+  it('the password cannot be changed from the app (the server settings own it)', async () => {
+    const { cookie } = await login('admin', 'admin');
+    const r = await call('/api/auth/change-password', { method: 'POST', cookie, body: { currentPassword: 'admin', newPassword: 'a-much-better-passphrase-2026' } });
+    assert.equal(r.status, 409);
+    assert.equal(r.json.code, 'static_credentials');
+  });
+
+  it('is idempotent: restarting does not create a second account', async () => {
+    await svc.ensureStaticOwner();
+    await svc.ensureStaticOwner();
+    assert.equal(await svc['users'].countDocuments({ username: 'admin' }), 1);
+  });
+
+  it('changing the password in the environment replaces it and ends every old session', async () => {
+    const old = await login('admin', 'admin');
+    assert.equal((await call('/api/secret', { cookie: old.cookie })).status, 200);
+
+    setConfigForTests(env('a-much-better-passphrase-2026')); // what editing the host setting and restarting does
+    await svc.ensureStaticOwner();
+
+    assert.equal((await call('/api/secret', { cookie: old.cookie })).status, 401, 'old sessions are ended');
+    assert.equal((await login('admin', 'admin')).status, 401, 'the old password no longer works');
+    const fresh = await login('admin', 'a-much-better-passphrase-2026');
+    assert.equal(fresh.status, 200);
+    assert.equal(fresh.json.staticWeak, false, 'a strong password is not flagged weak');
+  });
+});

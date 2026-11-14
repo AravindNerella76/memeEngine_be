@@ -136,6 +136,12 @@ export interface AuthConfig {
   appHosts: string[];
   /** APP_PUBLIC_URL: the address the owner opens in the browser. OAuth returns the browser here. */
   appPublicUrl: string;
+  /**
+   * AUTH_STATIC_USERNAME + AUTH_STATIC_PASSWORD: a fixed login from the environment, no command needed.
+   * For development and first deploys only: the password sits in plain text in .env / the host's settings.
+   */
+  staticUsername?: string;
+  staticPassword?: string;
   /** AUTH_COOKIE_SECURE: send the session cookie over HTTPS only. Default: on when APP_PUBLIC_URL is https. */
   cookieSecure: boolean;
   /** AUTH_SESSION_IDLE_DAYS: a session ends after this many days without use. */
@@ -232,11 +238,16 @@ export function parseHostList(raw: string | undefined): string[] {
 }
 
 function loadAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
-  const appPublicUrl = (str(env, 'APP_PUBLIC_URL') || 'http://localhost:5173').replace(/\/+$/, '');
+  const staticUser = str(env, 'AUTH_STATIC_USERNAME');
+  const staticPass = typeof env.AUTH_STATIC_PASSWORD === 'string' && env.AUTH_STATIC_PASSWORD.length > 0 ? env.AUTH_STATIC_PASSWORD : undefined; // exact, not trimmed
+  const hasStatic = Boolean(staticUser && staticPass);
+  const appPublicUrl =(str(env, 'APP_PUBLIC_URL') || 'http://localhost:5173').replace(/\/+$/, '');
   return {
     enabled: bool(env, 'AUTH_ENABLED', true),
     appHosts: parseHostList(env.APP_HOSTS),
     appPublicUrl,
+    staticUsername: hasStatic ? staticUser : undefined,
+    staticPassword: hasStatic ? staticPass : undefined,
     cookieSecure: bool(env, 'AUTH_COOKIE_SECURE', /^https:\/\//i.test(appPublicUrl)),
     sessionIdleDays: int(env, 'AUTH_SESSION_IDLE_DAYS', 7, 1, 90),
     sessionMaxDays: int(env, 'AUTH_SESSION_MAX_DAYS', 30, 1, 365),
@@ -478,6 +489,7 @@ export function describeConfig(cfg: AppConfig): Record<string, unknown> {
       enabled: cfg.auth.enabled,
       appHosts: cfg.auth.appHosts,
       appPublicUrl: cfg.auth.appPublicUrl,
+      staticLogin: Boolean(cfg.auth.staticUsername), // never the credentials themselves
       cookieSecure: cfg.auth.cookieSecure,
       trustProxy: cfg.auth.trustProxy,
       sessionIdleDays: cfg.auth.sessionIdleDays,

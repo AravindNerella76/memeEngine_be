@@ -115,6 +115,15 @@ state-changing request the browser labels cross-site is refused.
 | `AUTH_SESSION_IDLE_DAYS` / `AUTH_SESSION_MAX_DAYS` | `7` / `30` | Session lifetime. |
 | `AUTH_MAX_FAILURES` / `AUTH_LOCK_MINUTES` | `5` / `15` | Wrong-password limit and lock time. |
 
+**Temporary static login.** `AUTH_STATIC_USERNAME` + `AUTH_STATIC_PASSWORD` define a fixed login straight from the
+environment, so there is nothing to run (useful on a host without a shell). The account is created or updated at
+every start; changing the password in the environment and restarting replaces it and signs everyone out. The
+password is stored hashed in the database but sits in plain text in `.env` / the host's settings, may be as weak as
+you like, and cannot be changed from the Account page. The app shows a "Temporary login" reminder while it is in
+use. **Anyone who knows the address and these two values can sign in** (and publish to Instagram, delete memes, use
+your paid search quotas). To replace it with a private password: delete both settings and run
+`npm run auth:create-owner`.
+
 Running it on a public address: see [DEPLOY.md](DEPLOY.md).
 
 ## Tests

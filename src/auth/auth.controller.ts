@@ -29,7 +29,7 @@ export class AuthController {
     res.setHeader('Cache-Control', 'no-store');
     if (!getConfig().auth.enabled) return { authEnabled: false, authenticated: true, username: null };
     const session = await this.auth.sessionFromRequest(req);
-    if (session) return { authEnabled: true, authenticated: true, username: session.username };
+    if (session) return { authEnabled: true, authenticated: true, username: session.username, ...this.auth.staticFlags(session.username) };
     return { authEnabled: true, authenticated: false, setupRequired: !(await this.auth.ownerExists()) };
   }
 
@@ -42,7 +42,7 @@ export class AuthController {
     try {
       const s = await this.auth.login(username, password, clientOf(req));
       res.setHeader('Set-Cookie', sessionCookie(s.token, { secure: getConfig().auth.cookieSecure, maxAgeSeconds: s.maxAgeSeconds }));
-      return { authenticated: true, username: s.username };
+      return { authenticated: true, username: s.username, ...this.auth.staticFlags(s.username) };
     } catch (e) {
       if (e instanceof TooManyAttemptsException) res.setHeader('Retry-After', String(e.retryAfterSec));
       throw e;

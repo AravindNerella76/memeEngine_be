@@ -14,7 +14,7 @@ import { clearedSessionCookie, readCookie, sessionCookie, sessionCookieName } fr
 import { dummyHash, hashPassword, passwordProblems, verifyPassword } from '../auth/password';
 import { Public } from '../auth/public.decorator';
 import { hashToken, isWellFormedToken, newSessionToken } from '../auth/session-token';
-import { loadConfig, parseHostList, setConfigForTests } from '../config/app-config';
+import { describeConfig, loadConfig, parseHostList, setConfigForTests } from '../config/app-config';
 import { defaultGuardOptions, hostAndOriginGuard, tunnelPathGuard } from '../security/http-guards';
 
 describe('password hashing', () => {
@@ -280,5 +280,25 @@ describe('AuthGuard', () => {
   it('does nothing when login is switched off', async () => {
     enable({ AUTH_ENABLED: 'false' });
     assert.equal(await new AuthGuard(new Reflector(), fakeAuth(null)).canActivate(ctx(Routes.prototype.secret, req())), true);
+  });
+});
+
+describe('static login configuration (AUTH_STATIC_*)', () => {
+  it('is off unless both the username and the password are set', () => {
+    assert.equal(loadConfig({}).auth.staticUsername, undefined);
+    assert.equal(loadConfig({ AUTH_STATIC_USERNAME: 'admin' }).auth.staticPassword, undefined);
+    assert.equal(loadConfig({ AUTH_STATIC_PASSWORD: 'admin' }).auth.staticUsername, undefined);
+    assert.equal(loadConfig({ AUTH_STATIC_USERNAME: 'admin', AUTH_STATIC_PASSWORD: '' }).auth.staticUsername, undefined);
+  });
+  it('reads both; the username is trimmed, the password is kept exactly as written', () => {
+    const a = loadConfig({ AUTH_STATIC_USERNAME: ' admin ', AUTH_STATIC_PASSWORD: ' pa ss ' }).auth;
+    assert.equal(a.staticUsername, 'admin');
+    assert.equal(a.staticPassword, ' pa ss ');
+  });
+  it('never puts the credentials into the log-safe description', () => {
+    const d = JSON.stringify(describeConfig(loadConfig({ AUTH_STATIC_USERNAME: 'admin', AUTH_STATIC_PASSWORD: 'hunter2-secret-value' })));
+    assert.ok(d.includes('"staticLogin":true'));
+    assert.ok(!d.includes('hunter2-secret-value'));
+    assert.ok(!JSON.stringify(describeConfig(loadConfig({}))).includes('"staticLogin":true'));
   });
 });
