@@ -17,6 +17,23 @@ import { validateUploadPayload } from '../security/request-validation';
 import type { UploadedAsset } from '../types/meme.types';
 import { ConvertedFrom, MAX_CONVERT_INPUT_BYTES, normalizeImageBuffer } from '../security/image-normalize';
 import { SafeFetchError, safeFetch } from '../security/safe-fetch';
+import { loadImage } from '@napi-rs/canvas';
+import { OUTPUT_ROOT } from '../security/path-guard';
+import { ReactionLibraryService } from './reaction-library.service';
+import { ReactionAnalysis, ReactionFraming, analyzeReactionImage } from './reaction-framing';
+import {
+  SHEET_PAGE,
+  describeFraming,
+  folderListText,
+  framingFromRow,
+  framingOptions,
+  framingQuestionText,
+  parseFolderReply,
+  parseFramingAnswer,
+  renderFramingSheet,
+  renderSheet,
+  softWarning
+} from './whatsapp-reaction-ui';
 
 /** An image received from the user, already checked and (when needed) converted to JPEG/PNG/WebP. */
 export interface ReceivedImage {
@@ -33,6 +50,8 @@ export class WhatsAppService {
   private readonly logger = new Logger(WhatsAppService.name);
   private readonly seenMessageIds = new Set<string>();
   private readonly mediaDir = path.join(__dirname, '..', '..', 'uploads', 'whatsapp');
+  /** Where picture sheets are written (served publicly under /output so WhatsApp can fetch them). */
+  protected sheetDir = OUTPUT_ROOT;
 
   constructor(
     @InjectModel(WhatsAppSession.name)
@@ -43,7 +62,9 @@ export class WhatsAppService {
     private readonly selection: ImageSelectionService,
     private readonly formats: FormatLibraryService,
     // Token and phone number ID saved in the app (Settings > WhatsApp); falls back to the server settings
-    @Optional() private readonly credentials?: WhatsAppCredentialsService
+    @Optional() private readonly credentials?: WhatsAppCredentialsService,
+    // The owner's saved reaction pictures (the Reactions page of the app)
+    @Optional() private readonly reactions?: ReactionLibraryService
   ) {
     if (!fs.existsSync(this.mediaDir)) {
       fs.mkdirSync(this.mediaDir, { recursive: true });
@@ -154,6 +175,46 @@ export class WhatsAppService {
       return true;
     } catch (err: any) {
       this.logger.error(`Error sending WhatsApp image: ${err?.message || err}`);
+      return false;
+    }
+  }
+
+  /**
+   * Sends a WhatsApp list message (a tap-to-choose menu of up to 10 rows). Rows: { id, title (24), description (72) }.
+   * Returns false when it could not be sent, so the caller can ask in plain text instead.
+   */
+  async sendListMessage(to: string, body: string, buttonText: string, rows: Array<{ id: string; title: string; description?: string }>): Promise<boolean> {
+    const cfg = await this.currentCredentials();
+    if (!cfg.accessToken || !cfg.phoneNumberId) return false;
+    try {
+      const res = await fetch(`https://graph.facebook.com/${cfg.apiVersion}/${cfg.phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to,
+          type: 'interactive',
+          interactive: {
+            type: 'list',
+            body: { text: body.slice(0, 1024) },
+            action: {
+              button: buttonText.slice(0, 20),
+              sections: [{ title: 'Choose one', rows: rows.slice(0, 10).map(r => ({ id: r.id.slice(0, 200), title: r.title.slice(0, 24), ...(r.description ? { description: r.description.slice(0, 72) } : {}) })) }]
+            }
+          }
+        })
+      });
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        this.logger.warn(`Could not send a WhatsApp list message (asking in plain text instead): ${JSON.stringify(errJson)}`);
+        this.credentials?.noteSendResult(errJson);
+        return false;
+      }
+      this.credentials?.noteSendResult(null);
+      return true;
+    } catch (err: any) {
+      this.logger.warn(`Error sending a WhatsApp list message: ${err?.message || err}`);
       return false;
     }
   }
@@ -316,6 +377,13 @@ export class WhatsAppService {
 
     const type = message.type;
 
+    // A tap on a list row or a button (the frame question)
+    if (type === 'interactive') {
+      const reply = message.interactive?.list_reply || message.interactive?.button_reply;
+      if (session.state === 'AWAITING_FRAMING' && reply?.id) await this.answerFraming(session, from, String(reply.id));
+      return;
+    }
+
     // Handle Text Commands
     if (type === 'text') {
       const text = (message.text?.body || '').trim();
@@ -328,8 +396,9 @@ export class WhatsAppService {
           `🎭 *Meme Engine WhatsApp Bot*\n\n` +
           `To create and publish a meme:\n` +
           `1️⃣ Send the *Reference Meme* screenshot\n` +
-          `2️⃣ Send the *Reaction Image*\n` +
-          `3️⃣ Send the *Punchline Text*\n\n` +
+          `2️⃣ Send the *Reaction Image* — or send *Library* to pick one of your saved reactions (folders like Shocking, Sad, Praise)\n` +
+          `3️⃣ If the reaction picture has stacked frames I will ask which frame to use\n` +
+          `4️⃣ Send the *Punchline Text*\n\n` +
           `Or send *Manual* to build a meme from your own images and text.\n\n` +
           `📎 *Best quality:* send pictures as a *Document* (📎 → Document): JPG, PNG, WebP, HEIC or PDF. ` +
           `You can also paste a direct image link.\n\n` +
@@ -355,11 +424,15 @@ export class WhatsAppService {
           from,
           `📊 Current Status: *${session.state}*\n` +
           `Reference Image: ${session.referenceImagePath ? '✅ Ready' : '❌ Not set'}\n` +
-          `Reaction Image: ${session.reactionImagePath ? '✅ Ready' : '❌ Not set'}\n` +
+          `Reaction Image: ${session.reactionImagePath ? `✅ Ready${session.reactionLibraryId ? ' (from your library)' : ''}` : '❌ Not set'}\n` +
+          (session.reactionFraming ? `Framing: ${describeFraming(session.reactionFraming as ReactionFraming)}\n` : '') +
           `Punchline: ${session.punchline ? `"${session.punchline}"` : '❌ Not set'}`
         );
         return;
       }
+
+      // Reaction library and the "which frame?" question
+      if (await this.handleReactionFlowText(session, from, text, lower)) return;
 
       // Layout library: list / add / name / delete saved layouts (and the naming step after learning one)
       if (await this.handleLayoutCommand(session, from, text, lower)) return;
@@ -446,7 +519,7 @@ export class WhatsAppService {
       }
 
       if (session.state === 'AWAITING_REACTION') {
-        await this.sendTextMessage(from, '🎭 Please send the *reaction image* (e.g. Brahmanandam, Pawan Kalyan, etc.) to continue.');
+        await this.sendTextMessage(from, '🎭 Please send the *reaction image* (e.g. Brahmanandam, Pawan Kalyan, etc.) to continue.' + (await this.libraryHint()));
         return;
       }
     }
@@ -458,7 +531,7 @@ export class WhatsAppService {
     }
   }
 
-  private static readonly IMAGE_STATES = ['IDLE', 'AWAITING_REACTION', 'MANUAL_SUBJECTS', 'MANUAL_REACTION', 'AWAITING_SLOT_IMAGE', 'LAYOUT_EXAMPLE'];
+  private static readonly IMAGE_STATES = ['IDLE', 'AWAITING_REACTION', 'MANUAL_SUBJECTS', 'MANUAL_REACTION', 'AWAITING_SLOT_IMAGE', 'LAYOUT_EXAMPLE', 'AWAITING_FRAMING', 'LIBRARY_FOLDERS', 'LIBRARY_PICK'];
   private readonly qualityTipShown = new Set<string>();
 
   /** True when the bot is waiting for a picture, so a pasted link is treated as one. */
@@ -504,6 +577,10 @@ export class WhatsAppService {
         );
       }
 
+      // A picture sent while the library or the frame question is open is a new reaction picture: carry on from there
+      if (session.state === 'AWAITING_FRAMING') session.state = session.framingNext === 'manual' ? 'MANUAL_REACTION' : 'AWAITING_REACTION';
+      else if (session.state === 'LIBRARY_FOLDERS' || session.state === 'LIBRARY_PICK') session.state = (session.libraryBack as any) || 'AWAITING_REACTION';
+
       if (session.state === 'LAYOUT_EXAMPLE') {
         await this.handleLayoutExample(session, from, downloaded, caption);
         return;
@@ -536,7 +613,7 @@ export class WhatsAppService {
           await this.sendTextMessage(
             from,
             `📸 *Reference meme received!* (Caption: "${caption}")\n\n` +
-            `Now please send the *Reaction Image* (e.g. reacting actor/character photo).`
+            `Now please send the *Reaction Image* (e.g. reacting actor/character photo).` + (await this.libraryHint())
           );
         } else {
           session.state = 'AWAITING_REACTION';
@@ -545,61 +622,24 @@ export class WhatsAppService {
           await this.sendTextMessage(
             from,
             `📸 *Reference meme received!*\n\n` +
-            `Now please send the *Reaction Image* (e.g. Brahmanandam, Pawan Kalyan photo).`
+            `Now please send the *Reaction Image* (e.g. Brahmanandam, Pawan Kalyan photo).` + (await this.libraryHint())
           );
         }
         return;
       }
 
-      if (session.state === 'AWAITING_REACTION') {
+      if (session.state === 'AWAITING_REACTION' || session.state === 'AWAITING_PUNCHLINE') {
+        const replacing = session.state === 'AWAITING_PUNCHLINE';
         session.reactionImagePath = downloaded.filePath;
         session.reactionMimeType = downloaded.mimeType;
+        session.reactionLibraryId = null; // a picture sent by hand, not one from the library
+        session.reactionFraming = null; // not decided yet: a stacked picture asks
 
         // If punchline was attached to the reaction image or previously set
-        if (caption) {
-          session.punchline = caption;
-        }
+        if (caption) session.punchline = caption;
 
-        if (session.punchline) {
-          session.state = 'GENERATING';
-          await session.save();
-
-          await this.sendTextMessage(from, '⏳ *Generating your meme...* Running AI vision analysis & discovering clean subject images. This takes ~30-60s.');
-          await this.generateAndSendMeme(session, from);
-          return;
-        }
-
-        session.state = 'AWAITING_PUNCHLINE';
-        await session.save();
-
-        await this.sendTextMessage(
-          from,
-          `🎭 *Reaction image received!*\n\n` +
-          `Now send the *Reacting Text / Punchline* (in Telugu or English) to place on the reaction image.`
-        );
-        return;
-      }
-
-      if (session.state === 'AWAITING_PUNCHLINE') {
-        session.reactionImagePath = downloaded.filePath;
-        session.reactionMimeType = downloaded.mimeType;
-
-        if (caption) {
-          session.punchline = caption;
-          session.state = 'GENERATING';
-          await session.save();
-
-          await this.sendTextMessage(from, '⏳ *Generating your meme...* Running AI vision analysis & discovering clean subject images. This takes ~30-60s.');
-          await this.generateAndSendMeme(session, from);
-          return;
-        }
-
-        await session.save();
-        await this.sendTextMessage(
-          from,
-          `🎭 *Reaction image updated!*\n\n` +
-          `Now send the *Reacting Text / Punchline* to start generating.`
-        );
+        // A stacked picture asks which frame first; then generation (when the punchline is known) or the punchline question
+        await this.afterReaction(session, from, 'viral', { updated: replacing });
         return;
       }
     } catch (err: any) {
@@ -633,7 +673,8 @@ export class WhatsAppService {
             overrides: await this.stageOverrides(session),
             reaction: this.uploadOf(session.reactionImagePath, session.reactionMimeType),
             punchline: session.punchline,
-            reactionContext: session.reactionContext || undefined
+            reactionContext: session.reactionContext || undefined,
+            reactionFraming: (session.reactionFraming as ReactionFraming | null) || undefined
           });
           meme = adaptation.meme;
           break;
@@ -650,6 +691,7 @@ export class WhatsAppService {
       session.viralDraftId = null;
       session.viralOverrides = [];
       session.viralMissing = [];
+      this.noteLibraryUse(session);
       await this.deliverMeme(session, to, meme, session.punchline);
       if (adaptation?.adaptationMetadata?.layoutFormat?.newlyLearned) {
         await this.sendTextMessage(to, '📐 I learned a new layout from that reference. Send *Layouts* to see it and give it a name.');
@@ -911,14 +953,14 @@ export class WhatsAppService {
           }
           session.state = 'MANUAL_REACTION';
           await session.save();
-          await this.sendTextMessage(from, `🎭 ${session.manualSubjects.length} subject image(s) saved. Now send the *reaction image* (a caption becomes the punchline).`);
+          await this.sendTextMessage(from, `🎭 ${session.manualSubjects.length} subject image(s) saved. Now send the *reaction image* (a caption becomes the punchline).` + (await this.libraryHint()));
           return;
         }
         await this.sendTextMessage(from, 'Send a subject image, or *done* when you have sent them all.');
         return;
       }
       case 'MANUAL_REACTION':
-        await this.sendTextMessage(from, 'Please send the *reaction image*.');
+        await this.sendTextMessage(from, 'Please send the *reaction image*.' + (await this.libraryHint()));
         return;
       case 'MANUAL_PUNCHLINE':
         session.punchline = text;
@@ -951,7 +993,7 @@ export class WhatsAppService {
         // A saved layout has an exact number of images: continue by itself
         session.state = 'MANUAL_REACTION';
         await session.save();
-        await this.sendTextMessage(from, `${added} That is all ${n} images.\n🎭 Now send the *reaction image* (a caption becomes the punchline).`);
+        await this.sendTextMessage(from, `${added} That is all ${n} images.\n🎭 Now send the *reaction image* (a caption becomes the punchline).` + (await this.libraryHint()));
         return;
       }
       await this.sendTextMessage(from, `${added} ${session.manualSlotCount ? `${session.manualSlotCount - n} more to go.` : 'Send more, or *done*.'}`);
@@ -961,14 +1003,10 @@ export class WhatsAppService {
     if (session.state === 'MANUAL_REACTION' || session.state === 'MANUAL_PUNCHLINE') {
       session.reactionImagePath = downloaded.filePath;
       session.reactionMimeType = downloaded.mimeType;
-      if (caption) {
-        session.punchline = caption;
-        await this.generateManualMeme(session, from);
-        return;
-      }
-      session.state = 'MANUAL_PUNCHLINE';
-      await session.save();
-      await this.sendTextMessage(from, `🎭 Reaction image received! Now send the *punchline* text.`);
+      session.reactionLibraryId = null;
+      session.reactionFraming = null;
+      if (caption) session.punchline = caption;
+      await this.afterReaction(session, from, 'manual', {});
       return;
     }
 
@@ -1031,7 +1069,9 @@ export class WhatsAppService {
         }
       }
 
-      const meme = await this.memeEngine.generateMeme({ content, assets: { subjectImages, reactionImage }, design, layout: finalLayout });
+      const withFraming = session.reactionFraming ? { ...(design || {}), reactionFraming: session.reactionFraming as ReactionFraming } : design;
+      const meme = await this.memeEngine.generateMeme({ content, assets: { subjectImages, reactionImage }, design: withFraming as any, layout: finalLayout });
+      this.noteLibraryUse(session);
       await this.deliverMeme(session, to, meme, session.punchline);
     } catch (err: any) {
       this.logger.error(`Error in WhatsApp manual meme generation: ${err?.message || err}`);
@@ -1041,6 +1081,319 @@ export class WhatsAppService {
       );
       await this.resetSession(session);
     }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Reaction library and the "which frame?" question: the same flow as the studio, in a chat
+  // ---------------------------------------------------------------------------------------------
+
+  private static readonly LIBRARY_STATES = ['LIBRARY_FOLDERS', 'LIBRARY_PICK'];
+  private static readonly REACTION_STATES = ['AWAITING_REACTION', 'AWAITING_PUNCHLINE', 'MANUAL_REACTION', 'MANUAL_PUNCHLINE'];
+
+  /** One line offering the library when it holds something (empty text when it does not or is not available). */
+  private async libraryHint(): Promise<string> {
+    if (!this.reactions) return '';
+    try {
+      const { total } = await this.reactions.categories();
+      return total ? `\n🗂️ Or send *Library* to pick one of your ${total} saved reactions.` : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /** The public address of a picture written to the output folder (WhatsApp fetches pictures from a public link). */
+  private async writeSheet(buf: Buffer): Promise<string> {
+    await fs.promises.mkdir(this.sheetDir, { recursive: true });
+    // sheets are only needed for the chat in progress: forget the old ones
+    try {
+      for (const f of await fs.promises.readdir(this.sheetDir)) {
+        if (!f.startsWith('wa_sheet_')) continue;
+        const p = path.join(this.sheetDir, f);
+        if (Date.now() - (await fs.promises.stat(p)).mtimeMs > 6 * 3600 * 1000) await fs.promises.unlink(p).catch(() => undefined);
+      }
+    } catch {
+      /* nothing to tidy */
+    }
+    const name = `wa_sheet_${randomUUID()}.jpg`;
+    await fs.promises.writeFile(path.join(this.sheetDir, name), buf);
+    return `${getConfig().instagram.publicBaseUrl}/output/${name}`;
+  }
+
+  /** The reaction picture of this session, decoded and looked at (null when it cannot be read: then nothing is asked). */
+  private async reactionLook(session: WhatsAppSessionDocument): Promise<{ img: any; a: ReactionAnalysis } | null> {
+    if (!session.reactionImagePath) return null;
+    try {
+      const img = await loadImage(session.reactionImagePath);
+      return { img, a: analyzeReactionImage(img) };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Counts the library picture as used once a meme was made with it (the studio's quick-pick row sorts by this). */
+  private noteLibraryUse(session: WhatsAppSessionDocument): void {
+    if (session.reactionLibraryId) this.reactions?.markUsed(session.reactionLibraryId).catch(() => undefined);
+  }
+
+  /**
+   * Handles what is said while the library or the frame question is open, and opens the library on request.
+   * Returns true when the message was handled.
+   */
+  private async handleReactionFlowText(session: WhatsAppSessionDocument, from: string, text: string, lower: string): Promise<boolean> {
+    if (session.state === 'AWAITING_FRAMING') {
+      await this.answerFraming(session, from, text);
+      return true;
+    }
+    if (session.state === 'LIBRARY_FOLDERS') {
+      await this.libraryFolderReply(session, from, text, lower);
+      return true;
+    }
+    if (session.state === 'LIBRARY_PICK') {
+      await this.libraryPickReply(session, from, text, lower);
+      return true;
+    }
+    const m = /^(?:library|reactions?|reaction library|lib|my reactions?)(?:\s+(.+))?$/i.exec(text.trim());
+    if (!m || !this.reactions) return false;
+    if (session.state === 'IDLE') {
+      await this.sendTextMessage(from, '🗂️ Send the *reference meme* screenshot first. After that, send *Library* to pick one of your saved reaction pictures.');
+      return true;
+    }
+    if (!WhatsAppService.REACTION_STATES.includes(session.state)) return false;
+    await this.openLibrary(session, from, m[1]);
+    return true;
+  }
+
+  /** The folder list (or, with words, straight to a search). */
+  private async openLibrary(session: WhatsAppSessionDocument, from: string, search?: string): Promise<void> {
+    const library = this.reactions as ReactionLibraryService;
+    if (!WhatsAppService.LIBRARY_STATES.includes(session.state)) session.libraryBack = session.state;
+    const { categories, total } = await library.categories();
+    if (!total) {
+      await this.sendTextMessage(from, '🗂️ Your reaction library is empty. Add pictures in the studio (the *Reactions* page), then send *Library* again.');
+      return;
+    }
+    if (search?.trim()) {
+      await this.showLibrarySheet(session, from, { search: search.trim(), page: 0 });
+      return;
+    }
+    const recent = (await library.list({ sort: 'recent', limit: 1, skip: 0 })).total;
+    session.libraryFolders = categories.map(c => c.category);
+    session.libraryRecent = recent > 0;
+    session.state = 'LIBRARY_FOLDERS';
+    await session.save();
+    await this.sendTextMessage(from, folderListText(categories, total, recent));
+  }
+
+  /** Leaves the library and tells the user what is expected next. */
+  private async closeLibrary(session: WhatsAppSessionDocument, from: string): Promise<void> {
+    session.state = (session.libraryBack as any) || 'AWAITING_REACTION';
+    session.libraryBack = null;
+    await session.save();
+    await this.sendTextMessage(from, '👍 Back to your meme. Send the *reaction image*' + (session.state.endsWith('PUNCHLINE') ? ' again, or the *punchline* text.' : '.') + (await this.libraryHint()));
+  }
+
+  private async libraryFolderReply(session: WhatsAppSessionDocument, from: string, text: string, lower: string): Promise<void> {
+    if (['back', 'cancel', 'close', 'exit'].includes(lower)) {
+      await this.closeLibrary(session, from);
+      return;
+    }
+    const { categories } = await (this.reactions as ReactionLibraryService).categories();
+    const r = parseFolderReply(text, categories, session.libraryRecent);
+    if (r.kind === 'recent') await this.showLibrarySheet(session, from, { recent: true, page: 0 });
+    else if (r.kind === 'folder') await this.showLibrarySheet(session, from, { folder: r.category, page: 0 });
+    else await this.showLibrarySheet(session, from, { search: r.words, page: 0 });
+  }
+
+  private async libraryPickReply(session: WhatsAppSessionDocument, from: string, text: string, lower: string): Promise<void> {
+    if (['back', 'folders', 'folder'].includes(lower)) {
+      await this.openLibrary(session, from);
+      return;
+    }
+    if (['close', 'exit'].includes(lower)) {
+      await this.closeLibrary(session, from);
+      return;
+    }
+    const where = { folder: session.libraryFolder || undefined, search: session.librarySearch || undefined, recent: session.libraryRecent };
+    if (['more', 'next', 'n'].includes(lower)) {
+      await this.showLibrarySheet(session, from, { ...where, page: (session.libraryPage || 0) + 1 });
+      return;
+    }
+    if (['previous', 'prev', 'p'].includes(lower) && (session.libraryPage || 0) > 0) {
+      await this.showLibrarySheet(session, from, { ...where, page: session.libraryPage - 1 });
+      return;
+    }
+    const n = /^\d{1,2}$/.test(text.trim()) ? Number(text.trim()) : 0;
+    if (n >= 1 && n <= (session.libraryIds?.length || 0)) {
+      await this.pickFromLibrary(session, from, n);
+      return;
+    }
+    await this.sendTextMessage(from, `Reply with a number from 1 to ${session.libraryIds?.length || 0}, *More* for the next page, *Back* for the folders, or *Close* to return to your meme.`);
+  }
+
+  /** One page of a folder, a search or the recently used, as a numbered picture sheet. */
+  private async showLibrarySheet(
+    session: WhatsAppSessionDocument,
+    from: string,
+    q: { folder?: string; search?: string; recent?: boolean; page: number }
+  ): Promise<void> {
+    const library = this.reactions as ReactionLibraryService;
+    const { items, total } = await library.list({ category: q.folder, search: q.search, sort: q.recent ? 'recent' : 'newest', limit: SHEET_PAGE, skip: q.page * SHEET_PAGE });
+    if (!items.length) {
+      if (q.page > 0) {
+        await this.sendTextMessage(from, 'That was the last page. Reply with a number, *Previous*, or *Back*.');
+      } else {
+        // stay at the folder list so the next reply is read as a folder or a new search
+        if (!WhatsAppService.LIBRARY_STATES.includes(session.state)) session.libraryBack = session.state;
+        session.state = 'LIBRARY_FOLDERS';
+        await session.save();
+        await this.sendTextMessage(from, `🔎 Nothing found${q.search ? ` for “${q.search}”` : ''}. Try another word or a folder, or reply *Back* to return to your meme.`);
+      }
+      return;
+    }
+    const thumbs = await library.thumbs(items.map(i => i.imageId));
+    const pages = Math.max(1, Math.ceil(total / SHEET_PAGE));
+    const title = q.recent ? 'Recently used' : q.folder ? q.folder : `Search: ${q.search}`;
+    const sheet = await renderSheet(items.map(i => ({ image: thumbs.get(i.imageId)?.data ?? Buffer.alloc(0), label: i.name || undefined })), {
+      title,
+      subtitle: `${total} picture${total === 1 ? '' : 's'}${pages > 1 ? ` · page ${q.page + 1} of ${pages}` : ''}`
+    });
+    const url = await this.writeSheet(sheet);
+
+    if (!WhatsAppService.LIBRARY_STATES.includes(session.state)) session.libraryBack = session.state;
+    session.state = 'LIBRARY_PICK';
+    session.libraryIds = items.map(i => i.imageId);
+    session.libraryFolder = q.folder || null;
+    session.librarySearch = q.search || null;
+    session.libraryRecent = Boolean(q.recent);
+    session.libraryPage = q.page;
+    await session.save();
+
+    const caption =
+      `Reply with the *number* of the picture to use (1–${items.length}).` +
+      (q.page + 1 < pages ? '\n*More* — next page' : '') +
+      (q.page > 0 ? '\n*Previous* — previous page' : '') +
+      '\n*Back* — folders · *Close* — return to your meme';
+    const sent = await this.sendImageMessage(from, url, caption);
+    if (!sent) await this.sendTextMessage(from, '⚠️ I could not send the picture sheet. Open the studio to pick from your library, or send the reaction picture here.');
+  }
+
+  /** The user chose picture `n` of the current sheet: it becomes the reaction image, exactly as if it had been sent. */
+  private async pickFromLibrary(session: WhatsAppSessionDocument, from: string, n: number): Promise<void> {
+    const id = session.libraryIds[n - 1];
+    let file: { filePath: string; mimeType: string; category: string };
+    try {
+      file = await (this.reactions as ReactionLibraryService).materialize(id, this.mediaDir);
+    } catch {
+      await this.sendTextMessage(from, '⚠️ That picture is no longer in the library. Pick another one, or reply *Back*.');
+      return;
+    }
+    const back = (session.libraryBack as any) || 'AWAITING_REACTION';
+    session.reactionImagePath = file.filePath;
+    session.reactionMimeType = file.mimeType;
+    session.reactionLibraryId = id;
+    session.reactionFraming = null;
+    session.state = back;
+    session.libraryBack = null;
+    session.libraryIds = [];
+    await session.save();
+    await this.sendTextMessage(from, `✅ Using your *${file.category || 'library'}* picture.`);
+    await this.afterReaction(session, from, this.isManualState(session) ? 'manual' : 'viral', { updated: back.endsWith('PUNCHLINE') });
+  }
+
+  /**
+   * A reaction picture is in hand (sent, or chosen from the library). A stack of frames is never decided silently:
+   * the user is asked which frame to use. Anything else goes straight on.
+   */
+  private async afterReaction(session: WhatsAppSessionDocument, from: string, kind: 'viral' | 'manual', opts: { updated?: boolean }): Promise<void> {
+    const look = await this.reactionLook(session);
+    if (look?.a.stacked && !session.reactionFraming) {
+      await this.askFraming(session, from, kind, look);
+      return;
+    }
+    await this.continueAfterReaction(session, from, kind, look?.a || null, opts);
+  }
+
+  private async askFraming(session: WhatsAppSessionDocument, from: string, kind: 'viral' | 'manual', look: { img: any; a: ReactionAnalysis }): Promise<void> {
+    const options = framingOptions(look.a);
+    session.state = 'AWAITING_FRAMING';
+    session.framingNext = kind;
+    await session.save();
+
+    // a picture of every choice, then the question as a tap-list (plain text when a list cannot be sent)
+    try {
+      const url = await this.writeSheet(await renderFramingSheet(look.img, look.a, options));
+      await this.sendImageMessage(from, url, `🎞️ This picture has ${look.a.frames.length} frames. Here is each choice:`);
+    } catch (err: any) {
+      this.logger.warn(`Could not draw the frame choices: ${err?.message || err}`);
+    }
+    const question = framingQuestionText(look.a, options);
+    const sent = await this.sendListMessage(
+      from,
+      question,
+      'Choose',
+      options.map(o => ({ id: `fr:${o.id}`, title: `${o.n}. ${o.title}`, description: o.hint }))
+    );
+    if (!sent) await this.sendTextMessage(from, question);
+  }
+
+  /** The answer to the frame question: a number, a word, or a tapped list row (`fr:<id>`). */
+  private async answerFraming(session: WhatsAppSessionDocument, from: string, answer: string): Promise<void> {
+    const kind: 'viral' | 'manual' = session.framingNext === 'manual' ? 'manual' : 'viral';
+    const look = await this.reactionLook(session);
+    if (!look || !look.a.stacked) {
+      // the picture is gone or is not a stack any more: nothing to ask
+      await this.continueAfterReaction(session, from, kind, look?.a || null, {});
+      return;
+    }
+    const options = framingOptions(look.a);
+    const choice = framingFromRow(answer, options) || parseFramingAnswer(answer, options);
+    if (!choice) {
+      await this.sendTextMessage(from, `I did not get that. Reply with a number from 1 to ${options.length}.\n\n${framingQuestionText(look.a, options)}`);
+      return;
+    }
+    session.reactionFraming = choice.framing as any;
+    session.framingNext = null;
+    await this.sendTextMessage(from, `✅ Using *${describeFraming(choice.framing)}*.`);
+    await this.continueAfterReaction(session, from, kind, look.a, {});
+  }
+
+  /** After the reaction picture (and its framing) is settled: warn about a small picture, then punchline or generation. */
+  private async continueAfterReaction(
+    session: WhatsAppSessionDocument,
+    from: string,
+    kind: 'viral' | 'manual',
+    a: ReactionAnalysis | null,
+    opts: { updated?: boolean }
+  ): Promise<void> {
+    const warning = a ? softWarning(a, (session.reactionFraming as ReactionFraming | null) || undefined) : null;
+    if (warning) await this.sendTextMessage(from, warning);
+
+    if (kind === 'manual') {
+      if (session.punchline) {
+        await this.generateManualMeme(session, from);
+        return;
+      }
+      session.state = 'MANUAL_PUNCHLINE';
+      await session.save();
+      await this.sendTextMessage(from, `🎭 Reaction image received! Now send the *punchline* text.`);
+      return;
+    }
+
+    if (session.punchline) {
+      session.state = 'GENERATING';
+      await session.save();
+      await this.sendTextMessage(from, '⏳ *Generating your meme...* Running AI vision analysis & discovering clean subject images. This takes ~30-60s.');
+      await this.generateAndSendMeme(session, from);
+      return;
+    }
+    session.state = 'AWAITING_PUNCHLINE';
+    await session.save();
+    await this.sendTextMessage(
+      from,
+      opts.updated
+        ? `🎭 *Reaction image updated!*\n\nNow send the *Reacting Text / Punchline* to start generating.`
+        : `🎭 *Reaction image received!*\n\nNow send the *Reacting Text / Punchline* (in Telugu or English) to place on the reaction image.`
+    );
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1231,6 +1584,16 @@ export class WhatsAppService {
     session.referenceMimeType = null;
     session.reactionImagePath = null;
     session.reactionMimeType = null;
+    session.reactionFraming = null;
+    session.reactionLibraryId = null;
+    session.libraryBack = null;
+    session.libraryFolder = null;
+    session.librarySearch = null;
+    session.libraryRecent = false;
+    session.libraryPage = 0;
+    session.libraryIds = [];
+    session.libraryFolders = [];
+    session.framingNext = null;
     session.punchline = null;
     session.reactionContext = null;
     session.mode = 'viral';

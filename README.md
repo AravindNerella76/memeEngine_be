@@ -76,6 +76,16 @@ Reaction pictures are often two or three movie frames stacked on top of each oth
 
 The owner chooses per meme with `reactionFraming`: `{ "split": true }` (frames side by side), `{ "frame": 0 }` (only that frame, 0 is the top one, filling the panel), `{ "fit": "whole" }` (the entire picture, uncropped, on a softened darkened copy of itself), `{ "split": false }` (one scene, the old crop), each optionally with `"focus": [{ "x": 0..1, "y": 0..1 }]` to move what shows (a form field of `POST /api/memes/adapt-viral`, or `design.reactionFraming` of `upload-and-generate`). It is stored in the meme's design and kept through regeneration. `POST /api/reactions/analyze` (one `image`, nothing stored) returns the frames, suggested focus and the panel's shape for the studio's live preview. Settings → Images → Reaction fit `contain` bypasses all of this.
 
+## WhatsApp bot: the same flow as the studio
+
+The bot walks the same steps as the app: reference screenshot, reaction image, punchline, review, *Approve* to publish. The reaction library and the frame question are in it too:
+
+- **Library.** While it waits for the reaction image (or the punchline), send `Library`: it lists your folders with counts (`0` is *recently used*). Reply a number or a folder name, or type words to search folders, names and tags (`library brahmanandam`). A folder opens as one **numbered picture sheet** (12 per page; `More` / `Previous` / `Back` / `Close`); reply the number to use that picture. A picture sent by hand works as before.
+- **Which frame?** A reaction picture made of stacked frames is never decided silently. The bot sends one image showing every choice, then a tap-list (plain numbered text if a list cannot be sent): `1` both frames side by side, `2`/`3` each frame alone, then the whole picture, then one picture (cropped). Words work too (`both`, `first`, `top`, `whole`). Nothing is generated until it is answered; the choice goes to the meme exactly like the studio's (`reactionFraming`). A small picture gets the same "will look soft" warning. The manual flow asks too.
+- Library pictures are counted as used when the meme is made, so the studio's quick-pick row learns them. `Status` shows where the picture came from and the framing; `Reset` forgets everything.
+- Picture sheets are written to the output folder as `wa_sheet_*.jpg` (older than 6 hours are removed) and fetched by WhatsApp from `PUBLIC_BASE_URL` (or the address of `INSTAGRAM_REDIRECT_URI`), like the memes themselves, so that address must be reachable from the internet.
+- Code: `services/whatsapp.service.ts` (conversation), `services/whatsapp-reaction-ui.ts` (sheets, choices, answers; pure and tested).
+
 ## Replacing images (no manual editor)
 
 | Endpoint | Purpose |

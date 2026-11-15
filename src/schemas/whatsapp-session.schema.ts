@@ -11,6 +11,11 @@ export type WhatsAppState =
   | 'AWAITING_APPROVAL'
   // viral flow: discovery could not find a verified picture, the user is asked to send one
   | 'AWAITING_SLOT_IMAGE'
+  // reaction library: browsing folders / choosing a picture from a numbered sheet
+  | 'LIBRARY_FOLDERS'
+  | 'LIBRARY_PICK'
+  // a stacked reaction picture: the user is asked which frame to use
+  | 'AWAITING_FRAMING'
   // layout library: the user is adding a layout from an example meme
   | 'LAYOUT_EXAMPLE'
   | 'LAYOUT_ANALYZING'
@@ -110,6 +115,40 @@ export class WhatsAppSession {
 
   @Prop({ type: [{ _id: false, path: String, mimeType: String, label: String }], default: [] })
   manualSubjects: ManualSubject[];
+
+  /** How the reaction picture is framed ({ split?, frame?, fit?, focus? }); null until chosen. */
+  @Prop({ type: Object, default: null })
+  reactionFraming: Record<string, unknown> | null;
+
+  /** The library picture the reaction image came from (counted as used when the meme is made). */
+  @Prop({ type: String, default: null })
+  reactionLibraryId: string | null;
+
+  /** Reaction library browsing: where to return, what is being looked at, and which picture each sheet number means. */
+  @Prop({ type: String, default: null })
+  libraryBack: string | null;
+
+  @Prop({ type: String, default: null })
+  libraryFolder: string | null;
+
+  @Prop({ type: String, default: null })
+  librarySearch: string | null;
+
+  @Prop({ type: Boolean, default: false })
+  libraryRecent: boolean;
+
+  @Prop({ type: Number, default: 0 })
+  libraryPage: number;
+
+  @Prop({ type: [String], default: [] })
+  libraryIds: string[];
+
+  @Prop({ type: [String], default: [] })
+  libraryFolders: string[];
+
+  /** Which flow asked the frame question, so the right one carries on after the answer. */
+  @Prop({ type: String, default: null })
+  framingNext: string | null;
 
   @Prop({ type: String, default: null })
   lastGeneratedMemeId: string | null;

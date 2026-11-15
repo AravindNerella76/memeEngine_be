@@ -3,6 +3,8 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { createHash, randomUUID } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { ReactionImage, ReactionImageDocument } from '../schemas/reaction-image.schema';
 import { ImageValidationError, verifyImageBuffer } from '../security/image-verify';
 import { ValidatedReactionPatch, ValidatedReactionQuery, escapeRegex } from '../security/request-validation';
@@ -211,6 +213,27 @@ export class ReactionLibraryService {
 
   async markUsed(imageId: string): Promise<void> {
     await this.model.updateOne({ imageId }, { $inc: { usedCount: 1 }, $set: { lastUsedAt: new Date() } }).exec();
+  }
+
+  /** Small copies of several pictures at once (for a numbered sheet), keyed by id. Missing ids are simply absent. */
+  async thumbs(ids: string[]): Promise<Map<string, { data: Buffer; mime: string }>> {
+    const docs = await this.model.find({ imageId: { $in: ids } }).select('imageId +thumb thumbMime').exec();
+    return new Map(docs.map(d => [d.imageId, { data: Buffer.from(d.thumb), mime: d.thumbMime || 'image/jpeg' }]));
+  }
+
+  /**
+   * Writes a picture to `dir` as a file the meme pipeline can read (it works from files) and returns where. The name is made
+   * here; the stored picture is the one the owner added, byte for byte.
+   */
+  async materialize(imageId: string, dir: string): Promise<{ filePath: string; filename: string; mimeType: string; category: string }> {
+    const { data, mime } = await this.bytes(imageId, 'file');
+    const doc = await this.model.findOne({ imageId }).select('category').lean().exec();
+    const ext = mime === 'image/png' ? '.png' : mime === 'image/webp' ? '.webp' : '.jpg';
+    const filename = `lib_${randomUUID()}${ext}`;
+    const filePath = path.join(dir, filename);
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(filePath, data, { flag: 'wx' });
+    return { filePath, filename, mimeType: mime, category: doc?.category || '' };
   }
 
   /** The stored file (original bytes) or its small copy. */

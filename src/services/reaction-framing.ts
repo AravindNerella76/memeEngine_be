@@ -376,6 +376,54 @@ export function planReactionPanel(a: ReactionAnalysis, framing: ReactionFraming 
   return { parts, kind: split ? 'split' : 'single', split, enlargement };
 }
 
+/**
+ * A softened copy of a picture filling `bg.dest` (the backdrop behind a picture shown whole): shrunk to almost nothing and
+ * enlarged again in two steps, then darkened, so it reads as colour and light and never competes with the picture.
+ */
+export function drawSoftBackground(ctx: any, img: any, bg: PanelPart, origin: { x: number; y: number }, cornerRadius = 0): void {
+  const step = (w: number, source: any, sx: number, sy: number, sw: number, sh: number) => {
+    const h = Math.max(1, Math.round((w * sh) / sw));
+    const c = createCanvas(w, h);
+    const g = c.getContext('2d');
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(source, sx, sy, sw, sh, 0, 0, w, h);
+    return c;
+  };
+  const tiny = step(40, img, bg.src.x, bg.src.y, bg.src.width, bg.src.height);
+  const mid = step(160, tiny, 0, 0, tiny.width, tiny.height);
+  const x = origin.x + bg.dest.x;
+  const y = origin.y + bg.dest.y;
+  ctx.save();
+  ctx.beginPath();
+  if (cornerRadius > 0) ctx.roundRect(x, y, bg.dest.width, bg.dest.height, cornerRadius);
+  else ctx.rect(x, y, bg.dest.width, bg.dest.height);
+  ctx.clip();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(mid, 0, 0, mid.width, mid.height, x, y, bg.dest.width, bg.dest.height);
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+  ctx.fillRect(x, y, bg.dest.width, bg.dest.height);
+  ctx.restore();
+}
+
+/**
+ * Draws a plan with its top-left corner at `origin`: the softened backdrop first (when there is one), then each part, each
+ * clipped to its own rectangle (rounded when `cornerRadius` is set). The render and every preview use this one routine.
+ */
+export function drawReactionPlan(ctx: any, img: any, plan: PanelPlan, origin: { x: number; y: number }, cornerRadius = 0): void {
+  if (plan.background) drawSoftBackground(ctx, img, plan.background, origin, cornerRadius);
+  for (const part of plan.parts) {
+    ctx.save();
+    ctx.beginPath();
+    if (cornerRadius > 0) ctx.roundRect(origin.x + part.dest.x, origin.y + part.dest.y, part.dest.width, part.dest.height, cornerRadius);
+    else ctx.rect(origin.x + part.dest.x, origin.y + part.dest.y, part.dest.width, part.dest.height);
+    ctx.clip();
+    ctx.drawImage(img, part.src.x, part.src.y, part.src.width, part.src.height, origin.x + part.dest.x, origin.y + part.dest.y, part.dest.width, part.dest.height);
+    ctx.restore();
+  }
+}
+
 /** The height of the reaction panel on a canvas: from the layout plan when it has one, else from the picture's own shape. */
 export function reactionPanelHeight(canvasWidth: number, canvasHeight: number, aspect: number, heightRatio?: number): number {
   if (heightRatio) return Math.round(canvasHeight * heightRatio);
