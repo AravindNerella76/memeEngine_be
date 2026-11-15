@@ -58,7 +58,10 @@ describe('whatsapp config fails closed', () => {
   it('a Render service knows its own public address without any setting, and an explicit setting still wins', () => {
     assert.equal(loadConfig({ RENDER_EXTERNAL_URL: 'https://studio-api.onrender.com' } as any).instagram.publicBaseUrl, 'https://studio-api.onrender.com');
     assert.equal(loadConfig({ RENDER_EXTERNAL_URL: 'https://studio-api.onrender.com/' } as any).instagram.publicBaseUrl, 'https://studio-api.onrender.com');
+    assert.equal(loadConfig({ RENDER_EXTERNAL_URL: 'https://studio-api.onrender.com' } as any).instagram.redirectUri, 'https://studio-api.onrender.com/api/instagram/auth/callback');
     assert.equal(loadConfig({ PUBLIC_BASE_URL: 'https://mine.example', RENDER_EXTERNAL_URL: 'https://studio-api.onrender.com' } as any).instagram.publicBaseUrl, 'https://mine.example');
+    assert.equal(loadConfig({ PUBLIC_BASE_URL: 'https://mine.example' } as any).instagram.redirectUri, 'https://mine.example/api/instagram/auth/callback');
+    assert.equal(loadConfig({ INSTAGRAM_REDIRECT_URI: 'https://custom.example/cb' } as any).instagram.redirectUri, 'https://custom.example/cb');
     assert.match(loadConfig({} as any).instagram.publicBaseUrl, /^https:\/\//, 'with nothing set the old default still applies');
   });
 });

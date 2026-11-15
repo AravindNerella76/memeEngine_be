@@ -436,7 +436,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       metaAppSecret: str(env, 'META_APP_SECRET'),
       instagramAppId: str(env, 'INSTAGRAM_APP_ID') || '2049776039055092',
       loginConfigId: str(env, 'INSTAGRAM_LOGIN_CONFIG_ID') || '1684279023426778',
-      redirectUri: str(env, 'INSTAGRAM_REDIRECT_URI') || 'https://jailer-effective-wiring.ngrok-free.dev/api/instagram/auth/callback',
+      redirectUri: (
+        str(env, 'INSTAGRAM_REDIRECT_URI') ||
+        (str(env, 'PUBLIC_BASE_URL') || str(env, 'RENDER_EXTERNAL_URL')
+          ? `${(str(env, 'PUBLIC_BASE_URL') || str(env, 'RENDER_EXTERNAL_URL'))!.replace(/\/+$/, '')}/api/instagram/auth/callback`
+          : 'https://jailer-effective-wiring.ngrok-free.dev/api/instagram/auth/callback')
+      ),
       tokenEncryptionKey: str(env, 'INSTAGRAM_TOKEN_ENCRYPTION_KEY'),
       targetUsername: str(env, 'INSTAGRAM_TARGET_USERNAME') || 'kanyaraasi_memes',
       publicBaseUrl: (
