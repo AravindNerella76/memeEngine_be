@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { GoneException, Injectable, Logger, UnprocessableEntityException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import * as fs from 'fs';
@@ -9,6 +9,7 @@ import { WhatsAppSession, WhatsAppSessionDocument } from '../schemas/whatsapp-se
 import { ViralAdaptationService } from './viral-adaptation.service';
 import { InstagramPublisherService } from './instagram-publisher.service';
 import { MemeEngineService } from './meme-engine.service';
+import { ImageSelectionService } from './image-selection.service';
 import { validateUploadPayload } from '../security/request-validation';
 import type { UploadedAsset } from '../types/meme.types';
 
@@ -23,7 +24,8 @@ export class WhatsAppService {
     private readonly sessionModel: Model<WhatsAppSessionDocument>,
     private readonly viralAdaptation: ViralAdaptationService,
     private readonly instagramPublisher: InstagramPublisherService,
-    private readonly memeEngine: MemeEngineService
+    private readonly memeEngine: MemeEngineService,
+    private readonly selection: ImageSelectionService
   ) {
     if (!fs.existsSync(this.mediaDir)) {
       fs.mkdirSync(this.mediaDir, { recursive: true });
@@ -297,6 +299,11 @@ export class WhatsAppService {
         return;
       }
 
+      if (session.state === 'AWAITING_SLOT_IMAGE') {
+        await this.askForSlotImage(session, from, true);
+        return;
+      }
+
       // Manual (own edit) flow: start, then route every text message while it is in progress
       if (['manual', 'custom', 'own'].includes(lower)) {
         if (session.state === 'AWAITING_APPROVAL' || session.state === 'GENERATING') {
@@ -360,7 +367,16 @@ export class WhatsAppService {
           return;
         }
 
+        if (session.state === 'AWAITING_SLOT_IMAGE') {
+          await this.handleSlotImage(session, from, downloaded);
+          return;
+        }
+
         if (session.state === 'IDLE') {
+          session.viralDraftId = null;
+          session.viralSlots = [];
+          session.viralOverrides = [];
+          session.viralMissing = [];
           session.referenceImagePath = downloaded.filePath;
           session.referenceMimeType = downloaded.mimeType;
 
@@ -449,47 +465,189 @@ export class WhatsAppService {
   /**
    * Executes the Viral Adaptation pipeline and sends the rendered meme back to the user
    */
+  /**
+   * Viral flow. The reference is analysed once and the analysis is kept (draft); if internet discovery
+   * cannot find a verified picture for a slot, the user is asked to send one and the run continues with
+   * that picture instead of failing.
+   */
   private async generateAndSendMeme(session: WhatsAppSessionDocument, to: string): Promise<void> {
     try {
       if (!session.referenceImagePath || !session.reactionImagePath || !session.punchline) {
         throw new Error('Missing reference image, reaction image, or punchline');
       }
-
-      const referenceFilename = path.basename(session.referenceImagePath);
-      const reactionFilename = path.basename(session.reactionImagePath);
-
       this.logger.log(`Starting viral adaptation for WhatsApp user ${to}...`);
 
-      const { meme } = await this.viralAdaptation.adapt({
-        reference: {
-          path: session.referenceImagePath,
-          filename: referenceFilename,
-          originalName: referenceFilename,
-          mimeType: session.referenceMimeType || 'image/jpeg'
-        },
-        reaction: {
-          path: session.reactionImagePath,
-          filename: reactionFilename,
-          originalName: reactionFilename,
-          mimeType: session.reactionMimeType || 'image/jpeg'
-        },
-        punchline: session.punchline,
-        reactionContext: session.reactionContext || undefined
-      });
+      let meme: any;
+      for (let attempt = 0; ; attempt++) {
+        if (!session.viralDraftId) await this.analyzeReference(session);
+        try {
+          ({ meme } = await this.viralAdaptation.adapt({
+            draftId: session.viralDraftId as string,
+            overrides: await this.stageOverrides(session),
+            reaction: this.uploadOf(session.reactionImagePath, session.reactionMimeType),
+            punchline: session.punchline,
+            reactionContext: session.reactionContext || undefined
+          }));
+          break;
+        } catch (err: any) {
+          // The saved analysis expires after 30 minutes: analyse again once and retry
+          if (err instanceof GoneException && attempt === 0) {
+            session.viralDraftId = null;
+            continue;
+          }
+          throw err;
+        }
+      }
 
+      session.viralDraftId = null;
+      session.viralOverrides = [];
+      session.viralMissing = [];
       await this.deliverMeme(session, to, meme, session.punchline);
     } catch (err: any) {
+      const missing = this.missingSlotsFromError(err, new Set((session.viralOverrides || []).map(o => o.slot)), session);
+      if (missing.length) {
+        this.logger.warn(`Discovery needs a picture from the user for slot(s) ${missing.join(', ')}: ${err?.message || err}`);
+        session.viralMissing = missing;
+        session.state = 'AWAITING_SLOT_IMAGE';
+        await session.save();
+        await this.askForSlotImage(session, to);
+        return;
+      }
       this.logger.error(`Error in WhatsApp meme generation: ${err?.message || err}`);
       await this.sendTextMessage(
         to,
         `❌ *Generation Failed:*\n${err?.message || 'Internal processing error'}\n\n` +
         `Reply *Reset* to start fresh or try sending your inputs again.`
       );
+      session.viralDraftId = null;
+      session.viralOverrides = [];
+      session.viralMissing = [];
       session.state = 'IDLE';
       await session.save();
     }
   }
 
+  private uploadOf(filePath: string, mimeType: string | null | undefined) {
+    const filename = path.basename(filePath);
+    return { path: filePath, filename, originalName: filename, mimeType: mimeType || 'image/jpeg' };
+  }
+
+  /** Analyses the reference once and remembers its image slots (for the "send me a picture" questions). */
+  private async analyzeReference(session: WhatsAppSessionDocument): Promise<void> {
+    const draft = await this.viralAdaptation.analyzeDraft(this.uploadOf(session.referenceImagePath as string, session.referenceMimeType));
+    const previous = session.viralSlots?.length || 0;
+    session.viralDraftId = draft.draftId;
+    session.viralSlots = (draft.slots || []).map((s: any) => ({ slot: s.slot, label: s.label || undefined, subject: s.subject || undefined }));
+    // A re-analysis that finds a different number of image slots makes earlier slot numbers meaningless
+    if (previous && previous !== session.viralSlots.length) session.viralOverrides = [];
+    await session.save();
+  }
+
+  /** The user's pictures for slots, staged again for this run (staging expires after 15 minutes). */
+  private async stageOverrides(session: WhatsAppSessionDocument): Promise<{ slot: number; token: string }[]> {
+    const out: { slot: number; token: string }[] = [];
+    for (const o of session.viralOverrides || []) {
+      const st = await this.selection.stageUpload(o.path, path.basename(o.path));
+      out.push({ slot: o.slot, token: st.token });
+    }
+    return out;
+  }
+
+  /** Slots the user must supply a picture for, taken from a discovery or identity failure (empty for any other error). */
+  private missingSlotsFromError(err: any, alreadyGiven: Set<number>, session?: WhatsAppSessionDocument): number[] {
+    const response = typeof err?.getResponse === 'function' ? err.getResponse() : err?.response;
+    const details = response?.details || err?.details;
+
+    // 1. Check structured discovery details
+    if (details?.stage === 'discovery') {
+      const rawSlot = String(details.failedSlot ?? '');
+      const m = /(?:s|slot[ _]?)?(\d+)/i.exec(rawSlot);
+      if (m) {
+        const slotNum = Number(m[1]);
+        if (!alreadyGiven.has(slotNum)) return [slotNum];
+      }
+    }
+
+    // 2. Check unresolved identity slots
+    if (details?.stage === 'identity' && Array.isArray(details.slots)) {
+      const unres = details.slots
+        .filter((s: any) => s.status !== 'resolved' && !alreadyGiven.has(Number(s.slot)))
+        .map((s: any) => Number(s.slot));
+      if (unres.length) return unres;
+    }
+
+    // 3. Fallback: Parse error message text (e.g. "Could not find a verified portrait of 'Dulquer Salmaan'... for slot 1")
+    const msg = String(err?.message || response?.message || '');
+    if (/Could not find a verified|unverified image|no image found|failed to find/i.test(msg)) {
+      const slotMatch = /(?:for|in)\s+slot\s+(\d+)/i.exec(msg) || /slot\s+(\d+)/i.exec(msg) || /image\s+(\d+)/i.exec(msg);
+      if (slotMatch) {
+        const slotNum = Number(slotMatch[1]);
+        if (!alreadyGiven.has(slotNum)) {
+          // Extract subject name from quotes (e.g. "Dulquer Salmaan") to display in prompt
+          const subMatch = /of\s+"([^"]+)"/i.exec(msg);
+          if (subMatch && subMatch[1] && session) {
+            const existing = (session.viralSlots || []).find(s => s.slot === slotNum);
+            if (existing) {
+              existing.subject = subMatch[1];
+            } else {
+              session.viralSlots = [...(session.viralSlots || []), { slot: slotNum, subject: subMatch[1] }];
+            }
+          }
+          return [slotNum];
+        }
+      }
+    }
+
+    return [];
+  }
+
+  private async askForSlotImage(session: WhatsAppSessionDocument, to: string, reminder = false): Promise<void> {
+    const slot = session.viralMissing?.[0];
+    const info = (session.viralSlots || []).find(s => s.slot === slot);
+    const subjectName = info?.subject || (info?.label && info.label !== info?.subject ? info.label : undefined);
+    const targetDesc = subjectName ? `"${subjectName}" (Image ${slot})` : `Image ${slot}`;
+
+    await this.sendTextMessage(
+      to,
+      (reminder ? '' : `🔍 *Could not find a verified photo online for ${targetDesc}.*\n\n`) +
+      `📸 *Please send a photo of ${subjectName ? `"${subjectName}"` : `Image ${slot}`}* right here in this chat, and I will use it to complete your meme!\n\n` +
+      ((session.viralMissing?.length || 0) > 1 ? `_(${session.viralMissing.length} pictures needed in total)_\n\n` : '') +
+      `Reply *Reset* to start fresh anytime.`
+    );
+  }
+
+  private async handleSlotImage(
+    session: WhatsAppSessionDocument,
+    from: string,
+    downloaded: { filePath: string }
+  ): Promise<void> {
+    const slot = session.viralMissing?.[0];
+    if (!slot) {
+      session.state = 'IDLE';
+      await session.save();
+      return;
+    }
+    try {
+      // Same checks as a picture chosen in the web app (real image, size limits, decodes)
+      const staged = await this.selection.stageUpload(downloaded.filePath, path.basename(downloaded.filePath));
+      this.selection.discard(staged.token);
+    } catch (err: any) {
+      await this.sendTextMessage(from, `⚠️ That picture cannot be used: ${err?.message || 'invalid image'}\nPlease send another one for image ${slot}.`);
+      return;
+    }
+    session.viralOverrides = [...(session.viralOverrides || []).filter(o => o.slot !== slot), { slot, path: downloaded.filePath }];
+    session.viralMissing = (session.viralMissing || []).slice(1);
+    if (session.viralMissing.length) {
+      await session.save();
+      await this.sendTextMessage(from, `✅ Picture for image ${slot} saved.`);
+      await this.askForSlotImage(session, from);
+      return;
+    }
+    session.state = 'GENERATING';
+    await session.save();
+    await this.sendTextMessage(from, `✅ Got it. Continuing with your picture... this takes about 30 seconds.`);
+    await this.generateAndSendMeme(session, from);
+  }
 
   /** Sends the rendered meme to the user for review and moves the session to AWAITING_APPROVAL. */
   private async deliverMeme(session: WhatsAppSessionDocument, to: string, meme: any, punchlineText: string): Promise<void> {
@@ -719,6 +877,10 @@ export class WhatsAppService {
     session.punchline = null;
     session.reactionContext = null;
     session.mode = 'viral';
+    session.viralDraftId = null;
+    session.viralSlots = [];
+    session.viralOverrides = [];
+    session.viralMissing = [];
     session.manualMemeType = null;
     session.manualHeadline = null;
     session.manualStatement = null;
