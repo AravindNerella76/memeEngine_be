@@ -64,7 +64,7 @@ export class WhatsAppCredentials {
   @Prop({ type: String, default: null })
   appSecretLast4: string | null;
 
-  /** The only phone number allowed to use the bot (digits with country code); null = use the server setting. */
+  /** The phone numbers allowed to use the bot: digits with country code, several comma-separated; null = use the server setting. */
   @Prop({ type: String, default: null })
   allowedPhone: string | null;
 }

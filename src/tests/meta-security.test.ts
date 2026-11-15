@@ -51,6 +51,7 @@ describe('whatsapp config fails closed', () => {
     assert.equal(c.whatsapp.verifyToken, '');
     assert.equal(c.whatsapp.allowedPhone, '');
     assert.equal(loadConfig({ WHATSAPP_ALLOWED_PHONE: '+91 93477-08120' } as any).whatsapp.allowedPhone, '919347708120');
+    assert.equal(loadConfig({ WHATSAPP_ALLOWED_PHONE: '+91 93477-08120, 918885550123' } as any).whatsapp.allowedPhone, '919347708120,918885550123');
     assert.equal(loadConfig({ PUBLIC_BASE_URL: 'https://a.example/' } as any).instagram.publicBaseUrl, 'https://a.example');
   });
 });

@@ -8,6 +8,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { normalizePhoneList } from './phone-list';
 import { GEMINI_DEFAULT_BASE, GEMINI_DEFAULT_MODEL, GEMINI_THINKING_LEVELS, GeminiModelSettings, GeminiThinking } from '../vision/vision-gemini-api';
 
 export const BACKEND_ROOT = path.resolve(__dirname, '..', '..');
@@ -130,6 +131,7 @@ export interface WhatsAppConfig {
   phoneNumberId: string;
   accessToken: string;
   verifyToken: string;
+  /** Digits with country code; several numbers are comma-separated (see phone-list.ts). Empty = nobody is allowed. */
   allowedPhone: string;
   apiVersion: string;
   /** Meta app secret used to verify webhook signatures (WHATSAPP_APP_SECRET, falls back to META_APP_SECRET). */
@@ -447,7 +449,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       accessToken: str(env, 'WHATSAPP_ACCESS_TOKEN') || '',
       // No guessable defaults: an empty verify token / allowed phone makes the bot refuse everything.
       verifyToken: str(env, 'WHATSAPP_VERIFY_TOKEN') || '',
-      allowedPhone: (str(env, 'WHATSAPP_ALLOWED_PHONE') || '').replace(/\D/g, ''),
+      allowedPhone: normalizePhoneList(str(env, 'WHATSAPP_ALLOWED_PHONE')), // one or several numbers, comma-separated
       apiVersion: str(env, 'WHATSAPP_API_VERSION') || 'v21.0',
       appSecret: str(env, 'WHATSAPP_APP_SECRET') || str(env, 'META_APP_SECRET')
     },

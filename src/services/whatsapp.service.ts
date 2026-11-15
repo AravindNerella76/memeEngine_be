@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { getConfig } from '../config/app-config';
+import { isAllowedPhone } from '../config/phone-list';
 import { WhatsAppSession, WhatsAppSessionDocument } from '../schemas/whatsapp-session.schema';
 import { ViralAdaptationService } from './viral-adaptation.service';
 import { InstagramPublisherService } from './instagram-publisher.service';
@@ -296,8 +297,8 @@ export class WhatsAppService {
   private async handleUserMessage(from: string, message: any): Promise<void> {
     const cfg = await this.currentCredentials();
     // Security check: restrict to configured phone number if specified
-    // Fail closed: with no WHATSAPP_ALLOWED_PHONE configured nobody is authorised.
-    if (!cfg.allowedPhone || from !== cfg.allowedPhone) {
+    // Fail closed: with no allowed number configured nobody is authorised. Several numbers may be allowed.
+    if (!isAllowedPhone(cfg.allowedPhone, from)) {
       this.logger.warn(`Rejected message from unauthorized phone: ${from}`);
       if (cfg.allowedPhone) {
         await this.sendTextMessage(from, '⛔ This Meme Engine WhatsApp bot is configured for authorized users only.');

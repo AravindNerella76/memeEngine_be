@@ -108,6 +108,18 @@ describe('every WhatsApp field can be saved in the app', () => {
     assert.equal(model.doc, null, 'a bad value in the same request stops everything from being saved');
   });
 
+  it('saves several allowed numbers as a normalised list and names a bad entry', async () => {
+    mockMetaOk();
+    const s = await svc.saveAndVerify({ allowedPhone: '+91 93477-08120, 918885550123;\n919347708120' });
+    assert.equal(model.doc.allowedPhone, '919347708120,918885550123', 'normalised, deduplicated, comma-joined');
+    assert.equal(s.fields.allowedPhone.value, '919347708120,918885550123');
+    assert.equal((await svc.getEffective()).allowedPhone, '919347708120,918885550123');
+    await assert.rejects(() => svc.saveAndVerify({ allowedPhone: '919347708120, 12345' }), /allowed phone numbers.*12345/);
+    await assert.rejects(() => svc.saveAndVerify({ allowedPhone: '919347708120 918885550123' }), /allowed phone numbers/, 'a missing comma is an error, not a merged number');
+    await assert.rejects(() => svc.saveAndVerify({ allowedPhone: Array.from({ length: 11 }, (_, i) => '9100000000' + String(i).padStart(2, '0')).join(',') }), /At most 10/);
+    assert.equal(model.doc.allowedPhone, '919347708120,918885550123', 'a rejected request changes nothing');
+  });
+
   it('clears one saved value at a time and falls back to the server setting for it', async () => {
     mockMetaOk();
     await svc.saveAndVerify({ verifyToken: SAVED_VERIFY, appSecret: SAVED_SECRET, allowedPhone: '919347708120' });

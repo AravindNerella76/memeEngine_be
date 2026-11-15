@@ -2,6 +2,7 @@ import { BadGatewayException, BadRequestException, Injectable, Logger } from '@n
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { getConfig } from '../config/app-config';
+import { MAX_ALLOWED_PHONES, parsePhoneList } from '../config/phone-list';
 import { WhatsAppCredentials, WhatsAppCredentialsDocument } from '../schemas/whatsapp-credentials.schema';
 import { InstagramTokenService } from './instagram-token.service';
 
@@ -25,7 +26,7 @@ export interface EffectiveWhatsAppCredentials {
   phoneNumberId: string;
   verifyToken: string;
   appSecret: string;
-  /** Digits with country code; empty = nobody is allowed (the bot refuses everyone). */
+  /** Digits with country code; several numbers are comma-separated. Empty = nobody is allowed (the bot refuses everyone). */
   allowedPhone: string;
   sources: Record<CredentialField, FieldSource>;
   /** Secrets that are saved but cannot be decrypted (the encryption key changed). */
@@ -318,11 +319,19 @@ export class WhatsAppCredentialsService {
       newPhoneId = p || null;
     }
     if (input.allowedPhone !== undefined) {
-      const digits = typeof input.allowedPhone === 'string' ? input.allowedPhone.replace(/\D/g, '') : '';
-      if (input.allowedPhone !== '' && (digits.length < 8 || digits.length > 15)) {
-        throw new BadRequestException('The allowed phone number is 8-15 digits with the country code, for example 919876543210.');
+      // One or several numbers, separated by commas or new lines. Saved as a normalised comma-separated list.
+      const raw = typeof input.allowedPhone === 'string' ? input.allowedPhone : '';
+      const { phones, invalid, tooMany } = parsePhoneList(raw);
+      if (raw.trim() !== '') {
+        if (invalid.length) {
+          throw new BadRequestException(
+            `The allowed phone numbers are 8-15 digits each with the country code, for example 919876543210. Check: ${invalid.join(', ')}. Separate several numbers with commas.`
+          );
+        }
+        if (tooMany) throw new BadRequestException(`At most ${MAX_ALLOWED_PHONES} allowed phone numbers.`);
+        if (!phones.length) throw new BadRequestException('Enter the allowed phone numbers as digits with the country code, for example 919876543210.');
       }
-      set.allowedPhone = digits || null;
+      set.allowedPhone = phones.join(',') || null;
     }
     if (!Object.keys(secrets).length && newPhoneId === undefined && set.allowedPhone === undefined) {
       throw new BadRequestException('Fill in at least one value to save.');
