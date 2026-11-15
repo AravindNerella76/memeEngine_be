@@ -2,8 +2,12 @@ import { BadRequestException, Body, Controller, Delete, Get, HttpCode, NotFoundE
 import { FileFieldsInterceptor } from '@nestjs/platform-express';
 import { Response } from 'express';
 import * as fs from 'fs';
+import { loadImage } from '@napi-rs/canvas';
 import { ReactionLibraryService, ReactionSummary } from '../services/reaction-library.service';
-import { MulterUploadedFile, discardUploads, flattenUploads, uploadOptions } from './meme.controller';
+import { MulterUploadedFile, discardUploads, flattenUploads, uploadOptions, verifyAndNormalizeUploads } from './meme.controller';
+import { DesignProfileService } from '../design/design-profile.service';
+import { resolveRenderStyle } from '../design/render-style';
+import { analyzeReactionImage, reactionPanelHeight } from '../services/reaction-framing';
 import { Errors, REACTION_PAGE_DEFAULT, isReactionId, normalizeCategory, normalizeTags, validateReactionBulk, validateReactionPatch, validateReactionQuery } from '../security/request-validation';
 import { sanitizeDisplayName } from '../security/path-guard';
 
@@ -22,7 +26,10 @@ export interface ReactionUploadResult {
  */
 @Controller('api/reactions')
 export class ReactionController {
-  constructor(private readonly library: ReactionLibraryService) {}
+  constructor(
+    private readonly library: ReactionLibraryService,
+    private readonly profiles: DesignProfileService
+  ) {}
 
   /** One page of pictures. ?category=&search=&sort=newest|recent|used&limit=&skip= */
   @Get()
@@ -72,6 +79,39 @@ export class ReactionController {
         }
       }
       return out;
+    } finally {
+      discardUploads(uploaded);
+    }
+  }
+
+  /**
+   * How a reaction picture will sit in the reaction panel (field "image", one file; the studio sends a small copy):
+   * is it a stack of frames, where are they and their faces, and the panel's shape from the current Settings. The studio
+   * draws its live framing preview from this. Nothing is stored.
+   */
+  @Post('analyze')
+  @HttpCode(200)
+  @UseInterceptors(FileFieldsInterceptor([{ name: 'image', maxCount: 1 }], uploadOptions))
+  async analyze(@UploadedFiles() files: { image?: MulterUploadedFile[] }) {
+    const uploaded = flattenUploads(files);
+    try {
+      if (!files?.image?.length) throw new BadRequestException('Choose an image file (field "image").');
+      await verifyAndNormalizeUploads(uploaded);
+      const img = await loadImage(await fs.promises.readFile(files.image[0].path));
+      const a = analyzeReactionImage(img);
+      const design = await this.profiles.newMemeDesign();
+      const style = resolveRenderStyle(design);
+      return {
+        width: a.width,
+        height: a.height,
+        stacked: a.stacked,
+        // as shares of the picture's height, so they hold for the full-size picture as well as the small copy sent here
+        frames: a.frames.map(f => ({ top: f.y / a.height, bottom: (f.y + f.height) / a.height })),
+        autoFocus: a.autoFocus,
+        panel: { width: design.width, height: reactionPanelHeight(design.width, design.height, a.width / a.height) },
+        anchorY: style.image.reactionAnchorY,
+        fit: style.image.reactionFit
+      };
     } finally {
       discardUploads(uploaded);
     }

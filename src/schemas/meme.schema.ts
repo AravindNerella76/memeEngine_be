@@ -195,6 +195,10 @@ export class DesignSpecificationsSchema {
   /** Settings snapshot taken at generation (absent on older memes). */
   @Prop({ type: Object })
   style?: Record<string, unknown>;
+
+  /** The owner's choice for how the reaction image is framed ({ split?, focus? }); absent = automatic. */
+  @Prop({ type: Object })
+  reactionFraming?: Record<string, unknown>;
 }
 
 @Schema({ _id: false })

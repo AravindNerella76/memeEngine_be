@@ -8,6 +8,7 @@ import {
   GridSpec
 } from '../types/meme.types';
 import type { LayoutStyle } from '../design/render-style';
+import { reactionPanelHeight } from './reaction-framing';
 
 const MIN_SLOT_PX = 140;
 const clampW = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(4, Math.max(0.25, v)) : 1);
@@ -140,17 +141,8 @@ export class LayoutEngineService {
     // Determine reaction height based on detected cinematic aspect ratio
     // For 16:9 on 1080px canvas: 1080 / 1.778 = 607px.
     // We clamp between 460px and 560px on a 1350px canvas to leave ample space for subjects
-    let computedReactionH: number;
-    if (params.reactionHeightRatio) {
-      computedReactionH = Math.round(height * params.reactionHeightRatio);
-    } else {
-      // Natural cinematic adaptation
-      const naturalReactionH = Math.round(width / Math.max(1.33, reactionAspectRatio));
-      // Clamp between 34% and 42% of canvas height
-      const minReactionH = Math.round(height * 0.34);
-      const maxReactionH = Math.round(height * 0.42);
-      computedReactionH = Math.min(maxReactionH, Math.max(minReactionH, naturalReactionH));
-    }
+    // from the plan's ratio, else the picture's own shape clamped to 34-42% of the canvas height (shared with the studio's live preview)
+    const computedReactionH = reactionPanelHeight(width, height, reactionAspectRatio, params.reactionHeightRatio);
 
     const reactionY = height - computedReactionH;
     reactionBox = { x: 0, y: reactionY, width, height: computedReactionH };

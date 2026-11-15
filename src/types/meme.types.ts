@@ -141,6 +141,8 @@ export interface MemeAssets {
 /**
  * 3. Design Specifications - Full visual and typography styling
  */
+import type { ReactionFraming } from '../services/reaction-framing';
+
 export interface DesignSpecifications {
   fontFamily: 'Montserrat' | 'Anton' | 'Arial Black' | 'Impact' | 'Intrepid ExtraBold' | 'Intrepid' | 'Ramabhadra' | 'Mandali' | 'Noto Sans Telugu' | string;
   teluguFontFamily: 'Ramabhadra' | 'Mandali' | 'Noto Sans Telugu' | string;
@@ -177,6 +179,12 @@ export interface DesignSpecifications {
    * generated. Absent on memes created before Settings existed (they keep the original style).
    */
   style?: StyleSnapshot;
+
+  /**
+   * How the reaction image sits in its panel, when the owner chose (or turned off) the automatic framing of stacked
+   * pictures. Absent: decided from the picture itself on every render.
+   */
+  reactionFraming?: ReactionFraming;
 }
 
 /**

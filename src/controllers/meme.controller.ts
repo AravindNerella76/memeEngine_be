@@ -49,8 +49,10 @@ import {
   validateThumbQuery,
   validateUploadPayload,
   validateViralFields,
+  validateReactionFraming,
   validateViralOverrides
 } from '../security/request-validation';
+import type { ReactionFraming } from '../services/reaction-framing';
 
 export interface MulterUploadedFile {
   fieldname: string;
@@ -470,11 +472,13 @@ export class MemeController {
     @Body('fontFamily') preferredFont?: unknown,
     @Body('selectedProviders') selectedProviders?: unknown,
     @Body('draftId') draftId?: unknown,
-    @Body('slotOverrides') slotOverrides?: unknown
+    @Body('slotOverrides') slotOverrides?: unknown,
+    @Body('reactionFraming') reactionFraming?: unknown
   ) {
     const uploaded = flattenUploads(files);
     try {
       const own = validateViralOverrides({ draftId, slotOverrides });
+      const framing = validateReactionFraming(reactionFraming);
       if (!own.draftId && (!files?.referenceImage || files.referenceImage.length === 0)) {
         throw new BadRequestException('Input 1 missing: Viral Meme Reference screenshot is required.');
       }
@@ -500,7 +504,8 @@ export class MemeController {
         fields.reactionContext,
         fields.fontFamily,
         fields.selectedProviders,
-        own
+        own,
+        framing
       );
     } catch (err) {
       // Nothing references these files yet: do not leave rejected or failed uploads on disk
@@ -516,7 +521,8 @@ export class MemeController {
     reactionContext: string | undefined,
     preferredFont: string | undefined,
     selectedProviders?: string[],
-    own: { draftId?: string; overrides?: { slot: number; token: string }[] } = {}
+    own: { draftId?: string; overrides?: { slot: number; token: string }[] } = {},
+    reactionFraming?: ReactionFraming
   ) {
     // The orchestrator runs: analysis -> identity -> internet discovery + visual verification ->
     // layout -> render -> persistence (with the generation report). The punchline is passed verbatim.
@@ -528,7 +534,8 @@ export class MemeController {
       punchline,
       reactionContext,
       fontFamily: preferredFont,
-      selectedProviders
+      selectedProviders,
+      reactionFraming
     });
     const { generationReport, ...rest } = meme;
     return { ...rest, adaptationMetadata };

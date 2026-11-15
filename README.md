@@ -70,6 +70,12 @@ The owner's own reaction pictures, filed in free-form folders ("shocking", "sad 
 
 Every route needs the sign-in session. Generation itself is unchanged: the frontend downloads the chosen picture and sends it as the normal `reactionImage` upload.
 
+### Reaction framing (`services/reaction-framing.ts`)
+
+Reaction pictures are often two or three movie frames stacked on top of each other. A plain cover crop of a square stack keeps a middle band: one face cut at the chin, the next at the eyes. So the renderer first looks at the picture (about 2 ms): it finds the seams between stacked frames (a dark divider, or a hard cut near an even split; edge bars and horizons are not taken for frames) and a face in each frame (skin colour, biggest compact patch high in the frame), then shows the frames **side by side** in the panel, each cropped around its face. An ordinary single picture takes the unchanged crop, byte for byte.
+
+The owner chooses per meme with `reactionFraming`: `{ "split": true }` (frames side by side), `{ "frame": 0 }` (only that frame, 0 is the top one, filling the panel), `{ "fit": "whole" }` (the entire picture, uncropped, on a softened darkened copy of itself), `{ "split": false }` (one scene, the old crop), each optionally with `"focus": [{ "x": 0..1, "y": 0..1 }]` to move what shows (a form field of `POST /api/memes/adapt-viral`, or `design.reactionFraming` of `upload-and-generate`). It is stored in the meme's design and kept through regeneration. `POST /api/reactions/analyze` (one `image`, nothing stored) returns the frames, suggested focus and the panel's shape for the studio's live preview. Settings → Images → Reaction fit `contain` bypasses all of this.
+
 ## Replacing images (no manual editor)
 
 | Endpoint | Purpose |

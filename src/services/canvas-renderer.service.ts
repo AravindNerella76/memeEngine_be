@@ -10,6 +10,7 @@ import {
   TextScales
 } from '../types/meme.types';
 import { ComputedMemeLayout } from './layout-engine.service';
+import { analyzeReactionImage, planReactionPanel } from './reaction-framing';
 import { ENGLISH_FONTS, FONT_FILES, TELUGU_FONTS } from '../design/fonts';
 import { ElementStyle, RenderStyle, resolveRenderStyle } from '../design/render-style';
 
@@ -147,6 +148,37 @@ export class CanvasRendererService implements OnModuleInit {
     ctx.clip();
     // Zero distortion: sWidth/sHeight === dest.width/dest.height
     ctx.drawImage(img, sx, sy, sWidth, sHeight, dest.x, dest.y, dest.width, dest.height);
+    ctx.restore();
+  }
+
+  /**
+   * A softened copy of a picture filling `dest` (the backdrop behind a picture shown whole): shrunk to almost nothing and
+   * enlarged again in two steps, then darkened, so it reads as colour and light and never competes with the picture.
+   */
+  drawSoftBackground(ctx: SKRSContext2D, img: any, bg: { src: BoundingBox; dest: BoundingBox }, box: BoundingBox, cornerRadius = 0) {
+    const step = (w: number, source: any, sx: number, sy: number, sw: number, sh: number) => {
+      const h = Math.max(1, Math.round((w * sh) / sw));
+      const c = createCanvas(w, h);
+      const g = c.getContext('2d');
+      g.imageSmoothingEnabled = true;
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(source, sx, sy, sw, sh, 0, 0, w, h);
+      return c;
+    };
+    const tiny = step(40, img, bg.src.x, bg.src.y, bg.src.width, bg.src.height);
+    const mid = step(160, tiny, 0, 0, tiny.width, tiny.height);
+    const x = box.x + bg.dest.x;
+    const y = box.y + bg.dest.y;
+    ctx.save();
+    ctx.beginPath();
+    if (cornerRadius > 0) ctx.roundRect(x, y, bg.dest.width, bg.dest.height, cornerRadius);
+    else ctx.rect(x, y, bg.dest.width, bg.dest.height);
+    ctx.clip();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(mid, 0, 0, mid.width, mid.height, x, y, bg.dest.width, bg.dest.height);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+    ctx.fillRect(x, y, bg.dest.width, bg.dest.height);
     ctx.restore();
   }
 
@@ -449,12 +481,30 @@ export class CanvasRendererService implements OnModuleInit {
       const reactionImg = await this.loadAssetImage(assets.reactionImage.path, 'Reaction image', options.loadImage);
       if (style.image.reactionFit === 'contain') this.drawContainImage(ctx, reactionImg, layout.reactionBox, radius);
       else {
-        this.drawIntelligentCoverImage(ctx, reactionImg, layout.reactionBox, {
-          isReaction: true,
-          anchorX: 0.5,
-          anchorY: style.image.reactionAnchorY,
-          cornerRadius: radius
-        });
+        const framing = specs.reactionFraming;
+        const plan = planReactionPanel(analyzeReactionImage(reactionImg), framing, layout.reactionBox, style.image.reactionAnchorY);
+        if (plan.kind === 'single' && !framing?.focus?.length) {
+          // one picture, no choice made: the long-standing crop, unchanged
+          this.drawIntelligentCoverImage(ctx, reactionImg, layout.reactionBox, {
+            isReaction: true,
+            anchorX: 0.5,
+            anchorY: style.image.reactionAnchorY,
+            cornerRadius: radius
+          });
+        } else {
+          // a stack shown side by side, one frame of it, the whole picture, or a framing the owner chose
+          const box = layout.reactionBox;
+          if (plan.background) this.drawSoftBackground(ctx, reactionImg, plan.background, box, radius);
+          for (const part of plan.parts) {
+            ctx.save();
+            ctx.beginPath();
+            if (radius > 0) ctx.roundRect(box.x + part.dest.x, box.y + part.dest.y, part.dest.width, part.dest.height, radius);
+            else ctx.rect(box.x + part.dest.x, box.y + part.dest.y, part.dest.width, part.dest.height);
+            ctx.clip();
+            ctx.drawImage(reactionImg, part.src.x, part.src.y, part.src.width, part.src.height, box.x + part.dest.x, box.y + part.dest.y, part.dest.width, part.dest.height);
+            ctx.restore();
+          }
+        }
       }
     }
 

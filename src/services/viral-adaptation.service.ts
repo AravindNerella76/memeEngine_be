@@ -38,6 +38,7 @@ import { MemeEngineService } from './meme-engine.service';
 import { FormatLibraryService } from './format-library.service';
 import { LayoutEngineService } from './layout-engine.service';
 import { CanvasRendererService } from './canvas-renderer.service';
+import type { ReactionFraming } from './reaction-framing';
 
 export interface ViralUpload {
   path: string;
@@ -65,6 +66,8 @@ export interface ViralAdaptInput {
   reactionContext?: string;
   fontFamily?: string;
   selectedProviders?: string[];
+  /** The owner's choice for how the reaction image is framed (absent: decided from the picture). */
+  reactionFraming?: ReactionFraming;
 }
 
 function scriptOf(s: string): 'telugu' | 'english' | 'mixed' {
@@ -295,6 +298,7 @@ export class ViralAdaptationService {
       // 4. Settings (house style, snapshotted into the meme) + layout plan from the reference
       const settings = await this.profiles.getSettings();
       const design = await this.profiles.newMemeDesign(input.fontFamily);
+      if (input.reactionFraming) design.reactionFraming = input.reactionFraming;
       if (input.fontFamily && !CanvasRendererService.ENGLISH_FONTS.includes(input.fontFamily)) {
         warnings.push(`Font "${input.fontFamily}" is not installed on the server; the Settings font ${design.fontFamily} was used.`);
       }

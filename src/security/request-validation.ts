@@ -15,6 +15,7 @@ import {
   SectionRole
 } from '../types/meme.types';
 import { sanitizeDisplayName } from './path-guard';
+import { ReactionFraming, parseReactionFraming } from '../services/reaction-framing';
 
 export const MEME_TYPES = ['facts_collage', 'comparison', 'trending_news', 'movie_update', 'custom'] as const;
 export const ARRANGEMENTS = ['auto', 'side_by_side', 'columns_3', 'columns_4', 'grid_2x2', 'stacked_rows', 'single_hero'] as const;
@@ -131,6 +132,15 @@ export function validateContent(raw: unknown, e: Errors, requirePunchline = true
   }) as MemeContent;
 }
 
+/** The optional "how to frame the reaction image" choice (JSON text from a form field, or an object). Undefined when absent. */
+export function validateReactionFraming(input: unknown): ReactionFraming | undefined {
+  try {
+    return parseReactionFraming(input);
+  } catch (err: any) {
+    throw new BadRequestException(String(err?.message || 'reactionFraming is not valid'));
+  }
+}
+
 export function validateDesign(raw: unknown, e: Errors): Partial<DesignSpecifications> | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (!isObj(raw)) { e.add('design must be an object'); return undefined; }
@@ -148,7 +158,15 @@ export function validateDesign(raw: unknown, e: Errors): Partial<DesignSpecifica
     shadowBlur: num(raw, 'shadowBlur', 0, 40, e),
     fontSizeScale: num(raw, 'fontSizeScale', 0.5, 1.6, e),
     textAlignment: oneOf(raw, 'textAlignment', ALIGNMENTS, e) as DesignSpecifications['textAlignment'] | undefined,
-    customInstructions: str(raw, 'customInstructions', 500, e, { label: 'design.customInstructions' })
+    customInstructions: str(raw, 'customInstructions', 500, e, { label: 'design.customInstructions' }),
+    reactionFraming: (() => {
+      try {
+        return parseReactionFraming(raw.reactionFraming);
+      } catch (err: any) {
+        e.add(`design.${String(err?.message || 'reactionFraming is not valid')}`);
+        return undefined;
+      }
+    })()
   }) as Partial<DesignSpecifications>;
 }
 
