@@ -79,9 +79,10 @@ async function bootstrap() {
   );
   app.use('/output', express.static(OUTPUT_ROOT, { dotfiles: 'deny', index: false, redirect: false }));
 
-  // Loopback by default. Behind a reverse proxy keep HOST=127.0.0.1 and let the proxy face the internet.
-  await app.listen(cfg.port, cfg.host);
-  console.log(`Telugu Meme Engine Server running on http://${cfg.host}:${cfg.port}`);
+  // Always bind 0.0.0.0 on cloud hosts (Render, Railway, Docker) or when PORT is provided
+  const bindHost = process.env.PORT || process.env.RENDER || cfg.host === '0.0.0.0' ? '0.0.0.0' : cfg.host;
+  await app.listen(cfg.port, bindHost);
+  console.log(`Telugu Meme Engine Server running on http://${bindHost}:${cfg.port}`);
   console.log('Configuration:', JSON.stringify(describeConfig(cfg)));
 
   // Sign-in status, with the mistakes that matter spelled out

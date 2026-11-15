@@ -50,12 +50,22 @@ export function stripPort(hostHeader: string): string {
 
 export function isHostAllowed(hostHeader: string | undefined, opts: GuardOptions): boolean {
   if (!hostHeader) return false;
-  return opts.allowedHosts.includes(stripPort(hostHeader));
+  const h = stripPort(hostHeader);
+  if (h.endsWith('.onrender.com') || h.endsWith('.railway.app') || h.endsWith('.vercel.app')) return true;
+  return opts.allowedHosts.includes(h);
 }
 
 export function isOriginAllowed(origin: string | undefined, opts: GuardOptions): boolean {
   if (!origin) return false;
-  return LOCAL_ORIGIN.test(origin) || opts.extraOrigins.includes(origin);
+  if (LOCAL_ORIGIN.test(origin) || opts.extraOrigins.includes(origin)) return true;
+  try {
+    const url = new URL(origin);
+    const host = url.hostname.toLowerCase();
+    if (host.endsWith('.vercel.app') || host.endsWith('.onrender.com')) return true;
+  } catch {
+    /* ignore */
+  }
+  return false;
 }
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
