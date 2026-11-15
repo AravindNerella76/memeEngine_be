@@ -96,7 +96,15 @@ async function bootstrap() {
       if (!cfg.auth.cookieSecure) console.warn('WARNING: the session cookie is not marked Secure (AUTH_COOKIE_SECURE=false). Serve the app over HTTPS and set APP_PUBLIC_URL=https://...');
     }
   }
-  if (!cfg.vision.cliPath) console.warn('WARNING: vision CLI (agy) not found. Viral adaptation will fail until VISION_CLI_PATH is set.');
+  if (cfg.vision.backend === 'gemini-api') {
+    console.log(
+      cfg.vision.geminiApiKey
+        ? `Vision: Gemini API (${cfg.vision.gemini?.analysisModel}); no local CLI needed.`
+        : 'WARNING: VISION_BACKEND=gemini-api but no GEMINI_API_KEY is set. Viral adaptation will fail until it is set.'
+    );
+  } else if (!cfg.vision.cliPath) {
+    console.warn('WARNING: vision CLI (agy) not found and no GEMINI_API_KEY set. Viral adaptation will fail until VISION_CLI_PATH or GEMINI_API_KEY is set.');
+  }
 }
 
 bootstrap();

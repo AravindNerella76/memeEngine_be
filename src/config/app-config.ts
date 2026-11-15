@@ -8,10 +8,14 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { GEMINI_DEFAULT_BASE, GEMINI_DEFAULT_MODEL, GEMINI_THINKING_LEVELS, GeminiModelSettings, GeminiThinking } from '../vision/vision-gemini-api';
 
 export const BACKEND_ROOT = path.resolve(__dirname, '..', '..');
 
 export type VisionVerifyMode = 'required' | 'off';
+
+/** Which engine runs the vision tasks: the local Antigravity CLI, or the Gemini API (needs only a key). */
+export type VisionBackend = 'cli' | 'gemini-api';
 
 /**
  * Which images discovery may use for subject slots.
@@ -29,6 +33,13 @@ export interface VisionConfig {
   cliPathSource: 'VISION_CLI_PATH' | 'AGY_PATH' | 'home' | 'USERPROFILE' | 'not_found';
   /** Test-only: arguments placed before the CLI flags (e.g. a script path when cliPath is node). */
   cliPrefixArgs?: string[];
+  /** Engine for the vision tasks. Missing = 'cli'. Automatic choice: the CLI when it is installed, else the Gemini API when a key is set. */
+  backend?: VisionBackend;
+  /** Gemini API key (GEMINI_API_KEY). Used only when backend is 'gemini-api'. Never logged or sent to the browser. */
+  geminiApiKey?: string;
+  geminiApiBase?: string;
+  /** Gemini model ids and thinking levels per task (the CLI model names above are not used by the API). */
+  gemini?: GeminiModelSettings;
   analysisModel: string;
   verifyModel: string;
   instructionModel: string;
@@ -284,6 +295,22 @@ export function resolveVisionCliPath(env: NodeJS.ProcessEnv = process.env): Pick
   return { cliPath: null, cliPathSource: 'not_found' };
 }
 
+const GEMINI_KEY_RE = /^[A-Za-z0-9_-]{20,200}$/;
+
+function thinking(env: NodeJS.ProcessEnv, key: string, fallback: GeminiThinking): GeminiThinking {
+  const v = (str(env, key) || '').toUpperCase();
+  const found = GEMINI_THINKING_LEVELS.find(l => l.toUpperCase() === v);
+  return found || fallback;
+}
+
+/** Chooses the vision engine: an explicit VISION_BACKEND wins; otherwise the CLI when found, else the API when a key exists. */
+export function resolveVisionBackend(env: NodeJS.ProcessEnv, cliFound: boolean, hasKey: boolean): VisionBackend {
+  const want = (str(env, 'VISION_BACKEND') || 'auto').toLowerCase();
+  if (want === 'cli') return 'cli';
+  if (want === 'gemini-api' || want === 'gemini' || want === 'api') return 'gemini-api';
+  return cliFound ? 'cli' : hasKey ? 'gemini-api' : 'cli';
+}
+
 const DEFAULT_PROVIDERS = ['wikimedia-commons', 'wikipedia', 'openverse', 'duckduckgo'];
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -293,6 +320,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const explicitBase = str(env, 'VISION_MODEL') && MODEL_RE.test(str(env, 'VISION_MODEL') as string) ? (str(env, 'VISION_MODEL') as string) : undefined;
   const baseModel = explicitBase || 'gemini-3.8-flash-medium';
   const fastModel = explicitBase || 'gemini-3.8-flash-low';
+
+  const rawKey = str(env, 'GEMINI_API_KEY') || str(env, 'GOOGLE_API_KEY');
+  const geminiApiKey = rawKey && GEMINI_KEY_RE.test(rawKey) ? rawKey : undefined;
+  const visionBackend = resolveVisionBackend(env, Boolean(cli.cliPath), Boolean(geminiApiKey));
 
   const keyed: string[] = [];
   const tmdbApiKey = str(env, 'TMDB_API_KEY');
@@ -336,7 +367,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxConcurrent: int(env, 'VISION_MAX_CONCURRENT', 2, 1, 4),
       workRoot: path.resolve(str(env, 'VISION_WORK_ROOT') || path.join(BACKEND_ROOT, '.vision')),
       keepRunFiles: bool(env, 'VISION_KEEP_RUN_FILES', false),
-      verifyCandidates: verifyRaw === 'off' ? 'off' : 'required'
+      verifyCandidates: verifyRaw === 'off' ? 'off' : 'required',
+      backend: visionBackend,
+      geminiApiKey,
+      geminiApiBase: (str(env, 'GEMINI_API_BASE') || GEMINI_DEFAULT_BASE).replace(/\/+$/, ''),
+      gemini: {
+        analysisModel: model(env, 'GEMINI_ANALYSIS_MODEL', GEMINI_DEFAULT_MODEL),
+        verifyModel: model(env, 'GEMINI_VERIFY_MODEL', GEMINI_DEFAULT_MODEL),
+        instructionModel: model(env, 'GEMINI_INSTRUCTION_MODEL', GEMINI_DEFAULT_MODEL),
+        // the analysis is the hard task (medium); checking candidates and reading instructions are simpler (low)
+        analysisThinking: thinking(env, 'GEMINI_ANALYSIS_THINKING', 'MEDIUM'),
+        verifyThinking: thinking(env, 'GEMINI_VERIFY_THINKING', 'LOW'),
+        instructionThinking: thinking(env, 'GEMINI_INSTRUCTION_THINKING', 'LOW')
+      }
     },
     discovery: {
       enabledProviders,
@@ -472,8 +515,13 @@ export function describeConfig(cfg: AppConfig): Record<string, unknown> {
     host: cfg.host,
     port: cfg.port,
     mongo: cfg.mongoUri.replace(/\/\/[^@/]*@/, '//***@'),
+    visionBackend: cfg.vision.backend || 'cli',
     visionCli: cfg.vision.cliPath ? `${cfg.vision.cliPath} (${cfg.vision.cliPathSource})` : 'NOT FOUND',
-    visionModels: { analysis: cfg.vision.analysisModel, verify: cfg.vision.verifyModel, instruction: cfg.vision.instructionModel },
+    geminiKeyConfigured: Boolean(cfg.vision.geminiApiKey),
+    visionModels:
+      cfg.vision.backend === 'gemini-api' && cfg.vision.gemini
+        ? { analysis: cfg.vision.gemini.analysisModel, verify: cfg.vision.gemini.verifyModel, instruction: cfg.vision.gemini.instructionModel }
+        : { analysis: cfg.vision.analysisModel, verify: cfg.vision.verifyModel, instruction: cfg.vision.instructionModel },
     visionVerifyCandidates: cfg.vision.verifyCandidates,
     providers: cfg.discovery.enabledProviders,
     rightsPolicy: cfg.discovery.rightsPolicy,

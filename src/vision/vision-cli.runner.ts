@@ -1,5 +1,11 @@
 /**
- * Runs the Antigravity CLI (agy) as a sandboxed, single-purpose vision/text model.
+ * Runs the vision/text model tasks. Two engines, same contract (a task goes in, validated JSON comes out):
+ *  - the Antigravity CLI (agy), run as a sandboxed, single-purpose process (default on the owner's PC);
+ *  - the Gemini API (vision-gemini-api.ts), used when no CLI is installed and a GEMINI_API_KEY is set, so a
+ *    hosted server can run the same tasks.
+ * Retries, the concurrency limit, JSON extraction and the caller's validator are shared by both engines.
+ *
+ * The rest of this comment describes the CLI engine:
  *
  * Every run:
  *  - gets a fresh folder <workRoot>/runs/<id>/ with a private `workspace` (only the images for
@@ -18,6 +24,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getConfig, VisionConfig } from '../config/app-config';
 import { buildChildEnv, buildCliSettings } from './vision-sandbox';
+import { GEMINI_DEFAULT_BASE, GEMINI_DEFAULT_MODEL, GeminiFailure, GeminiRequestError, buildGeminiRequestBody, classifyGeminiHttpError, geminiModelFor, isGeminiFailure, parseGeminiResponse, redactKey } from './vision-gemini-api';
 
 export type VisionPurpose = 'reference_analysis' | 'candidate_verification' | 'instruction_interpretation' | 'probe';
 
@@ -158,16 +165,27 @@ export class VisionCliRunner {
     return this.cfgOverride ?? getConfig().vision;
   }
 
+  /** The engine in use ('cli' unless the configuration says otherwise). */
+  get backend(): 'cli' | 'gemini-api' {
+    return this.cfg.backend === 'gemini-api' ? 'gemini-api' : 'cli';
+  }
+
   isConfigured(): boolean {
+    if (this.backend === 'gemini-api') return Boolean(this.cfg.geminiApiKey);
     return Boolean(this.cfg.cliPath && fs.existsSync(this.cfg.cliPath));
   }
 
-  describe(): { configured: boolean; cliPath: string | null; source: string; models: Record<string, string> } {
+  describe(): { configured: boolean; backend: 'cli' | 'gemini-api'; cliPath: string | null; source: string; models: Record<string, string> } {
+    const api = this.backend === 'gemini-api';
+    const g = this.cfg.gemini;
     return {
       configured: this.isConfigured(),
+      backend: this.backend,
       cliPath: this.cfg.cliPath,
-      source: this.cfg.cliPathSource,
-      models: { analysis: this.cfg.analysisModel, verify: this.cfg.verifyModel, instruction: this.cfg.instructionModel }
+      source: api ? 'GEMINI_API_KEY' : this.cfg.cliPathSource,
+      models: api
+        ? { analysis: g?.analysisModel || GEMINI_DEFAULT_MODEL, verify: g?.verifyModel || GEMINI_DEFAULT_MODEL, instruction: g?.instructionModel || GEMINI_DEFAULT_MODEL }
+        : { analysis: this.cfg.analysisModel, verify: this.cfg.verifyModel, instruction: this.cfg.instructionModel }
     };
   }
 
@@ -175,7 +193,9 @@ export class VisionCliRunner {
     if (!this.isConfigured()) {
       throw new VisionError(
         'NOT_CONFIGURED',
-        'The vision CLI (Antigravity "agy") was not found. Install it, or set VISION_CLI_PATH in memeEngine_be/.env to the full path of agy.exe.'
+        this.backend === 'gemini-api'
+          ? 'No Gemini API key is configured. Set GEMINI_API_KEY on the server (a key from Google AI Studio).'
+          : 'The vision CLI (Antigravity "agy") was not found. Install it, or set VISION_CLI_PATH in memeEngine_be/.env to the full path of agy.exe. On a server without the CLI, set GEMINI_API_KEY to use the Gemini API instead.'
       );
     }
     const attempts = Math.max(1, task.maxAttempts ?? this.cfg.maxAttempts);
@@ -187,7 +207,7 @@ export class VisionCliRunner {
       const meta: VisionCallMeta = { purpose: task.purpose, model: task.model, attempt, ok: false, durationMs: 0, deniedActions: [] };
       calls.push(meta);
       try {
-        const envelope = await this.withSlot(() => this.runOnce(task, meta));
+        const envelope = await this.withSlot(() => (this.backend === 'gemini-api' ? this.runGemini(task, meta) : this.runOnce(task, meta)));
         const text = String(envelope.response ?? '');
         const json = extractJsonObject(text);
         const value = task.validate(json, text);
@@ -251,6 +271,85 @@ export class VisionCliRunner {
       fs.rmSync(runDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     } catch (e: any) {
       this.logger.warn(`Could not remove vision run folder (will be swept later): ${e.message}`);
+    }
+  }
+
+  /**
+   * One call to the Gemini API. A rate limit or overload (429/502/503/504) is waited out and repeated a
+   * couple of times inside the task's time budget; anything else is classified and reported once.
+   */
+  private async runGemini<T>(task: VisionJsonTask<T>, meta: VisionCallMeta): Promise<CliEnvelope> {
+    const cfg = this.cfg;
+    const key = cfg.geminiApiKey as string;
+    const settings = cfg.gemini || {
+      analysisModel: GEMINI_DEFAULT_MODEL, verifyModel: GEMINI_DEFAULT_MODEL, instructionModel: GEMINI_DEFAULT_MODEL,
+      analysisThinking: 'MEDIUM' as const, verifyThinking: 'LOW' as const, instructionThinking: 'LOW' as const
+    };
+    const { model, thinking } = geminiModelFor(settings, task.purpose);
+    meta.model = model;
+
+    let body;
+    try {
+      body = buildGeminiRequestBody(task.prompt, task.images, thinking);
+    } catch (err: any) {
+      throw new VisionError('CLI_ERROR', err instanceof GeminiRequestError ? err.message : `Could not build the request: ${err?.message || err}`);
+    }
+    const url = `${cfg.geminiApiBase || GEMINI_DEFAULT_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    const payload = JSON.stringify(body);
+    const timeoutMs = task.timeoutMs ?? cfg.timeoutMs;
+    const deadline = Date.now() + timeoutMs;
+    const started = Date.now();
+
+    for (let tryNo = 1; ; tryNo++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new VisionError('TIMEOUT', `Gemini did not answer within ${Math.round(timeoutMs / 1000)}s`, true);
+
+      let status = 0;
+      let text = '';
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+          body: payload,
+          signal: AbortSignal.timeout(remaining)
+        });
+        status = res.status;
+        text = (await res.text()).slice(0, MAX_OUTPUT_BYTES);
+      } catch (err: any) {
+        if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+          throw new VisionError('TIMEOUT', `Gemini did not answer within ${Math.round(timeoutMs / 1000)}s`, true);
+        }
+        throw new VisionError('CLI_ERROR', `Could not reach the Gemini API: ${redactKey(err?.message || String(err), key)}`, true);
+      }
+
+      if (status < 200 || status >= 300) {
+        const f = classifyGeminiHttpError(status, text, key, model);
+        if (f.transient && tryNo < 3 && Date.now() + 500 < deadline) {
+          const wait = Math.min(f.retryAfterMs ?? 2000 * tryNo, 20_000, Math.max(0, deadline - Date.now() - 500));
+          this.logger.warn(`Gemini ${status}: waiting ${Math.round(wait / 100) / 10}s before trying again (${tryNo}/3)`);
+          await new Promise(r => setTimeout(r, wait));
+          continue;
+        }
+        throw new VisionError(f.code, f.message, f.retryable);
+      }
+
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new VisionError('BAD_OUTPUT', 'The Gemini API answer was not JSON', true);
+      }
+      try {
+        const parsed = parseGeminiResponse(json);
+        meta.modelSeconds = (Date.now() - started) / 1000;
+        meta.inputTokens = parsed.inputTokens;
+        meta.outputTokens = parsed.outputTokens;
+        meta.thinkingTokens = parsed.thinkingTokens;
+        return { status: 'SUCCESS', response: parsed.text };
+      } catch (e: any) {
+        if (isGeminiFailure(e)) throw new VisionError((e as GeminiFailure).code, e.message, e.retryable);
+        throw e;
+      }
     }
   }
 

@@ -126,10 +126,12 @@ Those two paths stay reachable without a session on purpose, and each checks its
 
 ## What is not covered
 
-- **The AI vision tool.** Viral adaptation runs the `agy` CLI from the owner's PC (a signed-in Gemini CLI under
-  the user profile). A server needs that tool installed and signed in too, and its models reachable from the
-  server's network. Without it, hosting still serves the gallery, Settings, manual Create and Instagram
-  publishing, but **Viral Adaptation will not work**. Decide this before renting a server.
+- **The AI vision tool.** Viral adaptation and layout learning need a vision model. A hosted server has no `agy`
+  CLI, so give it a Gemini API key instead: set `GEMINI_API_KEY` (from Google AI Studio) in the server's
+  environment. The server then uses the Gemini API automatically when no CLI is installed (`VISION_BACKEND` can
+  force either engine). Pictures are sent to Google for analysis. A free key has low per-minute limits, and one
+  viral adaptation makes many calls, so enable billing on the key for smooth use. Without either engine, hosting
+  still serves the gallery, Settings, manual Create and Instagram publishing, but **Viral Adaptation will not work**.
 - **Verified here:** the sign-in logic, cookie flags, lockout, Host/Origin rules and public/private route split
   were tested against a scratch server by simulating the public host name and a proxy's `X-Forwarded-For`. A real
   Caddy/nginx deployment with a real certificate was **not** tested; follow section 5 on your own deployment.
