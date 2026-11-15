@@ -35,6 +35,9 @@ import { WhatsAppCredentials, WhatsAppCredentialsSchema } from './schemas/whatsa
 import { WhatsAppCredentialsService } from './services/whatsapp-credentials.service';
 import { FormatController } from './controllers/format.controller';
 import { ThumbnailService } from './services/thumbnail.service';
+import { ReactionImage, ReactionImageSchema } from './schemas/reaction-image.schema';
+import { ReactionLibraryService } from './services/reaction-library.service';
+import { ReactionController } from './controllers/reaction.controller';
 import { VisionCliRunner } from './vision/vision-cli.runner';
 import { ProviderUsageRecord, ProviderUsageSchema, ProviderUsageService } from './discovery/provider-usage';
 import { getConfig } from './config/app-config';
@@ -53,7 +56,8 @@ import { getConfig } from './config/app-config';
       { name: MemeFormat.name, schema: MemeFormatSchema },
       { name: WhatsAppCredentials.name, schema: WhatsAppCredentialsSchema },
       { name: AuthUser.name, schema: AuthUserSchema },
-      { name: AuthSession.name, schema: AuthSessionSchema }
+      { name: AuthSession.name, schema: AuthSessionSchema },
+      { name: ReactionImage.name, schema: ReactionImageSchema }
     ])
   ],
   controllers: [
@@ -66,11 +70,13 @@ import { getConfig } from './config/app-config';
     SystemController,
     InstagramController,
     WhatsAppController,
-    FormatController
+    FormatController,
+    ReactionController
   ],
   providers: [
     AuthService,
     ThumbnailService,
+    ReactionLibraryService,
     // Every route needs a signed-in session unless it is marked @Public()
     { provide: APP_GUARD, useClass: AuthGuard },
     VisionCliRunner,

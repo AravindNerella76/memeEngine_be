@@ -55,6 +55,21 @@ punchline, captions), canvas and layout, image processing, image discovery, adva
   diagnostics, log level) apply at once on top of `.env`. They can only switch providers off, raise
   thresholds or lower limits; keys and monthly caps stay in `.env`.
 
+## Reaction library (`/api/reactions`, frontend `/reactions`)
+
+The owner's own reaction pictures, filed in free-form folders ("shocking", "sad funny", "brahmi laughing"...) with optional tags, so one can be picked in a tap instead of being found and uploaded every time. Pictures are stored **in MongoDB** (collection `reaction_images`: the original bytes plus a 480 px copy), not on disk, so they survive redeploys on hosts with a temporary disk such as Render's free plan. The same file is never stored twice (SHA-256), pictures larger than 2400 px or 3 MB are shrunk when stored, and at most 3000 are kept.
+
+| Route | What |
+|---|---|
+| `GET /api/reactions?category=&search=&sort=newest\|recent\|used&limit=&skip=` | a page of summaries (never image bytes) |
+| `GET /api/reactions/categories` | folders with counts |
+| `POST /api/reactions` | multipart: `images` (up to 12) + `category` (+ `tags`); per-file results `added` / `duplicates` / `failed` |
+| `PATCH /api/reactions/:id`, `DELETE /api/reactions/:id`, `POST /api/reactions/bulk` | edit folder / name / tags; move or delete many |
+| `GET /api/reactions/:id/thumb`, `/:id/file` | bytes, cacheable (a picture never changes) |
+| `POST /api/reactions/:id/used` | counts a use (what the quick-pick row sorts by) |
+
+Every route needs the sign-in session. Generation itself is unchanged: the frontend downloads the chosen picture and sends it as the normal `reactionImage` upload.
+
 ## Replacing images (no manual editor)
 
 | Endpoint | Purpose |

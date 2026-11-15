@@ -453,3 +453,113 @@ export function validateViralOverrides(input: { draftId?: unknown; slotOverrides
   e.throwIfAny();
   return { draftId, overrides: overrides && overrides.length ? overrides : undefined };
 }
+
+// -----------------------------------------------------------------------------------------------
+// Reaction library (the owner's own set of reaction pictures, grouped by situation / emotion / subject)
+// -----------------------------------------------------------------------------------------------
+
+export const REACTION_PAGE_DEFAULT = 48;
+export const REACTION_PAGE_MAX = 120;
+export const REACTION_MAX_IDS = 200;
+export const REACTION_MAX_TAGS = 12;
+// \p{M}: the vowel signs and virama of Telugu (and other scripts) are combining marks, not letters
+const CATEGORY_RE = /^[\p{L}\p{N}][\p{L}\p{M}\p{N} _-]{0,39}$/u;
+const TAG_RE = /^[\p{L}\p{N}][\p{L}\p{M}\p{N} _.'-]{0,29}$/u;
+
+/** "  Sad   Funny " -> "sad funny". Letters (any language), digits, space, - and _; 1-40 characters. Null when invalid. */
+export function normalizeCategory(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const s = v.normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
+  return CATEGORY_RE.test(s) ? s : null;
+}
+
+/** Free tags (a person, a situation): trimmed, lower-cased, de-duplicated, at most REACTION_MAX_TAGS. */
+export function normalizeTags(v: unknown, e: Errors): string[] | undefined {
+  if (v === undefined || v === null) return undefined;
+  const raw = typeof v === 'string' ? v.split(',') : Array.isArray(v) ? v : null;
+  if (!raw) { e.add('tags must be a list'); return undefined; }
+  const out: string[] = [];
+  for (const t of raw) {
+    if (typeof t !== 'string') { e.add('tags must be text'); return undefined; }
+    const s = t.normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!s) continue;
+    if (!TAG_RE.test(s)) { e.add(`tag "${s.slice(0, 20)}" has characters that are not allowed (30 letters, digits, space . ' - _ at most)`); return undefined; }
+    if (!out.includes(s)) out.push(s);
+  }
+  if (out.length > REACTION_MAX_TAGS) { e.add(`at most ${REACTION_MAX_TAGS} tags`); return undefined; }
+  return out;
+}
+
+export interface ValidatedReactionQuery {
+  category?: string;
+  search?: string;
+  sort: 'recent' | 'used' | 'newest';
+  limit: number;
+  skip: number;
+}
+
+/** GET /api/reactions?category=&search=&sort=&limit=&skip= */
+export function validateReactionQuery(q: unknown): ValidatedReactionQuery {
+  const o: Obj = isObj(q) ? q : {};
+  const e = new Errors();
+  let category: string | undefined;
+  const rawCat = str(o, 'category', 60, e, { label: 'category' });
+  if (rawCat !== undefined && rawCat !== 'all') {
+    const c = normalizeCategory(rawCat);
+    if (!c) e.add('category has characters that are not allowed');
+    else category = c;
+  }
+  const search = str(o, 'search', 100, e, { label: 'search' })?.trim() || undefined;
+  const sort = oneOf(o, 'sort', ['recent', 'used', 'newest'] as const, e) || 'newest';
+  const limit = intParam(o, 'limit', 1, REACTION_PAGE_MAX, REACTION_PAGE_DEFAULT, e);
+  const skip = intParam(o, 'skip', 0, 1_000_000, 0, e);
+  e.throwIfAny();
+  return { category, search, sort, limit, skip };
+}
+
+export interface ValidatedReactionPatch {
+  category?: string;
+  name?: string;
+  tags?: string[];
+}
+
+/** PATCH /api/reactions/:id */
+export function validateReactionPatch(body: unknown): ValidatedReactionPatch {
+  const o: Obj = isObj(body) ? body : {};
+  const e = new Errors();
+  const out: ValidatedReactionPatch = {};
+  if (o.category !== undefined) {
+    const c = normalizeCategory(o.category);
+    if (!c) e.add('category must be 1-40 letters, digits, spaces, - or _');
+    else out.category = c;
+  }
+  if (o.name !== undefined) {
+    const n = str(o, 'name', 80, e, { label: 'name' });
+    out.name = (n ?? '').replace(/\s+/g, ' ').trim();
+  }
+  const tags = normalizeTags(o.tags, e);
+  if (tags !== undefined) out.tags = tags;
+  e.throwIfAny();
+  return out;
+}
+
+/** POST /api/reactions/bulk  { action: 'move' | 'delete', ids: [...], category? } */
+export function validateReactionBulk(body: unknown): { action: 'move' | 'delete'; ids: string[]; category?: string } {
+  const o: Obj = isObj(body) ? body : {};
+  const e = new Errors();
+  const action = oneOf(o, 'action', ['move', 'delete'] as const, e);
+  if (!action) e.add('action is required (move or delete)');
+  const ids = strArray(o, 'ids', REACTION_MAX_IDS, 40, e);
+  if (!ids || !ids.length) e.add('ids is required');
+  else if (!ids.every(id => UUID_RE.test(id))) e.add('ids must be reaction image ids');
+  let category: string | undefined;
+  if (action === 'move') {
+    const c = normalizeCategory(o.category);
+    if (!c) e.add('category is required to move images');
+    else category = c;
+  }
+  e.throwIfAny();
+  return { action: action as 'move' | 'delete', ids: ids as string[], category };
+}
+
+export const isReactionId = (v: unknown): v is string => typeof v === 'string' && UUID_RE.test(v);
