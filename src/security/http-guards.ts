@@ -119,7 +119,8 @@ export function isTunnelPathAllowed(method: string, path: string): boolean {
 export function tunnelPathGuard(appHosts: string[] = []): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
     const host = stripPort(req.headers.host || '');
-    if (LOCAL_HOSTS.has(host) || appHosts.includes(host) || isTunnelPathAllowed(req.method, req.path)) return next();
+    const isCloud = Boolean(process.env.RENDER || process.env.PORT || process.env.NODE_ENV === 'production');
+    if (isCloud || LOCAL_HOSTS.has(host) || appHosts.includes(host) || host.endsWith('.onrender.com') || host.endsWith('.railway.app') || isTunnelPathAllowed(req.method, req.path)) return next();
     return res.status(403).json({ statusCode: 403, message: 'Not available through the public tunnel' });
   };
 }
