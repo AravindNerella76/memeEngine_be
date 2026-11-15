@@ -89,6 +89,15 @@ async function bootstrap() {
   console.log(`Telugu Meme Engine Server running on http://${bindHost}:${cfg.port}`);
   console.log('Configuration:', JSON.stringify(describeConfig(cfg)));
 
+  // A hosted server that does not know its own address would tell Instagram and WhatsApp to fetch pictures from somewhere else
+  const hosted = Boolean(process.env.PORT || process.env.RENDER);
+  if (hosted && !process.env.PUBLIC_BASE_URL && !process.env.RENDER_EXTERNAL_URL && /ngrok/i.test(cfg.instagram.publicBaseUrl)) {
+    console.warn(
+      `WARNING: PUBLIC_BASE_URL is not set, so generated pictures are announced as ${cfg.instagram.publicBaseUrl}. ` +
+        'Set PUBLIC_BASE_URL=https://<your-service>.onrender.com (Instagram publishing needs it; WhatsApp pictures are uploaded directly and do not).'
+    );
+  }
+
   // Sign-in status, with the mistakes that matter spelled out
   if (!cfg.auth.enabled) {
     console.warn('WARNING: login is OFF (AUTH_ENABLED=false). Only do this for local development.');

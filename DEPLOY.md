@@ -28,6 +28,12 @@ INSTAGRAM_REDIRECT_URI=https://studio.example.com/api/instagram/auth/callback
 # keep your existing META_*, WHATSAPP_*, MONGO_URI, INSTAGRAM_TOKEN_ENCRYPTION_KEY ...
 ```
 
+**`PUBLIC_BASE_URL` must be this server's real public address** (on Render it is filled in from `RENDER_EXTERNAL_URL`
+when you leave it unset). It is the address Instagram downloads generated pictures from. If it is left at the old
+ngrok default the server announces pictures at an address that is not this server: Instagram publishing fails, and
+the Settings page shows the wrong webhook URL. The WhatsApp bot uploads its pictures to WhatsApp directly, so chat
+delivery does not depend on it; a failed delivery is logged ("WhatsApp could not deliver message ...") and the user is told.
+
 Create the owner on the server, then start it:
 
 ```bash

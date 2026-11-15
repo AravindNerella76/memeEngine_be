@@ -54,4 +54,11 @@ describe('whatsapp config fails closed', () => {
     assert.equal(loadConfig({ WHATSAPP_ALLOWED_PHONE: '+91 93477-08120, 918885550123' } as any).whatsapp.allowedPhone, '919347708120,918885550123');
     assert.equal(loadConfig({ PUBLIC_BASE_URL: 'https://a.example/' } as any).instagram.publicBaseUrl, 'https://a.example');
   });
+
+  it('a Render service knows its own public address without any setting, and an explicit setting still wins', () => {
+    assert.equal(loadConfig({ RENDER_EXTERNAL_URL: 'https://studio-api.onrender.com' } as any).instagram.publicBaseUrl, 'https://studio-api.onrender.com');
+    assert.equal(loadConfig({ RENDER_EXTERNAL_URL: 'https://studio-api.onrender.com/' } as any).instagram.publicBaseUrl, 'https://studio-api.onrender.com');
+    assert.equal(loadConfig({ PUBLIC_BASE_URL: 'https://mine.example', RENDER_EXTERNAL_URL: 'https://studio-api.onrender.com' } as any).instagram.publicBaseUrl, 'https://mine.example');
+    assert.match(loadConfig({} as any).instagram.publicBaseUrl, /^https:\/\//, 'with nothing set the old default still applies');
+  });
 });

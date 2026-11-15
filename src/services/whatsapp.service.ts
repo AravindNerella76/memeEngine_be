@@ -134,9 +134,69 @@ export class WhatsAppService {
   }
 
   /**
-   * Sends an image message to WhatsApp via public HTTPS URL
+   * Sends an image message to WhatsApp via public HTTPS URL. WhatsApp's servers must be able to download that address, so
+   * prefer sendPicture, which uploads the picture to WhatsApp itself and needs no public address at all.
    */
   async sendImageMessage(to: string, imageUrl: string, caption?: string): Promise<boolean> {
+    return this.postImage(to, { link: imageUrl }, caption);
+  }
+
+  /** Sends a picture that was uploaded to WhatsApp (uploadMedia) by its media id. */
+  async sendImageById(to: string, mediaId: string, caption?: string): Promise<boolean> {
+    return this.postImage(to, { id: mediaId }, caption);
+  }
+
+  /**
+   * Uploads a picture to WhatsApp (Cloud API media upload) and returns its media id, or null when that did not work. The id
+   * can be sent to the user right away (and stays valid for 30 days).
+   */
+  async uploadMedia(buffer: Buffer, mimeType: string, filename: string): Promise<string | null> {
+    const cfg = await this.currentCredentials();
+    if (!cfg.accessToken || !cfg.phoneNumberId) return null;
+    try {
+      const form = new FormData();
+      form.set('messaging_product', 'whatsapp');
+      form.set('type', mimeType);
+      form.set('file', new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
+      const res = await fetch(`https://graph.facebook.com/${cfg.apiVersion}/${cfg.phoneNumberId}/media`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${cfg.accessToken}` },
+        body: form
+      });
+      const out: any = await res.json().catch(() => ({}));
+      if (!res.ok || !out?.id) {
+        this.logger.warn(`Could not upload a picture to WhatsApp (it will be sent as a link instead): ${JSON.stringify(out)}`);
+        this.credentials?.noteSendResult(out);
+        return null;
+      }
+      this.credentials?.noteSendResult(null);
+      return String(out.id);
+    } catch (err: any) {
+      this.logger.warn(`Error uploading a picture to WhatsApp: ${err?.message || err}`);
+      return null;
+    }
+  }
+
+  /**
+   * Sends a picture the most dependable way: uploaded to WhatsApp, so nothing outside has to be reachable from the internet.
+   * Only if that fails is it sent as a link to the same picture (which WhatsApp must then be able to download). Returns
+   * false when neither worked.
+   */
+  async sendPicture(to: string, pic: { buffer?: Buffer; filePath?: string; mimeType?: string; url: string }, caption?: string): Promise<boolean> {
+    try {
+      const buffer = pic.buffer ?? (pic.filePath ? await fs.promises.readFile(pic.filePath) : null);
+      if (buffer && buffer.length > 0 && buffer.length <= 5 * 1024 * 1024) {
+        const mime = pic.mimeType || (pic.filePath && /\.png$/i.test(pic.filePath) ? 'image/png' : 'image/jpeg');
+        const id = await this.uploadMedia(buffer, mime, mime === 'image/png' ? 'picture.png' : 'picture.jpg');
+        if (id && (await this.sendImageById(to, id, caption))) return true;
+      }
+    } catch (err: any) {
+      this.logger.warn(`Could not send the picture by upload (${err?.message || err}); trying its link.`);
+    }
+    return this.sendImageMessage(to, pic.url, caption);
+  }
+
+  private async postImage(to: string, image: { link?: string; id?: string }, caption?: string): Promise<boolean> {
     const cfg = await this.currentCredentials();
     if (!cfg.accessToken || !cfg.phoneNumberId) {
       this.logger.error('WhatsApp credentials missing in configuration');
@@ -150,7 +210,7 @@ export class WhatsAppService {
         recipient_type: 'individual',
         to,
         type: 'image',
-        image: { link: imageUrl }
+        image: { ...image }
       };
       if (caption) {
         payload.image.caption = caption;
@@ -347,9 +407,37 @@ export class WhatsAppService {
             const from = msg.from;
             await this.handleUserMessage(from, msg);
           }
+          // Meta also reports what became of each message we sent (delivered, read, failed)
+          for (const st of value?.statuses || []) await this.handleStatus(st);
         }
       }
     }
+  }
+
+  private readonly reportedFailures = new Set<string>();
+
+  /**
+   * A message we sent could not be delivered. WhatsApp accepts a request and fails later (for example when it cannot
+   * download a picture from the address it was given), so this is the only place that shows it. It is logged with Meta's
+   * reason; when it is a picture that could not be loaded the user is told once, instead of simply getting nothing.
+   */
+  private async handleStatus(st: any): Promise<void> {
+    if (st?.status !== 'failed') return;
+    const err = Array.isArray(st.errors) ? st.errors[0] : null;
+    const detail = [err?.code ? `(${err.code})` : '', err?.title, err?.error_data?.details || err?.message].filter(Boolean).join(' ');
+    this.logger.error(`WhatsApp could not deliver message ${st.id} to ${st.recipient_id}: ${detail || 'no reason given'}`);
+    if (!st.id || this.reportedFailures.has(st.id)) return;
+    this.reportedFailures.add(st.id);
+    if (this.reportedFailures.size > 500) this.reportedFailures.delete(this.reportedFailures.values().next().value as string);
+    // 131053 / 131052 / 131051: the picture could not be uploaded, downloaded or is not supported. Never answer a failed text with a text.
+    if (![131053, 131052, 131051].includes(Number(err?.code))) return;
+    const cfg = await this.currentCredentials();
+    if (!st.recipient_id || !isAllowedPhone(cfg.allowedPhone, String(st.recipient_id))) return;
+    await this.sendTextMessage(
+      String(st.recipient_id),
+      '⚠️ WhatsApp could not load the picture I just tried to send. Your meme is saved: open the studio and look in *My Memes* to see it and publish it.\n' +
+        'If this keeps happening, the server\'s public address (PUBLIC_BASE_URL) is probably not set to its real address.'
+    );
   }
 
   /**
@@ -864,8 +952,9 @@ export class WhatsAppService {
       `👉 *Approve* — Publish to Instagram (@kanyaraasi_memes)\n` +
       `👉 *Reset* — Discard this meme`;
 
-    // Send image preview to user
-    const sent = await this.sendImageMessage(to, publicImageUrl, previewCaption);
+    // Send image preview to user: uploaded to WhatsApp itself, so it arrives even when the server's public address is not reachable
+    const localFile: string | undefined = meme.outputPaths?.jpeg || meme.outputPaths?.png;
+    const sent = await this.sendPicture(to, { filePath: localFile, mimeType: localFile && /\.png$/i.test(localFile) ? 'image/png' : 'image/jpeg', url: publicImageUrl }, previewCaption);
     if (!sent) {
       // Fallback to text with link if image send fails
       await this.sendTextMessage(to, `🎭 *Meme Ready!*\nView image: ${publicImageUrl}\n\n${previewCaption}`);
@@ -877,7 +966,7 @@ export class WhatsAppService {
     session.lastGeneratedCaption = punchline;
     await session.save();
 
-    this.logger.log(`Generated meme ${session.lastGeneratedMemeId} delivered to WhatsApp user ${to}`);
+    this.logger.log(`Generated meme ${session.lastGeneratedMemeId} sent to WhatsApp user ${to}`);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1273,7 +1362,7 @@ export class WhatsAppService {
       (q.page + 1 < pages ? '\n*More* — next page' : '') +
       (q.page > 0 ? '\n*Previous* — previous page' : '') +
       '\n*Back* — folders · *Close* — return to your meme';
-    const sent = await this.sendImageMessage(from, url, caption);
+    const sent = await this.sendPicture(from, { buffer: sheet, mimeType: 'image/jpeg', url }, caption);
     if (!sent) await this.sendTextMessage(from, '⚠️ I could not send the picture sheet. Open the studio to pick from your library, or send the reaction picture here.');
   }
 
@@ -1321,8 +1410,9 @@ export class WhatsAppService {
 
     // a picture of every choice, then the question as a tap-list (plain text when a list cannot be sent)
     try {
-      const url = await this.writeSheet(await renderFramingSheet(look.img, look.a, options));
-      await this.sendImageMessage(from, url, `🎞️ This picture has ${look.a.frames.length} frames. Here is each choice:`);
+      const sheet = await renderFramingSheet(look.img, look.a, options);
+      const url = await this.writeSheet(sheet);
+      await this.sendPicture(from, { buffer: sheet, mimeType: 'image/jpeg', url }, `🎞️ This picture has ${look.a.frames.length} frames. Here is each choice:`);
     } catch (err: any) {
       this.logger.warn(`Could not draw the frame choices: ${err?.message || err}`);
     }
@@ -1470,7 +1560,7 @@ export class WhatsAppService {
       const description = FormatLibraryService.describe(doc);
       const caption = `📐 *${doc.name || `Unnamed layout ${view[1]}`}*\n${description}\nUsed ${doc.usageCount || 0} time(s).`;
       const sent = doc.thumbnailFile
-        ? await this.sendImageMessage(from, `${getConfig().instagram.publicBaseUrl}/output/${doc.thumbnailFile}`, caption)
+        ? await this.sendPicture(from, { filePath: path.join(OUTPUT_ROOT, path.basename(doc.thumbnailFile)), url: `${getConfig().instagram.publicBaseUrl}/output/${doc.thumbnailFile}` }, caption)
         : false;
       if (!sent) await this.sendTextMessage(from, caption);
       return true;

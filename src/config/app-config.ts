@@ -441,6 +441,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       targetUsername: str(env, 'INSTAGRAM_TARGET_USERNAME') || 'kanyaraasi_memes',
       publicBaseUrl: (
         str(env, 'PUBLIC_BASE_URL') ||
+        // Render sets this to the service's own public address, so a hosted server needs no setting at all
+        str(env, 'RENDER_EXTERNAL_URL') ||
         (str(env, 'INSTAGRAM_REDIRECT_URI') || 'https://jailer-effective-wiring.ngrok-free.dev/api/instagram/auth/callback').replace(/\/api\/instagram\/auth\/callback\/?$/, '')
       ).replace(/\/+$/, '')
     },
