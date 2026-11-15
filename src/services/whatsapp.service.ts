@@ -1,4 +1,4 @@
-import { GoneException, Injectable, Logger, UnprocessableEntityException } from '@nestjs/common';
+import { GoneException, Injectable, Logger, Optional, UnprocessableEntityException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import * as fs from 'fs';
@@ -10,8 +10,22 @@ import { ViralAdaptationService } from './viral-adaptation.service';
 import { InstagramPublisherService } from './instagram-publisher.service';
 import { MemeEngineService } from './meme-engine.service';
 import { ImageSelectionService } from './image-selection.service';
+import { FormatLibraryService, FormatSummary } from './format-library.service';
+import { WhatsAppCredentialsService } from './whatsapp-credentials.service';
 import { validateUploadPayload } from '../security/request-validation';
 import type { UploadedAsset } from '../types/meme.types';
+import { ConvertedFrom, MAX_CONVERT_INPUT_BYTES, normalizeImageBuffer } from '../security/image-normalize';
+import { SafeFetchError, safeFetch } from '../security/safe-fetch';
+
+/** An image received from the user, already checked and (when needed) converted to JPEG/PNG/WebP. */
+export interface ReceivedImage {
+  filePath: string;
+  filename: string;
+  mimeType: string;
+  width: number;
+  height: number;
+  convertedFrom: ConvertedFrom;
+}
 
 @Injectable()
 export class WhatsAppService {
@@ -25,7 +39,10 @@ export class WhatsAppService {
     private readonly viralAdaptation: ViralAdaptationService,
     private readonly instagramPublisher: InstagramPublisherService,
     private readonly memeEngine: MemeEngineService,
-    private readonly selection: ImageSelectionService
+    private readonly selection: ImageSelectionService,
+    private readonly formats: FormatLibraryService,
+    // Token and phone number ID saved in the app (Settings > WhatsApp); falls back to the server settings
+    @Optional() private readonly credentials?: WhatsAppCredentialsService
   ) {
     if (!fs.existsSync(this.mediaDir)) {
       fs.mkdirSync(this.mediaDir, { recursive: true });
@@ -35,8 +52,8 @@ export class WhatsAppService {
   /**
    * Meta Webhook verification handshake for GET /api/whatsapp/webhook
    */
-  verifyWebhook(mode?: string, token?: string, challenge?: string): string | null {
-    const expectedToken = getConfig().whatsapp.verifyToken;
+  async verifyWebhook(mode?: string, token?: string, challenge?: string): Promise<string | null> {
+    const expectedToken = (await this.currentCredentials()).verifyToken;
     if (expectedToken && mode === 'subscribe' && token === expectedToken && challenge) {
       this.logger.log(`WhatsApp webhook verified successfully`);
       return challenge;
@@ -45,11 +62,19 @@ export class WhatsAppService {
     return null;
   }
 
+  /** Server settings with everything saved in the app (Settings > WhatsApp) applied on top. */
+  private async currentCredentials() {
+    const env = getConfig().whatsapp;
+    if (!this.credentials) return env;
+    const c = await this.credentials.getEffective();
+    return { ...env, accessToken: c.accessToken, phoneNumberId: c.phoneNumberId, verifyToken: c.verifyToken, appSecret: c.appSecret, allowedPhone: c.allowedPhone };
+  }
+
   /**
    * Sends a plain text WhatsApp message via Meta Cloud API
    */
   async sendTextMessage(to: string, text: string): Promise<boolean> {
-    const cfg = getConfig().whatsapp;
+    const cfg = await this.currentCredentials();
     if (!cfg.accessToken || !cfg.phoneNumberId) {
       this.logger.error('WhatsApp credentials missing in configuration');
       return false;
@@ -75,8 +100,10 @@ export class WhatsAppService {
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}));
         this.logger.error(`Failed to send WhatsApp message: ${JSON.stringify(errJson)}`);
+        this.credentials?.noteSendResult(errJson);
         return false;
       }
+      this.credentials?.noteSendResult(null);
       return true;
     } catch (err: any) {
       this.logger.error(`Error sending WhatsApp message: ${err?.message || err}`);
@@ -88,7 +115,7 @@ export class WhatsAppService {
    * Sends an image message to WhatsApp via public HTTPS URL
    */
   async sendImageMessage(to: string, imageUrl: string, caption?: string): Promise<boolean> {
-    const cfg = getConfig().whatsapp;
+    const cfg = await this.currentCredentials();
     if (!cfg.accessToken || !cfg.phoneNumberId) {
       this.logger.error('WhatsApp credentials missing in configuration');
       return false;
@@ -119,8 +146,10 @@ export class WhatsAppService {
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}));
         this.logger.error(`Failed to send WhatsApp image: ${JSON.stringify(errJson)}`);
+        this.credentials?.noteSendResult(errJson);
         return false;
       }
+      this.credentials?.noteSendResult(null);
       return true;
     } catch (err: any) {
       this.logger.error(`Error sending WhatsApp image: ${err?.message || err}`);
@@ -128,11 +157,21 @@ export class WhatsAppService {
     }
   }
 
+  /** Verifies and converts the bytes (HEIC/PDF -> image), then stores them for the pipeline. */
+  private async storeImage(buf: Buffer): Promise<ReceivedImage> {
+    const n = await normalizeImageBuffer(buf);
+    const filename = `wa_${randomUUID()}${n.ext}`;
+    const filePath = path.join(this.mediaDir, filename);
+    await fs.promises.writeFile(filePath, n.buffer, { flag: 'wx' });
+    return { filePath, filename, mimeType: n.mime, width: n.width, height: n.height, convertedFrom: n.convertedFrom };
+  }
+
   /**
-   * Downloads a media file (image) sent by the user in WhatsApp
+   * Downloads a file the user sent in WhatsApp (photo or document) at its original quality and
+   * converts it when needed (HEIC, PDF).
    */
-  async downloadMedia(mediaId: string): Promise<{ filePath: string; filename: string; mimeType: string }> {
-    const cfg = getConfig().whatsapp;
+  async downloadMedia(mediaId: string): Promise<ReceivedImage> {
+    const cfg = await this.currentCredentials();
     // The id is interpolated into a Graph API URL that carries our bearer token: digits only.
     if (!/^\d{1,40}$/.test(String(mediaId))) {
       throw new Error('Invalid WhatsApp media id');
@@ -143,14 +182,14 @@ export class WhatsAppService {
     });
     if (!metaRes.ok) {
       const err = await metaRes.text();
+      try { this.credentials?.noteSendResult(JSON.parse(err)); } catch { /* not JSON */ }
       throw new Error(`Failed to query WhatsApp media: ${err}`);
     }
     const metaJson = await metaRes.json();
     const mediaUrl = metaJson.url;
-    const mimeType = metaJson.mime_type || 'image/jpeg';
-    const ext = mimeType.includes('png') ? '.png' : mimeType.includes('webp') ? '.webp' : '.jpg';
-    const filename = `wa_${randomUUID()}${ext}`;
-    const filePath = path.join(this.mediaDir, filename);
+    if (Number(metaJson.file_size) > MAX_CONVERT_INPUT_BYTES) {
+      throw new Error(`File is too large (${(Number(metaJson.file_size) / 1048576).toFixed(0)} MB; limit ${MAX_CONVERT_INPUT_BYTES / 1048576} MB)`);
+    }
 
     // Step 2: Download the binary file using access token
     const fileRes = await fetch(mediaUrl, {
@@ -162,10 +201,63 @@ export class WhatsAppService {
     if (!fileRes.ok) {
       throw new Error(`Failed to download WhatsApp media bytes: HTTP ${fileRes.status}`);
     }
-    const arrayBuf = await fileRes.arrayBuffer();
-    await fs.promises.writeFile(filePath, Buffer.from(arrayBuf));
+    if (Number(fileRes.headers.get('content-length')) > MAX_CONVERT_INPUT_BYTES) {
+      throw new Error('File is too large');
+    }
+    return this.storeImage(Buffer.from(await fileRes.arrayBuffer()));
+  }
 
-    return { filePath, filename, mimeType };
+  /** First http(s) link in a message, without trailing punctuation. */
+  extractUrl(text: string): string | null {
+    const m = /https?:\/\/[^\s<>"']+/i.exec(text || '');
+    return m ? m[0].replace(/[.,;:!?)\]]+$/, '') : null;
+  }
+
+  /** Share links of common file hosts rewritten to their direct-download form. */
+  directDownloadUrl(raw: string): string {
+    try {
+      const u = new URL(raw);
+      const host = u.hostname.toLowerCase();
+      if (host === 'drive.google.com') {
+        const id = /\/file\/d\/([\w-]+)/.exec(u.pathname)?.[1] || u.searchParams.get('id');
+        if (id) return `https://drive.google.com/uc?export=download&id=${id}`;
+      }
+      if (host === 'www.dropbox.com' || host === 'dropbox.com') {
+        u.searchParams.delete('dl');
+        u.searchParams.set('dl', '1');
+        return u.toString();
+      }
+    } catch {
+      /* fall through: safeFetch validates the URL */
+    }
+    return raw;
+  }
+
+  /** Downloads a direct image link (SSRF-safe, size-capped) and converts it when needed. */
+  async downloadImageFromUrl(rawUrl: string): Promise<ReceivedImage> {
+    let body: Buffer;
+    try {
+      const res = await safeFetch(this.directDownloadUrl(rawUrl), {
+        timeoutMs: 45_000,
+        maxBytes: MAX_CONVERT_INPUT_BYTES,
+        userAgent: getConfig().discovery.userAgent
+      });
+      body = res.body;
+    } catch (err: any) {
+      if (err instanceof SafeFetchError) {
+        throw new Error(
+          err.code === 'TOO_LARGE'
+            ? `The linked file is larger than ${MAX_CONVERT_INPUT_BYTES / 1048576} MB.`
+            : `I could not download that link (${err.code.toLowerCase().replace(/_/g, ' ')}). Send the file itself or a direct image link.`
+        );
+      }
+      throw err;
+    }
+    const head = body.subarray(0, 512).toString('utf8').trimStart().toLowerCase();
+    if (head.startsWith('<!doctype html') || head.startsWith('<html')) {
+      throw new Error('That link opens a web page, not an image file. Send the picture itself (as a Document) or a direct link to the image file.');
+    }
+    return this.storeImage(body);
   }
 
   /**
@@ -202,7 +294,7 @@ export class WhatsAppService {
    * Conversational state machine for handling messages from a user
    */
   private async handleUserMessage(from: string, message: any): Promise<void> {
-    const cfg = getConfig().whatsapp;
+    const cfg = await this.currentCredentials();
     // Security check: restrict to configured phone number if specified
     // Fail closed: with no WHATSAPP_ALLOWED_PHONE configured nobody is authorised.
     if (!cfg.allowedPhone || from !== cfg.allowedPhone) {
@@ -238,6 +330,9 @@ export class WhatsAppService {
           `2️⃣ Send the *Reaction Image*\n` +
           `3️⃣ Send the *Punchline Text*\n\n` +
           `Or send *Manual* to build a meme from your own images and text.\n\n` +
+          `📎 *Best quality:* send pictures as a *Document* (📎 → Document): JPG, PNG, WebP, HEIC or PDF. ` +
+          `You can also paste a direct image link.\n\n` +
+          `📐 *Layouts:* send *Layouts* to see your saved meme layouts, or *New layout* to teach me one from an example meme.\n\n` +
           `Commands:\n` +
           `• *Approve* — Publish pending meme to Instagram (@kanyaraasi_memes)\n` +
           `• *Reset* — Clear current draft and start fresh\n` +
@@ -264,6 +359,9 @@ export class WhatsAppService {
         );
         return;
       }
+
+      // Layout library: list / add / name / delete saved layouts (and the naming step after learning one)
+      if (await this.handleLayoutCommand(session, from, text, lower)) return;
 
       // Command: APPROVE / PUBLISH
       if (!this.isManualState(session) && ['approve', 'approved', 'publish', 'yes', 'ok'].includes(lower)) {
@@ -299,6 +397,13 @@ export class WhatsAppService {
         return;
       }
 
+      // A pasted link counts as a picture whenever the bot is waiting for one; extra words become the caption/label
+      const link = this.extractUrl(text);
+      if (link && this.expectsImage(session)) {
+        await this.receiveImage(session, from, { url: link }, text.replace(link, '').trim(), false);
+        return;
+      }
+
       if (session.state === 'AWAITING_SLOT_IMAGE') {
         await this.askForSlotImage(session, from, true);
         return;
@@ -314,7 +419,7 @@ export class WhatsAppService {
         session.mode = 'manual';
         session.state = 'MANUAL_TYPE';
         await session.save();
-        await this.sendTextMessage(from, this.manualTypePrompt());
+        await this.sendTextMessage(from, this.manualTypePrompt(await this.formats.list()));
         return;
       }
       if (this.isManualState(session)) {
@@ -345,120 +450,160 @@ export class WhatsAppService {
       }
     }
 
-    // Handle Image Messages
-    if (type === 'image') {
-      try {
-        const mediaId = message.image.id;
-        const caption = (message.image.caption || '').trim();
-        const downloaded = await this.downloadMedia(mediaId);
+    // Pictures: compressed photos ("image"), original-quality files ("document": JPG/PNG/WebP/HEIC/PDF)
+    if (type === 'image' || type === 'document') {
+      const media = message[type] || {};
+      await this.receiveImage(session, from, { mediaId: media.id }, String(media.caption || '').trim(), type === 'image');
+    }
+  }
 
-        if (session.state === 'AWAITING_APPROVAL') {
-          await this.sendTextMessage(
-            from,
-            '⚠️ You have a generated meme waiting for approval!\n' +
-            '• Reply *Approve* to publish it to Instagram\n' +
-            '• Reply *Reset* to discard it and use your new image'
-          );
-          return;
-        }
+  private static readonly IMAGE_STATES = ['IDLE', 'AWAITING_REACTION', 'MANUAL_SUBJECTS', 'MANUAL_REACTION', 'AWAITING_SLOT_IMAGE', 'LAYOUT_EXAMPLE'];
+  private readonly qualityTipShown = new Set<string>();
 
-        if (this.isManualState(session)) {
-          await this.handleManualImage(session, from, downloaded, caption);
-          return;
-        }
+  /** True when the bot is waiting for a picture, so a pasted link is treated as one. */
+  private expectsImage(session: WhatsAppSessionDocument): boolean {
+    return WhatsAppService.IMAGE_STATES.includes(session.state);
+  }
 
-        if (session.state === 'AWAITING_SLOT_IMAGE') {
-          await this.handleSlotImage(session, from, downloaded);
-          return;
-        }
-
-        if (session.state === 'IDLE') {
-          session.viralDraftId = null;
-          session.viralSlots = [];
-          session.viralOverrides = [];
-          session.viralMissing = [];
-          session.referenceImagePath = downloaded.filePath;
-          session.referenceMimeType = downloaded.mimeType;
-
-          // If user also attached a punchline caption to the image
-          if (caption) {
-            session.punchline = caption;
-            session.state = 'AWAITING_REACTION';
-            await session.save();
-
-            await this.sendTextMessage(
-              from,
-              `📸 *Reference meme received!* (Caption: "${caption}")\n\n` +
-              `Now please send the *Reaction Image* (e.g. reacting actor/character photo).`
-            );
-          } else {
-            session.state = 'AWAITING_REACTION';
-            await session.save();
-
-            await this.sendTextMessage(
-              from,
-              `📸 *Reference meme received!*\n\n` +
-              `Now please send the *Reaction Image* (e.g. Brahmanandam, Pawan Kalyan photo).`
-            );
-          }
-          return;
-        }
-
-        if (session.state === 'AWAITING_REACTION') {
-          session.reactionImagePath = downloaded.filePath;
-          session.reactionMimeType = downloaded.mimeType;
-
-          // If punchline was attached to the reaction image or previously set
-          if (caption) {
-            session.punchline = caption;
-          }
-
-          if (session.punchline) {
-            session.state = 'GENERATING';
-            await session.save();
-
-            await this.sendTextMessage(from, '⏳ *Generating your meme...* Running AI vision analysis & discovering clean subject images. This takes ~30-60s.');
-            await this.generateAndSendMeme(session, from);
-            return;
-          }
-
-          session.state = 'AWAITING_PUNCHLINE';
-          await session.save();
-
-          await this.sendTextMessage(
-            from,
-            `🎭 *Reaction image received!*\n\n` +
-            `Now send the *Reacting Text / Punchline* (in Telugu or English) to place on the reaction image.`
-          );
-          return;
-        }
-
-        if (session.state === 'AWAITING_PUNCHLINE') {
-          session.reactionImagePath = downloaded.filePath;
-          session.reactionMimeType = downloaded.mimeType;
-
-          if (caption) {
-            session.punchline = caption;
-            session.state = 'GENERATING';
-            await session.save();
-
-            await this.sendTextMessage(from, '⏳ *Generating your meme...* Running AI vision analysis & discovering clean subject images. This takes ~30-60s.');
-            await this.generateAndSendMeme(session, from);
-            return;
-          }
-
-          await session.save();
-          await this.sendTextMessage(
-            from,
-            `🎭 *Reaction image updated!*\n\n` +
-            `Now send the *Reacting Text / Punchline* to start generating.`
-          );
-          return;
-        }
-      } catch (err: any) {
-        this.logger.error(`Failed to handle WhatsApp image: ${err?.message || err}`);
-        await this.sendTextMessage(from, `❌ Failed to process uploaded image: ${err?.message || 'Download error'}. Please try sending again.`);
+  /**
+   * One entry point for every picture, whether it arrives as a WhatsApp photo, a document
+   * (JPG/PNG/WebP/HEIC/PDF) or a link: downloads, verifies and converts it, then routes it by state.
+   */
+  private async receiveImage(
+    session: WhatsAppSessionDocument,
+    from: string,
+    source: { mediaId?: string; url?: string },
+    caption: string,
+    compressedPhoto: boolean
+  ): Promise<void> {
+    try {
+      if (session.state === 'AWAITING_APPROVAL') {
+        await this.sendTextMessage(
+          from,
+          '⚠️ You have a generated meme waiting for approval!\n' +
+          '• Reply *Approve* to publish it to Instagram\n' +
+          '• Reply *Reset* to discard it and use your new image'
+        );
+        return;
       }
+      if (session.state === 'GENERATING' || session.state === 'LAYOUT_ANALYZING') return;
+
+      const downloaded = source.url ? await this.downloadImageFromUrl(source.url) : await this.downloadMedia(String(source.mediaId));
+
+      if (downloaded.convertedFrom === 'pdf') {
+        await this.sendTextMessage(from, `📄 Using page 1 of your PDF (${downloaded.width}x${downloaded.height}px).`);
+      }
+      // WhatsApp shrinks normal photos to about 1600 px; the same file sent as a Document keeps full quality.
+      if (compressedPhoto && session.state !== 'IDLE' && Math.max(downloaded.width, downloaded.height) <= 1700 && !this.qualityTipShown.has(from)) {
+        this.qualityTipShown.add(from);
+        await this.sendTextMessage(
+          from,
+          `💡 *Tip:* WhatsApp compressed that photo to ${downloaded.width}x${downloaded.height}px. ` +
+          `For full quality send pictures as a *Document* (📎 → Document) or paste a direct image link.`
+        );
+      }
+
+      if (session.state === 'LAYOUT_EXAMPLE') {
+        await this.handleLayoutExample(session, from, downloaded, caption);
+        return;
+      }
+
+      if (this.isManualState(session)) {
+        await this.handleManualImage(session, from, downloaded, caption);
+        return;
+      }
+
+      if (session.state === 'AWAITING_SLOT_IMAGE') {
+        await this.handleSlotImage(session, from, downloaded);
+        return;
+      }
+
+      if (session.state === 'IDLE') {
+        session.viralDraftId = null;
+        session.viralSlots = [];
+        session.viralOverrides = [];
+        session.viralMissing = [];
+        session.referenceImagePath = downloaded.filePath;
+        session.referenceMimeType = downloaded.mimeType;
+
+        // If user also attached a punchline caption to the image
+        if (caption) {
+          session.punchline = caption;
+          session.state = 'AWAITING_REACTION';
+          await session.save();
+
+          await this.sendTextMessage(
+            from,
+            `📸 *Reference meme received!* (Caption: "${caption}")\n\n` +
+            `Now please send the *Reaction Image* (e.g. reacting actor/character photo).`
+          );
+        } else {
+          session.state = 'AWAITING_REACTION';
+          await session.save();
+
+          await this.sendTextMessage(
+            from,
+            `📸 *Reference meme received!*\n\n` +
+            `Now please send the *Reaction Image* (e.g. Brahmanandam, Pawan Kalyan photo).`
+          );
+        }
+        return;
+      }
+
+      if (session.state === 'AWAITING_REACTION') {
+        session.reactionImagePath = downloaded.filePath;
+        session.reactionMimeType = downloaded.mimeType;
+
+        // If punchline was attached to the reaction image or previously set
+        if (caption) {
+          session.punchline = caption;
+        }
+
+        if (session.punchline) {
+          session.state = 'GENERATING';
+          await session.save();
+
+          await this.sendTextMessage(from, '⏳ *Generating your meme...* Running AI vision analysis & discovering clean subject images. This takes ~30-60s.');
+          await this.generateAndSendMeme(session, from);
+          return;
+        }
+
+        session.state = 'AWAITING_PUNCHLINE';
+        await session.save();
+
+        await this.sendTextMessage(
+          from,
+          `🎭 *Reaction image received!*\n\n` +
+          `Now send the *Reacting Text / Punchline* (in Telugu or English) to place on the reaction image.`
+        );
+        return;
+      }
+
+      if (session.state === 'AWAITING_PUNCHLINE') {
+        session.reactionImagePath = downloaded.filePath;
+        session.reactionMimeType = downloaded.mimeType;
+
+        if (caption) {
+          session.punchline = caption;
+          session.state = 'GENERATING';
+          await session.save();
+
+          await this.sendTextMessage(from, '⏳ *Generating your meme...* Running AI vision analysis & discovering clean subject images. This takes ~30-60s.');
+          await this.generateAndSendMeme(session, from);
+          return;
+        }
+
+        await session.save();
+        await this.sendTextMessage(
+          from,
+          `🎭 *Reaction image updated!*\n\n` +
+          `Now send the *Reacting Text / Punchline* to start generating.`
+        );
+        return;
+      }
+    } catch (err: any) {
+      this.logger.error(`Failed to handle WhatsApp image: ${err?.message || err}`);
+      await this.sendTextMessage(from, `❌ I could not use that picture: ${err?.message || 'download error'}\nPlease send it again (as a Document for full quality).`);
     }
   }
 
@@ -478,16 +623,18 @@ export class WhatsAppService {
       this.logger.log(`Starting viral adaptation for WhatsApp user ${to}...`);
 
       let meme: any;
+      let adaptation: any;
       for (let attempt = 0; ; attempt++) {
         if (!session.viralDraftId) await this.analyzeReference(session);
         try {
-          ({ meme } = await this.viralAdaptation.adapt({
+          adaptation = await this.viralAdaptation.adapt({
             draftId: session.viralDraftId as string,
             overrides: await this.stageOverrides(session),
             reaction: this.uploadOf(session.reactionImagePath, session.reactionMimeType),
             punchline: session.punchline,
             reactionContext: session.reactionContext || undefined
-          }));
+          });
+          meme = adaptation.meme;
           break;
         } catch (err: any) {
           // The saved analysis expires after 30 minutes: analyse again once and retry
@@ -503,6 +650,9 @@ export class WhatsAppService {
       session.viralOverrides = [];
       session.viralMissing = [];
       await this.deliverMeme(session, to, meme, session.punchline);
+      if (adaptation?.adaptationMetadata?.layoutFormat?.newlyLearned) {
+        await this.sendTextMessage(to, '📐 I learned a new layout from that reference. Send *Layouts* to see it and give it a name.');
+      }
     } catch (err: any) {
       const missing = this.missingSlotsFromError(err, new Set((session.viralOverrides || []).map(o => o.slot)), session);
       if (missing.length) {
@@ -698,7 +848,7 @@ export class WhatsAppService {
     return session.mode === 'manual' && typeof session.state === 'string' && session.state.startsWith('MANUAL_');
   }
 
-  private manualTypePrompt(): string {
+  private manualTypePrompt(layouts: FormatSummary[] = []): string {
     return (
       `✏️ *Manual meme*\n\n` +
       `Pick a layout (send the number):\n` +
@@ -706,8 +856,11 @@ export class WhatsAppService {
       `2️⃣ Facts collage\n` +
       `3️⃣ Comparison\n` +
       `4️⃣ Movie update\n` +
-      `5️⃣ Custom\n\n` +
-      `Send *skip* for the default. *Reset* cancels anytime.`
+      `5️⃣ Custom\n` +
+      (layouts.length
+        ? `\n📐 *Your saved layouts:*\n` + layouts.map((l, i) => `${WhatsAppService.MANUAL_TYPES.length + i + 1}. ${l.name ? `*${l.name}*` : `_${l.displayName}_`} — ${l.description}`).join('\n') + `\n`
+        : '') +
+      `\nSend *skip* for the default. *Reset* cancels anytime.`
     );
   }
 
@@ -718,39 +871,41 @@ export class WhatsAppService {
   private async handleManualText(session: WhatsAppSessionDocument, from: string, text: string): Promise<void> {
     switch (session.state) {
       case 'MANUAL_TYPE': {
+        const builtIn = WhatsAppService.MANUAL_TYPES;
         const n = Number(text.trim());
-        if (this.isSkip(text)) session.manualMemeType = WhatsAppService.MANUAL_TYPES[0];
-        else if (Number.isInteger(n) && n >= 1 && n <= WhatsAppService.MANUAL_TYPES.length) session.manualMemeType = WhatsAppService.MANUAL_TYPES[n - 1];
-        else {
-          await this.sendTextMessage(from, 'Please send a number from 1 to 5, or *skip*.');
+        const saved = Number.isInteger(n) && n > builtIn.length ? await this.formats.getByPosition(n - builtIn.length) : null;
+        if (this.isSkip(text)) {
+          session.manualMemeType = builtIn[0];
+        } else if (Number.isInteger(n) && n >= 1 && n <= builtIn.length) {
+          session.manualMemeType = builtIn[n - 1];
+        } else if (saved) {
+          session.manualMemeType = saved.memeType;
+          session.manualFormatId = saved.formatId;
+          session.manualSlotCount = saved.slotCount;
+        } else {
+          const total = builtIn.length + (await this.formats.list()).length;
+          await this.sendTextMessage(from, `Please send a number from 1 to ${total}, or *skip*.`);
           return;
         }
-        session.state = 'MANUAL_HEADLINE';
-        await session.save();
-        await this.sendTextMessage(from, `📌 Send the *headline* for the top banner (or *skip*).`);
+        await this.manualNextStep(session, from, 'type');
         return;
       }
       case 'MANUAL_HEADLINE':
         session.manualHeadline = this.isSkip(text) ? null : text;
-        session.state = 'MANUAL_STATEMENT';
-        await session.save();
-        await this.sendTextMessage(from, `📝 Send the *statement / news text* (or *skip*).`);
+        await this.manualNextStep(session, from, 'headline');
         return;
       case 'MANUAL_STATEMENT':
         session.manualStatement = this.isSkip(text) ? null : text;
-        session.state = 'MANUAL_SUBJECTS';
-        await session.save();
-        await this.sendTextMessage(
-          from,
-          `🖼️ Now send the *subject images* one by one (up to ${WhatsAppService.MAX_MANUAL_SUBJECTS}).\n` +
-          `Add a *caption* to an image to use it as its label.\n` +
-          `Send *done* when all subject images are in.`
-        );
+        await this.manualNextStep(session, from, 'statement');
         return;
       case 'MANUAL_SUBJECTS': {
         if (['done', 'next', 'finish'].includes(text.trim().toLowerCase())) {
           if (!session.manualSubjects?.length) {
             await this.sendTextMessage(from, 'Please send at least one subject image first.');
+            return;
+          }
+          if (session.manualSlotCount && session.manualSubjects.length < session.manualSlotCount) {
+            await this.sendTextMessage(from, `This layout needs *${session.manualSlotCount}* images and I have ${session.manualSubjects.length}. Please send ${session.manualSlotCount - session.manualSubjects.length} more.`);
             return;
           }
           session.state = 'MANUAL_REACTION';
@@ -778,8 +933,9 @@ export class WhatsAppService {
     caption: string
   ): Promise<void> {
     if (session.state === 'MANUAL_SUBJECTS') {
-      if ((session.manualSubjects?.length || 0) >= WhatsAppService.MAX_MANUAL_SUBJECTS) {
-        await this.sendTextMessage(from, `Maximum of ${WhatsAppService.MAX_MANUAL_SUBJECTS} subject images reached. Send *done*.`);
+      const cap = session.manualSlotCount || WhatsAppService.MAX_MANUAL_SUBJECTS;
+      if ((session.manualSubjects?.length || 0) >= cap) {
+        await this.sendTextMessage(from, `Maximum of ${cap} subject images reached. ${session.manualSlotCount ? 'Now send the *reaction image*.' : 'Send *done*.'}`);
         return;
       }
       // Atomic push: several images can arrive in parallel webhooks.
@@ -789,7 +945,15 @@ export class WhatsAppService {
         { new: true }
       );
       const n = updated?.manualSubjects?.length || 0;
-      await this.sendTextMessage(from, `✅ Subject ${n} added${caption ? ` (label: "${caption}")` : ''}. Send more, or *done*.`);
+      const added = `✅ Subject ${n} added${caption ? ` (label: "${caption}")` : ''}.`;
+      if (session.manualSlotCount && n >= session.manualSlotCount) {
+        // A saved layout has an exact number of images: continue by itself
+        session.state = 'MANUAL_REACTION';
+        await session.save();
+        await this.sendTextMessage(from, `${added} That is all ${n} images.\n🎭 Now send the *reaction image* (a caption becomes the punchline).`);
+        return;
+      }
+      await this.sendTextMessage(from, `${added} ${session.manualSlotCount ? `${session.manualSlotCount - n} more to go.` : 'Send more, or *done*.'}`);
       return;
     }
 
@@ -856,7 +1020,17 @@ export class WhatsAppService {
         orderIndex: 99
       };
 
-      const meme = await this.memeEngine.generateMeme({ content, assets: { subjectImages, reactionImage }, design, layout });
+      // A saved layout brings its grid and proportions; style (fonts, colours) still comes from Settings
+      let finalLayout = layout;
+      if (session.manualFormatId) {
+        const saved = await this.formats.get(session.manualFormatId);
+        if (saved) {
+          finalLayout = { ...layout, ...FormatLibraryService.layoutFor(saved, Boolean(session.manualHeadline)) };
+          this.formats.markUsed(saved.formatId).catch(() => undefined);
+        }
+      }
+
+      const meme = await this.memeEngine.generateMeme({ content, assets: { subjectImages, reactionImage }, design, layout: finalLayout });
       await this.deliverMeme(session, to, meme, session.punchline);
     } catch (err: any) {
       this.logger.error(`Error in WhatsApp manual meme generation: ${err?.message || err}`);
@@ -865,6 +1039,188 @@ export class WhatsAppService {
         `❌ *Generation Failed:*\n${err?.message || 'Internal processing error'}\n\nSend *Manual* to try again.`
       );
       await this.resetSession(session);
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Layout library: saved meme layouts (structure only; fonts and colours come from Settings)
+  // ---------------------------------------------------------------------------------------------
+
+  private layoutListText(layouts: FormatSummary[]): string {
+    if (!layouts.length) {
+      return (
+        `📐 *No saved layouts yet.*\n\n` +
+        `Layouts are learned automatically each time you adapt a viral meme. You can also send *New layout* and then an example meme.`
+      );
+    }
+    return (
+      `📐 *Your saved layouts*\n\n` +
+      layouts.map((l, i) => `${i + 1}. ${l.name ? `*${l.name}*` : `_${l.displayName}_`} — ${l.description}`).join('\n') +
+      `\n\n• *Layout 2* — see its example\n• *Name 2 My layout* — name it\n• *Delete layout 2*\n• *New layout* — teach me a new one\n` +
+      `Use them with *Manual*.`
+    );
+  }
+
+  /** Layout commands and the naming step. Returns true when the message was handled. */
+  private async handleLayoutCommand(session: WhatsAppSessionDocument, from: string, text: string, lower: string): Promise<boolean> {
+    // The name for a layout that was just learned
+    if (session.state === 'LAYOUT_NAME') {
+      const id = session.pendingFormatId;
+      if (id && !this.isSkip(text)) {
+        try {
+          const f = await this.formats.rename(id, text);
+          await this.sendTextMessage(from, `✅ Saved as *${f.name}* — ${f.description}.\nUse it with *Manual*.`);
+        } catch (err: any) {
+          await this.sendTextMessage(from, `⚠️ ${err?.message || 'Could not save that name'} Send another name, or *skip*.`);
+          return true;
+        }
+      } else {
+        await this.sendTextMessage(from, '👍 Kept as an unnamed layout. Send *Layouts* anytime to name it.');
+      }
+      session.pendingFormatId = null;
+      session.state = 'IDLE';
+      await session.save();
+      return true;
+    }
+    if (session.state === 'LAYOUT_ANALYZING') {
+      await this.sendTextMessage(from, '⏳ Still analysing your example meme...');
+      return true;
+    }
+    // Other commands only when nothing else is in progress, so ordinary text is never mistaken for one
+    if (session.state !== 'IDLE' && session.state !== 'LAYOUT_EXAMPLE') return false;
+
+    if (/^(layouts|formats|my layouts|layout list)$/.test(lower)) {
+      await this.sendTextMessage(from, this.layoutListText(await this.formats.list()));
+      return true;
+    }
+
+    if (/^(new|add|save) layout$/.test(lower)) {
+      session.state = 'LAYOUT_EXAMPLE';
+      await session.save();
+      await this.sendTextMessage(
+        from,
+        `📐 Send an *example meme* of the layout you want to save (photo, document or link).\n` +
+        `Add a *caption* to name it right away. Only the structure is saved (image positions, header, reaction panel) — fonts and colours stay as in Settings.\n` +
+        `Send *Reset* to cancel.`
+      );
+      return true;
+    }
+
+    const view = /^layout\s+(\d{1,3})$/.exec(lower);
+    if (view) {
+      const doc = await this.formats.getByPosition(Number(view[1]));
+      if (!doc) {
+        await this.sendTextMessage(from, `I do not have layout ${view[1]}. Send *Layouts* to see the list.`);
+        return true;
+      }
+      const description = FormatLibraryService.describe(doc);
+      const caption = `📐 *${doc.name || `Unnamed layout ${view[1]}`}*\n${description}\nUsed ${doc.usageCount || 0} time(s).`;
+      const sent = doc.thumbnailFile
+        ? await this.sendImageMessage(from, `${getConfig().instagram.publicBaseUrl}/output/${doc.thumbnailFile}`, caption)
+        : false;
+      if (!sent) await this.sendTextMessage(from, caption);
+      return true;
+    }
+
+    const rename = /^(?:name|rename)\s+(\d{1,3})\s+(.+)$/i.exec(text);
+    if (rename) {
+      const doc = await this.formats.getByPosition(Number(rename[1]));
+      if (!doc) {
+        await this.sendTextMessage(from, `I do not have layout ${rename[1]}. Send *Layouts* to see the list.`);
+        return true;
+      }
+      try {
+        const f = await this.formats.rename(doc.formatId, rename[2]);
+        await this.sendTextMessage(from, `✅ Layout ${rename[1]} is now *${f.name}*.`);
+      } catch (err: any) {
+        await this.sendTextMessage(from, `⚠️ ${err?.message || 'Could not rename it.'}`);
+      }
+      return true;
+    }
+
+    const del = /^delete layout\s+(\d{1,3})$/.exec(lower);
+    if (del) {
+      const doc = await this.formats.getByPosition(Number(del[1]));
+      if (!doc) {
+        await this.sendTextMessage(from, `I do not have layout ${del[1]}. Send *Layouts* to see the list.`);
+        return true;
+      }
+      await this.formats.remove(doc.formatId);
+      await this.sendTextMessage(from, `🗑️ Deleted layout ${del[1]} (${doc.name || 'unnamed'}). Numbers after it moved up by one.`);
+      return true;
+    }
+    return false;
+  }
+
+  /** The example meme for a new layout: analyse the structure, save it, ask for a name. */
+  private async handleLayoutExample(
+    session: WhatsAppSessionDocument,
+    from: string,
+    downloaded: { filePath: string; mimeType: string },
+    caption: string
+  ): Promise<void> {
+    session.state = 'LAYOUT_ANALYZING';
+    await session.save();
+    await this.sendTextMessage(from, '🔎 *Analysing the layout of your example...* about 30-60 seconds.');
+    try {
+      const analysis = await this.viralAdaptation.analyzeForFormat(this.uploadOf(downloaded.filePath, downloaded.mimeType));
+      const { format, created } = await this.formats.saveFromAnalysis(analysis, {
+        name: caption,
+        source: 'whatsapp',
+        referencePath: downloaded.filePath
+      });
+      const description = FormatLibraryService.describe(format);
+      if (!created) {
+        await this.sendTextMessage(
+          from,
+          `ℹ️ That structure is already saved as *${format.name || 'an unnamed layout'}* — ${description}.\nSend *Layouts* to see all of them.`
+        );
+        session.state = 'IDLE';
+      } else if (format.name) {
+        await this.sendTextMessage(from, `✅ Saved layout *${format.name}* — ${description}.\nUse it with *Manual*.`);
+        session.state = 'IDLE';
+      } else {
+        session.pendingFormatId = format.formatId;
+        session.state = 'LAYOUT_NAME';
+        await this.sendTextMessage(from, `✅ Learned a new layout: ${description}.\n\nWhat should I call it? (or *skip*)`);
+      }
+    } catch (err: any) {
+      this.logger.error(`Layout analysis failed: ${err?.message || err}`);
+      await this.sendTextMessage(from, `❌ I could not learn a layout from that picture: ${err?.message || 'analysis failed'}\nSend another example, or *Reset*.`);
+      session.state = 'LAYOUT_EXAMPLE';
+    } finally {
+      await session.save();
+      // The preview (if any) was copied; the downloaded example is not needed any more
+      fs.promises.rm(downloaded.filePath, { force: true }).catch(() => undefined);
+    }
+  }
+
+  /** Moves the manual flow on, skipping the headline/statement questions a saved layout does not have. */
+  private async manualNextStep(session: WhatsAppSessionDocument, from: string, after: 'type' | 'headline' | 'statement'): Promise<void> {
+    const f = session.manualFormatId ? await this.formats.get(session.manualFormatId) : null;
+    if (f && after === 'type') {
+      await this.sendTextMessage(from, `📐 Layout *${f.name || 'Unnamed layout'}*: ${FormatLibraryService.describe(f)}.`);
+    }
+    let next: 'MANUAL_HEADLINE' | 'MANUAL_STATEMENT' | 'MANUAL_SUBJECTS';
+    if (after === 'type') next = !f || f.hasHeader ? 'MANUAL_HEADLINE' : f.hasStatement ? 'MANUAL_STATEMENT' : 'MANUAL_SUBJECTS';
+    else if (after === 'headline') next = !f || f.hasStatement ? 'MANUAL_STATEMENT' : 'MANUAL_SUBJECTS';
+    else next = 'MANUAL_SUBJECTS';
+    session.state = next;
+    await session.save();
+    if (next === 'MANUAL_HEADLINE') {
+      await this.sendTextMessage(from, `📌 Send the *headline* for the top banner (or *skip*).`);
+    } else if (next === 'MANUAL_STATEMENT') {
+      await this.sendTextMessage(from, `📝 Send the *statement / news text* (or *skip*).`);
+    } else {
+      await this.sendTextMessage(
+        from,
+        session.manualSlotCount
+          ? `🖼️ Send the *${session.manualSlotCount} subject image${session.manualSlotCount === 1 ? '' : 's'}* in layout order (left to right, top to bottom).\n` +
+            `Add a *caption* to an image to use it as its label. I continue by myself after image ${session.manualSlotCount}.`
+          : `🖼️ Now send the *subject images* one by one (up to ${WhatsAppService.MAX_MANUAL_SUBJECTS}).\n` +
+            `Add a *caption* to an image to use it as its label.\n` +
+            `Send *done* when all subject images are in.`
+      );
     }
   }
 
@@ -882,6 +1238,9 @@ export class WhatsAppService {
     session.viralOverrides = [];
     session.viralMissing = [];
     session.manualMemeType = null;
+    session.manualFormatId = null;
+    session.manualSlotCount = null;
+    session.pendingFormatId = null;
     session.manualHeadline = null;
     session.manualStatement = null;
     session.manualSubjects = [];

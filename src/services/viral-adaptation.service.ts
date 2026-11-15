@@ -14,7 +14,7 @@
  *  5. discover, rank and visually verify one real image per slot (internet only)
  *  6. render (text fitting, structural output checks) and persist with the generation report
  */
-import { GoneException, HttpException, Injectable, InternalServerErrorException, Logger, UnprocessableEntityException } from '@nestjs/common';
+import { GoneException, HttpException, Injectable, Optional, InternalServerErrorException, Logger, UnprocessableEntityException } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { loadImage } from '@napi-rs/canvas';
 import { describeConfig, getConfig } from '../config/app-config';
@@ -35,6 +35,7 @@ import { safeDeleteFile, sanitizeDisplayName, UPLOADS_ROOT } from '../security/p
 import { ViralMemeAnalyzerService } from './viral-meme-analyzer.service';
 import { InternetSubjectDiscoveryService } from './internet-subject-discovery.service';
 import { MemeEngineService } from './meme-engine.service';
+import { FormatLibraryService } from './format-library.service';
 import { LayoutEngineService } from './layout-engine.service';
 import { CanvasRendererService } from './canvas-renderer.service';
 
@@ -109,7 +110,9 @@ export class ViralAdaptationService {
     private readonly memeEngine: MemeEngineService,
     private readonly layoutEngine: LayoutEngineService,
     private readonly profiles: DesignProfileService,
-    private readonly selection: ImageSelectionService
+    private readonly selection: ImageSelectionService,
+    // Remembers the layout of every reference that is adapted (optional so the service stays usable on its own)
+    @Optional() private readonly formats?: FormatLibraryService
   ) {}
 
   private dropDraft(d: AnalysisDraft, deleteFile: boolean) {
@@ -181,6 +184,20 @@ export class ViralAdaptationService {
         slots,
         warnings: analysis.suspectedPromptInjection ? ['The reference screenshot contained text addressed to the AI. It was treated as plain data and ignored.'] : []
       };
+    } finally {
+      this.active--;
+    }
+  }
+
+  /** Analyses one example meme and returns only its structure (used to save a layout). Nothing is searched or generated. */
+  async analyzeForFormat(reference: ViralUpload): Promise<ReferenceAnalysis> {
+    const cfg = getConfig();
+    if (this.active >= cfg.adaptationMaxConcurrent) {
+      throw new HttpException({ statusCode: 429, message: 'Another viral adaptation is still running. Please wait for it to finish and try again.' }, 429);
+    }
+    this.active++;
+    try {
+      return (await this.analyzer.analyzeReference(reference.path)).analysis;
     } finally {
       this.active--;
     }
@@ -513,11 +530,15 @@ export class ViralAdaptationService {
       meme.markModified('generationReport');
       await meme.save();
 
+      // The structure of this reference is remembered (new layouts appear in the library, known ones are counted)
+      const layoutFormat = this.formats ? await this.formats.recordSeen(analysis, reference.path) : null;
+
       const plainMeme = typeof (meme as any).toObject === 'function' ? (meme as any).toObject() : meme;
       return {
         meme: plainMeme,
         adaptationMetadata: {
           pipelineVersion: 2,
+          layoutFormat: layoutFormat ? { id: layoutFormat.format.formatId, name: layoutFormat.format.name || null, newlyLearned: layoutFormat.created } : undefined,
           referenceImageFilename: reference.filename,
           detectedMemeType: analysis.legacyMemeType,
           detectedFormat: analysis.memeFormat,

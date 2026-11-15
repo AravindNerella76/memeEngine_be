@@ -29,6 +29,11 @@ import { InstagramOAuthService } from './services/instagram-oauth.service';
 import { InstagramTokenService } from './services/instagram-token.service';
 import { InstagramPublisherService } from './services/instagram-publisher.service';
 import { WhatsAppService } from './services/whatsapp.service';
+import { MemeFormat, MemeFormatSchema } from './schemas/meme-format.schema';
+import { FormatLibraryService } from './services/format-library.service';
+import { WhatsAppCredentials, WhatsAppCredentialsSchema } from './schemas/whatsapp-credentials.schema';
+import { WhatsAppCredentialsService } from './services/whatsapp-credentials.service';
+import { FormatController } from './controllers/format.controller';
 import { VisionCliRunner } from './vision/vision-cli.runner';
 import { ProviderUsageRecord, ProviderUsageSchema, ProviderUsageService } from './discovery/provider-usage';
 import { getConfig } from './config/app-config';
@@ -44,6 +49,8 @@ import { getConfig } from './config/app-config';
       { name: ProviderUsageRecord.name, schema: ProviderUsageSchema },
       { name: InstagramAccount.name, schema: InstagramAccountSchema },
       { name: WhatsAppSession.name, schema: WhatsAppSessionSchema },
+      { name: MemeFormat.name, schema: MemeFormatSchema },
+      { name: WhatsAppCredentials.name, schema: WhatsAppCredentialsSchema },
       { name: AuthUser.name, schema: AuthUserSchema },
       { name: AuthSession.name, schema: AuthSessionSchema }
     ])
@@ -57,7 +64,8 @@ import { getConfig } from './config/app-config';
     ImageSelectionController,
     SystemController,
     InstagramController,
-    WhatsAppController
+    WhatsAppController,
+    FormatController
   ],
   providers: [
     AuthService,
@@ -78,7 +86,9 @@ import { getConfig } from './config/app-config';
     InstagramTokenService,
     InstagramOAuthService,
     InstagramPublisherService,
-    WhatsAppService
+    WhatsAppService,
+    FormatLibraryService,
+    WhatsAppCredentialsService
   ],
 })
 export class AppModule {}

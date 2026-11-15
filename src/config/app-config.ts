@@ -323,7 +323,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       str(env, 'MONGO_URI') ||
       str(env, 'MONGODB_URI') ||
       'mongodb://127.0.0.1:27017/kanyaraasi_memes',
-    host: str(env, 'HOST') || (env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1'),
+    host: str(env, 'HOST') || (env.PORT || env.RENDER || env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1'),
     port: int(env, 'PORT', 3000, 1, 65535),
     adaptationMaxConcurrent: int(env, 'ADAPTATION_MAX_CONCURRENT', 1, 1, 4),
     vision: {

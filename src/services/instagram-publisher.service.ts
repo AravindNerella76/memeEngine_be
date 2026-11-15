@@ -11,6 +11,8 @@ import { Model } from 'mongoose';
 import { Meme, MemeDocument } from '../schemas/meme.schema';
 import { InstagramOAuthService } from './instagram-oauth.service';
 import { getConfig } from '../config/app-config';
+import * as fs from 'fs';
+import { inspectImageFileHeader } from '../security/image-verify';
 
 export interface PublishMemeResult {
   success: boolean;
@@ -105,6 +107,9 @@ export class InstagramPublisherService {
         throw new BadRequestException(`No output image file found for meme ${memeId} (version ${targetVersionNum}).`);
       }
 
+      // Instagram feed rules, checked up front so the failure is a clear message instead of an opaque Meta error
+      this.assertInstagramFeedImage((targetVersion as any).outputPaths?.jpeg || (meme as any).outputPaths?.jpeg);
+
       const publicBase = getConfig().instagram.publicBaseUrl;
       const publicImageUrl = `${publicBase}${relativeImageUrl}`;
 
@@ -170,6 +175,36 @@ export class InstagramPublisherService {
       };
     } finally {
       this.inProgressPublish.delete(lockKey);
+    }
+  }
+
+  /**
+   * Instagram feed images: JPEG, at most 8 MB, width 320-1440 px (larger is resized), aspect ratio between
+   * 4:5 and 1.91:1. A file that is not on disk (or cannot be inspected) is left for Meta to judge.
+   */
+  private assertInstagramFeedImage(jpegPath: string | undefined): void {
+    if (!jpegPath || !fs.existsSync(jpegPath)) return;
+    let header: ReturnType<typeof inspectImageFileHeader>;
+    try {
+      header = inspectImageFileHeader(jpegPath);
+    } catch {
+      return;
+    }
+    const mb = fs.statSync(jpegPath).size / 1048576;
+    const ratio = header.width / header.height;
+    if (header.type !== 'jpeg') {
+      throw new BadRequestException('Instagram feed posts must be JPEG images.');
+    }
+    if (mb > 8) {
+      throw new BadRequestException(`The image is ${mb.toFixed(1)} MB; Instagram allows at most 8 MB. Lower the JPEG quality or output scale in Settings.`);
+    }
+    if (header.width < 320) {
+      throw new BadRequestException(`The image is only ${header.width}px wide; Instagram needs at least 320px.`);
+    }
+    if (ratio < 0.8 - 0.001 || ratio > 1.91 + 0.001) {
+      throw new BadRequestException(
+        `This meme is ${header.width}x${header.height} (${ratio.toFixed(2)}:1). Instagram feed posts must be between 4:5 and 1.91:1, so a 9:16 story-size meme cannot be posted. Regenerate it with the 4:5 or square canvas.`
+      );
     }
   }
 

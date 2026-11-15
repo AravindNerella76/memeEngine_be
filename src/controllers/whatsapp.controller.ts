@@ -1,15 +1,18 @@
-import { Controller, Get, Post, Query, Body, Res, Req, Headers, HttpCode, Logger, RawBodyRequest } from '@nestjs/common';
+import { BadRequestException, Controller, Delete, Get, Post, Put, Query, Body, Res, Req, Headers, HttpCode, Logger, RawBodyRequest } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { verifyMetaSignature } from '../security/http-guards';
 import { WhatsAppService } from '../services/whatsapp.service';
-import { getConfig } from '../config/app-config';
+import { CREDENTIAL_FIELDS, CredentialField, WhatsAppCredentialsService, WhatsAppStatus } from '../services/whatsapp-credentials.service';
 import { Public } from '../auth/public.decorator';
 
 @Controller('api/whatsapp')
 export class WhatsAppController {
   private readonly logger = new Logger(WhatsAppController.name);
 
-  constructor(private readonly whatsappService: WhatsAppService) {}
+  constructor(
+    private readonly whatsappService: WhatsAppService,
+    private readonly credentials: WhatsAppCredentialsService
+  ) {}
 
   /**
    * Meta Webhook verification endpoint (called by Meta during "Verify and save").
@@ -17,13 +20,13 @@ export class WhatsAppController {
    */
   @Public()
   @Get('webhook')
-  verifyWebhook(
+  async verifyWebhook(
     @Query('hub.mode') mode: string,
     @Query('hub.verify_token') verifyToken: string,
     @Query('hub.challenge') challenge: string,
     @Res() res: Response
   ) {
-    const verifiedChallenge = this.whatsappService.verifyWebhook(mode, verifyToken, challenge);
+    const verifiedChallenge = await this.whatsappService.verifyWebhook(mode, verifyToken, challenge);
     if (verifiedChallenge) {
       return res.status(200).send(verifiedChallenge);
     }
@@ -43,7 +46,8 @@ export class WhatsAppController {
     @Res() res: Response
   ) {
     // Only Meta can produce a valid HMAC of the raw body with the app secret. Fail closed.
-    if (!verifyMetaSignature(req.rawBody, signature, getConfig().whatsapp.appSecret)) {
+    const appSecret = (await this.credentials.getEffective()).appSecret;
+    if (!verifyMetaSignature(req.rawBody, signature, appSecret)) {
       this.logger.warn('Rejected WhatsApp webhook POST with missing/invalid X-Hub-Signature-256');
       return res.status(403).send('Forbidden');
     }
@@ -58,19 +62,35 @@ export class WhatsAppController {
   }
 
   /**
-   * Status endpoint for checking WhatsApp configuration
+   * WhatsApp configuration and token health. With ?check=1 Meta is asked whether the token works and when
+   * it expires. The token itself is never returned, only the last 4 characters.
    */
   @Get('status')
   @HttpCode(200)
-  getStatus() {
-    const cfg = getConfig().whatsapp;
-    return {
-      configured: Boolean(cfg.phoneNumberId && cfg.accessToken),
-      phoneNumberId: cfg.phoneNumberId,
-      allowedPhone: cfg.allowedPhone,
-      verifyTokenConfigured: Boolean(cfg.verifyToken),
-      apiVersion: cfg.apiVersion
-    };
+  async getStatus(@Query('check') check?: string): Promise<WhatsAppStatus> {
+    return this.credentials.status(check === '1' || check === 'true');
+  }
+
+  /**
+   * Saves a new access token and/or phone number ID (so an expired token can be replaced from the app).
+   * Meta is asked first; a token Meta rejects is not saved.
+   */
+  @Put('credentials')
+  async saveCredentials(@Body() body: Partial<Record<CredentialField, unknown>>): Promise<WhatsAppStatus> {
+    const input: Partial<Record<CredentialField, unknown>> = {};
+    for (const f of CREDENTIAL_FIELDS) if (body && f in body) input[f] = body[f];
+    return this.credentials.saveAndVerify(input);
+  }
+
+  /**
+   * Removes a value saved in the app (?field=accessToken|phoneNumberId|verifyToken|appSecret|allowedPhone), or all
+   * of them without ?field. The server (.env) setting, if any, is used again.
+   */
+  @Delete('credentials')
+  async clearCredentials(@Query('field') field?: string): Promise<WhatsAppStatus> {
+    if (field !== undefined && field !== 'all' && !(CREDENTIAL_FIELDS as string[]).includes(field)) {
+      throw new BadRequestException('Unknown field.');
+    }
+    return this.credentials.clearSaved(field as CredentialField | 'all' | undefined);
   }
 }
-

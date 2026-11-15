@@ -4,6 +4,7 @@ import { DesignProfileService } from '../design/design-profile.service';
 import { VisionCliRunner } from '../vision/vision-cli.runner';
 import { InternetSubjectDiscoveryService } from '../services/internet-subject-discovery.service';
 import { CanvasRendererService } from '../services/canvas-renderer.service';
+import { WhatsAppCredentialsService } from '../services/whatsapp-credentials.service';
 
 /** Personal design profile (house style). A settings record, not a meme editor. */
 @Controller('api/design-profile')
@@ -29,7 +30,11 @@ export class DesignProfileController {
 /** Read-only health of the AI pipeline (no secrets are returned). */
 @Controller('api/system')
 export class SystemController {
-  constructor(private readonly runner: VisionCliRunner, private readonly discovery: InternetSubjectDiscoveryService) {}
+  constructor(
+    private readonly runner: VisionCliRunner,
+    private readonly discovery: InternetSubjectDiscoveryService,
+    private readonly whatsapp: WhatsAppCredentialsService
+  ) {}
 
   @Get('status')
   async status() {
@@ -42,7 +47,9 @@ export class SystemController {
       providers: this.discovery.describeProviders(),
       paidProviderUsage: await this.discovery.describeUsage(),
       fonts: { english: CanvasRendererService.ENGLISH_FONTS, telugu: CanvasRendererService.TELUGU_FONTS },
-      adaptationMaxConcurrent: cfg.adaptationMaxConcurrent
+      adaptationMaxConcurrent: cfg.adaptationMaxConcurrent,
+      // Token health without calling Meta: lets the app warn before WhatsApp silently stops answering
+      whatsapp: await this.whatsapp.indicator().catch(() => null)
     };
   }
 }
