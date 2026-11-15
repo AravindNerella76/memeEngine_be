@@ -175,12 +175,13 @@ export class VisionCliRunner {
     return Boolean(this.cfg.cliPath && fs.existsSync(this.cfg.cliPath));
   }
 
-  describe(): { configured: boolean; backend: 'cli' | 'gemini-api'; cliPath: string | null; source: string; models: Record<string, string> } {
+  describe(): { configured: boolean; backend: 'cli' | 'gemini-api'; cliPath: string | null; source: string; models: Record<string, string>; keyIgnored: boolean } {
     const api = this.backend === 'gemini-api';
     const g = this.cfg.gemini;
     return {
       configured: this.isConfigured(),
       backend: this.backend,
+      keyIgnored: Boolean(this.cfg.geminiKeyIgnored),
       cliPath: this.cfg.cliPath,
       source: api ? 'GEMINI_API_KEY' : this.cfg.cliPathSource,
       models: api
@@ -194,7 +195,9 @@ export class VisionCliRunner {
       throw new VisionError(
         'NOT_CONFIGURED',
         this.backend === 'gemini-api'
-          ? 'No Gemini API key is configured. Set GEMINI_API_KEY on the server (a key from Google AI Studio).'
+          ? this.cfg.geminiKeyIgnored
+            ? 'GEMINI_API_KEY is set but does not look like a key (it must be one piece with no spaces or line breaks, no quotes). Paste the key again exactly as Google shows it.'
+            : 'No Gemini API key is configured. Set GEMINI_API_KEY on the server (a key from Google AI Studio).'
           : 'The vision CLI (Antigravity "agy") was not found. Install it, or set VISION_CLI_PATH in memeEngine_be/.env to the full path of agy.exe. On a server without the CLI, set GEMINI_API_KEY to use the Gemini API instead.'
       );
     }

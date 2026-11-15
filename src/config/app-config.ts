@@ -37,6 +37,8 @@ export interface VisionConfig {
   backend?: VisionBackend;
   /** Gemini API key (GEMINI_API_KEY). Used only when backend is 'gemini-api'. Never logged or sent to the browser. */
   geminiApiKey?: string;
+  /** GEMINI_API_KEY is set but does not look like a key (spaces, too short ...), so it is not used. */
+  geminiKeyIgnored?: boolean;
   geminiApiBase?: string;
   /** Gemini model ids and thinking levels per task (the CLI model names above are not used by the API). */
   gemini?: GeminiModelSettings;
@@ -295,7 +297,17 @@ export function resolveVisionCliPath(env: NodeJS.ProcessEnv = process.env): Pick
   return { cliPath: null, cliPathSource: 'not_found' };
 }
 
-const GEMINI_KEY_RE = /^[A-Za-z0-9_-]{20,200}$/;
+/**
+ * Google issues keys in more than one shape (the older "AIza..." and newer ones such as "AQ.Ab8..." that
+ * contain a dot), so only what would be unsafe in an HTTP header is refused: whitespace and control characters.
+ */
+const GEMINI_KEY_RE = /^[\x21-\x7E]{20,300}$/;
+
+/** A pasted value often arrives with quotes around it ("AQ...") or after a copy of the whole line. */
+function cleanKey(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  return raw.replace(/^["'`]+|["'`]+$/g, '').trim() || undefined;
+}
 
 function thinking(env: NodeJS.ProcessEnv, key: string, fallback: GeminiThinking): GeminiThinking {
   const v = (str(env, key) || '').toUpperCase();
@@ -321,8 +333,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const baseModel = explicitBase || 'gemini-3.8-flash-medium';
   const fastModel = explicitBase || 'gemini-3.8-flash-low';
 
-  const rawKey = str(env, 'GEMINI_API_KEY') || str(env, 'GOOGLE_API_KEY');
+  const rawKey = cleanKey(str(env, 'GEMINI_API_KEY') || str(env, 'GOOGLE_API_KEY'));
   const geminiApiKey = rawKey && GEMINI_KEY_RE.test(rawKey) ? rawKey : undefined;
+  // a key was provided but could not be used: say so (otherwise the failure is silent)
+  const geminiKeyIgnored = Boolean(rawKey) && !geminiApiKey;
   const visionBackend = resolveVisionBackend(env, Boolean(cli.cliPath), Boolean(geminiApiKey));
 
   const keyed: string[] = [];
@@ -370,6 +384,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       verifyCandidates: verifyRaw === 'off' ? 'off' : 'required',
       backend: visionBackend,
       geminiApiKey,
+      geminiKeyIgnored,
       geminiApiBase: (str(env, 'GEMINI_API_BASE') || GEMINI_DEFAULT_BASE).replace(/\/+$/, ''),
       gemini: {
         analysisModel: model(env, 'GEMINI_ANALYSIS_MODEL', GEMINI_DEFAULT_MODEL),

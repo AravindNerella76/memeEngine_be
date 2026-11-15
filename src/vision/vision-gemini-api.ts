@@ -92,7 +92,10 @@ export function buildGeminiRequestBody(prompt: string, images: { name: string; d
 export function redactKey(text: string, key?: string): string {
   let out = String(text ?? '');
   if (key) out = out.split(key).join('***');
-  return out.replace(/AIza[0-9A-Za-z_-]{20,}/g, '***').replace(/([?&]key=)[^&\s"']+/gi, '$1***');
+  return out
+    .replace(/AIza[0-9A-Za-z_-]{20,}/g, '***')
+    .replace(/\bAQ\.[0-9A-Za-z._-]{20,}/g, '***')
+    .replace(/([?&]key=)[^&\s"']+/gi, '$1***');
 }
 
 export interface GeminiFailure {

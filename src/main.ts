@@ -102,6 +102,8 @@ async function bootstrap() {
         ? `Vision: Gemini API (${cfg.vision.gemini?.analysisModel}); no local CLI needed.`
         : 'WARNING: VISION_BACKEND=gemini-api but no GEMINI_API_KEY is set. Viral adaptation will fail until it is set.'
     );
+  } else if (cfg.vision.geminiKeyIgnored) {
+    console.warn('WARNING: GEMINI_API_KEY is set but does not look like a key (spaces, line breaks or too short), so it is NOT used. Paste it again exactly as Google shows it.');
   } else if (!cfg.vision.cliPath) {
     console.warn('WARNING: vision CLI (agy) not found and no GEMINI_API_KEY set. Viral adaptation will fail until VISION_CLI_PATH or GEMINI_API_KEY is set.');
   }

@@ -241,6 +241,41 @@ describe('choosing the vision engine', () => {
     assert.equal(v.gemini?.instructionThinking, 'LOW', 'an unknown level falls back to the default');
     assert.equal(v.gemini?.verifyModel, 'gemini-3.8-flash');
   });
+  it('accepts keys that contain a dot (the newer "AQ." shape), and quotes around a pasted value', () => {
+    const dotted = 'AQ.FAKEFAKE' + 'x'.repeat(12) + '_-y' + 'z'.repeat(14);
+    const v = loadConfig({ GEMINI_API_KEY: dotted } as any).vision;
+    assert.equal(v.geminiApiKey, dotted);
+    assert.equal(v.geminiKeyIgnored, false);
+    assert.equal(loadConfig({ GEMINI_API_KEY: `"${dotted}"` } as any).vision.geminiApiKey, dotted, 'quotes are stripped');
+    assert.equal(loadConfig({ GEMINI_API_KEY: `'${dotted}'` } as any).vision.geminiApiKey, dotted);
+    assert.equal(resolveVisionBackend({}, false, Boolean(v.geminiApiKey)), 'gemini-api');
+  });
+
+  it('says so when a key was set but cannot be used, instead of failing silently', async () => {
+    const bad = loadConfig({ GEMINI_API_KEY: 'has spaces and !!! not a key at all', VISION_BACKEND: 'gemini-api' } as any).vision;
+    assert.equal(bad.geminiApiKey, undefined);
+    assert.equal(bad.geminiKeyIgnored, true);
+    const r = new VisionCliRunner().useConfig(bad);
+    assert.equal(r.describe().keyIgnored, true);
+    await assert.rejects(() => r.runJsonTask(task()), (e: any) => e.code === 'NOT_CONFIGURED' && /does not look like a key/.test(e.message));
+    assert.equal(loadConfig({} as any).vision.geminiKeyIgnored, false);
+  });
+
+  it('works end to end with a dotted key (header carries it, messages never show it)', async () => {
+    const dotted = 'AQ.FAKEFAKE' + 'x'.repeat(12) + '_-y' + 'z'.repeat(14);
+    const calls = mockFetch([{ status: 403, body: { error: { code: 403, status: 'PERMISSION_DENIED', message: `denied for ${dotted}` } } }]);
+    try {
+      await assert.rejects(
+        () => new VisionCliRunner().useConfig({ ...loadConfig({ GEMINI_API_KEY: dotted, VISION_BACKEND: 'gemini-api' } as any).vision, maxAttempts: 1 } as any).runJsonTask(task()),
+        (e: any) => e.code === 'AUTH' && !e.message.includes(dotted)
+      );
+      assert.equal(calls[0].init.headers['x-goog-api-key'], dotted);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.ok(!redactKey(`x ${dotted} y`, undefined).includes(dotted), 'the newer key shape is redacted even without knowing the key');
+  });
+
   it('ignores a key that is not shaped like one', () => {
     assert.equal(loadConfig({ GEMINI_API_KEY: 'short' } as any).vision.geminiApiKey, undefined);
     assert.equal(loadConfig({ GEMINI_API_KEY: 'has spaces and !!! not a key at all' } as any).vision.geminiApiKey, undefined);
