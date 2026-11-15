@@ -4,6 +4,7 @@ import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { GlobalFonts } from '@napi-rs/canvas';
 import * as express from 'express';
+import compression = require('compression');
 import * as path from 'path';
 import { OUTPUT_ROOT } from './security/path-guard';
 import {
@@ -61,6 +62,8 @@ async function bootstrap() {
   app.useGlobalFilters(new UploadErrorFilter(app.get(HttpAdapterHost).httpAdapter));
 
   const guard = defaultGuardOptions();
+  // gzip for JSON and text (the settings screen alone is ~240 KB uncompressed, ~25 KB gzipped). Images are skipped.
+  app.use(compression());
   app.use(securityHeaders({ hsts: cfg.auth.cookieSecure }));
   app.use(hostAndOriginGuard(guard));
   app.use(tunnelPathGuard(cfg.auth.appHosts));
@@ -77,7 +80,8 @@ async function bootstrap() {
   app.use('/output', (req: express.Request, res: express.Response, next: express.NextFunction) =>
     /\.(png|jpe?g)$/i.test(req.path) ? next() : res.status(404).end()
   );
-  app.use('/output', express.static(OUTPUT_ROOT, { dotfiles: 'deny', index: false, redirect: false }));
+  // File names carry the meme id and version, so an hour of caching is safe and saves revalidating every image on each visit.
+  app.use('/output', express.static(OUTPUT_ROOT, { dotfiles: 'deny', index: false, redirect: false, maxAge: '1h' }));
 
   // Always bind 0.0.0.0 on cloud hosts (Render, Railway, Docker) or when PORT is provided
   const bindHost = process.env.PORT || process.env.RENDER || cfg.host === '0.0.0.0' ? '0.0.0.0' : cfg.host;

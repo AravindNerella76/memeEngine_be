@@ -34,6 +34,7 @@ import { FormatLibraryService } from './services/format-library.service';
 import { WhatsAppCredentials, WhatsAppCredentialsSchema } from './schemas/whatsapp-credentials.schema';
 import { WhatsAppCredentialsService } from './services/whatsapp-credentials.service';
 import { FormatController } from './controllers/format.controller';
+import { ThumbnailService } from './services/thumbnail.service';
 import { VisionCliRunner } from './vision/vision-cli.runner';
 import { ProviderUsageRecord, ProviderUsageSchema, ProviderUsageService } from './discovery/provider-usage';
 import { getConfig } from './config/app-config';
@@ -69,6 +70,7 @@ import { getConfig } from './config/app-config';
   ],
   providers: [
     AuthService,
+    ThumbnailService,
     // Every route needs a signed-in session unless it is marked @Public()
     { provide: APP_GUARD, useClass: AuthGuard },
     VisionCliRunner,

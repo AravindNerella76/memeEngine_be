@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { MemeEngineService } from '../services/meme-engine.service';
 import { ViralAdaptationService } from '../services/viral-adaptation.service';
+import { ThumbnailService } from '../services/thumbnail.service';
 import { UploadedAsset } from '../types/meme.types';
 import { getConfig } from '../config/app-config';
 import {
@@ -44,6 +45,8 @@ import {
   validateGenerateBody,
   validateInstruction,
   validateListQuery,
+  validatePageQuery,
+  validateThumbQuery,
   validateUploadPayload,
   validateViralFields,
   validateViralOverrides
@@ -154,7 +157,8 @@ export async function verifyAndNormalizeUploads(files: MulterUploadedFile[]): Pr
 export class MemeController {
   constructor(
     private readonly memeEngine: MemeEngineService,
-    private readonly viralAdaptation: ViralAdaptationService
+    private readonly viralAdaptation: ViralAdaptationService,
+    private readonly thumbnails: ThumbnailService
   ) {}
 
   /**
@@ -164,6 +168,17 @@ export class MemeController {
   async getMemes(@Query() query: unknown) {
     // Every value must be a plain string from the allowed set: no arrays, no operator objects
     return this.memeEngine.getAllMemes(validateListQuery(query));
+  }
+
+  /**
+   * One page of the gallery, lightweight (see MemeEngineService.listMemes). The total lets the app show
+   * "24 of 180" and know when to stop loading more.
+   */
+  @Get('list')
+  async listMemes(@Query() query: unknown) {
+    const q = validatePageQuery(query);
+    const { items, total } = await this.memeEngine.listMemes(q);
+    return { items, total, skip: q.skip, limit: q.limit, hasMore: q.skip + items.length < total };
   }
 
   /**
@@ -193,6 +208,27 @@ export class MemeController {
     res.setHeader('Cache-Control', 'private, max-age=300');
     res.setHeader('Content-Disposition', 'inline');
     res.sendFile(file.path);
+  }
+
+  /**
+   * A small JPEG of a meme version for the gallery (?v=<version>&w=240|360|480|720). Made on first use and kept
+   * on disk. The URL names the version, and the file is rebuilt if its source changes, so it may be cached.
+   */
+  @Get(':id/thumb')
+  async getMemeThumb(@Param('id', MemeIdPipe) id: string, @Query() query: unknown, @Res() res: Response) {
+    const { version, width } = validateThumbQuery(query);
+    const out = await this.memeEngine.resolveOutputFile(id, version);
+    if (!out) throw new NotFoundException('Meme image not found');
+    let file: string;
+    try {
+      file = await this.thumbnails.ensure(out.path, `${id}_v${out.version}`, width);
+    } catch {
+      throw new NotFoundException('Meme image not found');
+    }
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, max-age=3600, stale-while-revalidate=86400');
+    res.setHeader('Content-Disposition', 'inline');
+    res.sendFile(file);
   }
 
   /**
@@ -257,7 +293,9 @@ export class MemeController {
    */
   @Delete(':id')
   async deleteMeme(@Param('id', MemeIdPipe) id: string) {
-    return this.memeEngine.deleteMeme(id);
+    const result = await this.memeEngine.deleteMeme(id);
+    this.thumbnails.removeForMeme(id); // its small copies go with it
+    return result;
   }
 
   /**

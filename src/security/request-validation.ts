@@ -325,6 +325,56 @@ export function validateListQuery(q: unknown): ValidatedListQuery {
   return { search, type, sort };
 }
 
+/** Page size limits for the gallery list. */
+export const PAGE_DEFAULT = 24;
+export const PAGE_MAX = 60;
+/** Thumbnail widths the server will make (a fixed set keeps disk use and abuse bounded). */
+export const THUMB_WIDTHS = [240, 360, 480, 720] as const;
+
+const intParam = (o: Obj, key: string, min: number, max: number, def: number, e: Errors): number => {
+  const raw = o[key];
+  if (raw === undefined || raw === '') return def;
+  if (typeof raw !== 'string' || !/^\d{1,7}$/.test(raw)) {
+    e.add(`${key} must be a whole number`);
+    return def;
+  }
+  const n = parseInt(raw, 10);
+  if (n < min || n > max) {
+    e.add(`${key} must be between ${min} and ${max}`);
+    return def;
+  }
+  return n;
+};
+
+export interface ValidatedPageQuery extends ValidatedListQuery {
+  limit: number;
+  skip: number;
+}
+
+/** GET /api/memes/list: the same filters as the full list, plus paging. */
+export function validatePageQuery(q: unknown): ValidatedPageQuery {
+  const o: Obj = isObj(q) ? q : {};
+  const e = new Errors();
+  const search = str(o, 'search', 100, e, { label: 'search' });
+  const type = oneOf(o, 'type', ['all', ...MEME_TYPES] as const, e);
+  const sort = oneOf(o, 'sort', ['newest', 'oldest'] as const, e);
+  const limit = intParam(o, 'limit', 1, PAGE_MAX, PAGE_DEFAULT, e);
+  const skip = intParam(o, 'skip', 0, 1_000_000, 0, e);
+  e.throwIfAny();
+  return { search, type, sort, limit, skip };
+}
+
+/** GET /api/memes/:id/thumb?v=<version>&w=<width> */
+export function validateThumbQuery(q: unknown): { version?: number; width: number } {
+  const o: Obj = isObj(q) ? q : {};
+  const e = new Errors();
+  const v = o.v === undefined || o.v === '' ? undefined : intParam(o, 'v', 1, 999999, 1, e);
+  const width = intParam(o, 'w', 1, 4000, 480, e);
+  if (!(THUMB_WIDTHS as readonly number[]).includes(width)) e.add(`w must be one of ${THUMB_WIDTHS.join(', ')}`);
+  e.throwIfAny();
+  return { version: v, width };
+}
+
 export function validateInstruction(v: unknown): string {
   const e = new Errors();
   const s = str({ instruction: v }, 'instruction', 300, e, { required: true, label: 'instruction' });

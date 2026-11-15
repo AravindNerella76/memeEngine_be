@@ -39,7 +39,8 @@ import {
   safeDeleteFile
 } from '../security/path-guard';
 import { ImageValidationError, MAX_UPLOAD_BYTES, MIME_BY_TYPE, inspectImageFileHeader, verifyImageBuffer } from '../security/image-verify';
-import { escapeRegex } from '../security/request-validation';
+import { escapeRegex, THUMB_WIDTHS } from '../security/request-validation';
+import { ThumbnailService } from './thumbnail.service';
 import { safeFetch } from '../security/safe-fetch';
 import { getConfig } from '../config/app-config';
 import { sha256 } from '../discovery/image-fingerprint';
@@ -80,7 +81,9 @@ export class MemeEngineService implements OnModuleInit {
     /** Saved Settings (absent in unit tests: new memes then use the original house constants). */
     @Optional() private readonly profiles?: DesignProfileService,
     /** Staged image choices for image replacement (absent in unit tests). */
-    @Optional() private readonly selection?: ImageSelectionService
+    @Optional() private readonly selection?: ImageSelectionService,
+    /** Makes the gallery's small copies as soon as a meme is saved (absent in unit tests: they are then made on first view). */
+    @Optional() private readonly thumbnails?: ThumbnailService
   ) {}
 
   onModuleInit() {
@@ -93,6 +96,58 @@ export class MemeEngineService implements OnModuleInit {
    * Retrieves all memes from MongoDB with optional search, filter and sort.
    * The (large) generation report is not included in lists; fetch it with getReport().
    */
+  /**
+   * One page of the gallery with only what a card needs. A full record is ~13 KB (every version, its design,
+   * its assets); a card needs ~1 KB, so the list stays quick however many memes there are. `versionCount`
+   * replaces the versions array and `lite: true` tells the app to fetch the full meme when one is opened.
+   */
+  async listMemes(query: MemeFilterQuery & { limit?: number; skip?: number }): Promise<{ items: any[]; total: number }> {
+    const filter = this.buildFilter(query);
+    const limit = Math.min(Math.max(query.limit ?? 24, 1), 60);
+    const skip = Math.max(query.skip ?? 0, 0);
+    const sortOrder = query.sort === 'oldest' ? 1 : -1;
+    const [rows, total] = await Promise.all([
+      this.memeModel
+        .find(filter)
+        .select('memeId createdAt currentVersion content.topic content.headline content.punchline layout.memeType pipeline instagramPublish.status outputUrls versions.versionNumber')
+        .sort({ createdAt: sortOrder, _id: sortOrder }) // _id breaks ties so paging never repeats or skips a meme
+        .skip(skip)
+        .limit(limit)
+        .lean()
+        .exec(),
+      this.memeModel.countDocuments(filter).exec()
+    ]);
+    const items = (rows as any[]).map(({ versions, _id, __v, ...m }) => ({ ...m, versionCount: Array.isArray(versions) ? versions.length : 1, lite: true }));
+    return { items, total };
+  }
+
+  /** Search / type filter shared by the full and the paged list. Only plain strings may reach the query. */
+  private buildFilter(query?: MemeFilterQuery): any {
+    const filter: any = {};
+    if (typeof query?.type === 'string' && query.type !== 'all') filter['layout.memeType'] = query.type;
+    if (typeof query?.search === 'string' && query.search.trim()) {
+      const s = escapeRegex(query.search.trim().slice(0, 100));
+      filter.$or = [
+        { 'content.topic': { $regex: s, $options: 'i' } },
+        { 'content.headline': { $regex: s, $options: 'i' } },
+        { 'content.statement': { $regex: s, $options: 'i' } },
+        { 'content.punchline': { $regex: s, $options: 'i' } }
+      ];
+    }
+    return filter;
+  }
+
+  /** Where a version's output image lives (JPEG preferred: smaller to decode), or null. Used for thumbnails. */
+  async resolveOutputFile(memeId: string, version?: number): Promise<{ path: string; version: number } | null> {
+    const m: any = await this.memeModel.findOne({ memeId }).select('currentVersion outputPaths versions.versionNumber versions.outputPaths').lean().exec();
+    if (!m) return null;
+    const wanted = version ?? m.currentVersion ?? 1;
+    const v = (m.versions || []).find((x: any) => x.versionNumber === wanted);
+    const paths = v?.outputPaths || (wanted === (m.currentVersion ?? 1) ? m.outputPaths : null);
+    const file = paths?.jpeg || paths?.png;
+    return file ? { path: file, version: wanted } : null;
+  }
+
   async getAllMemes(query?: MemeFilterQuery): Promise<Meme[]> {
     const filter: any = {};
 
@@ -273,6 +328,17 @@ export class MemeEngineService implements OnModuleInit {
     };
   }
 
+  /**
+   * Makes the gallery's small copies in the background right after a meme is saved, so the first time the gallery opens
+   * nothing has to be made on demand. Never delays or fails the save: if one is missing it is simply made on first view.
+   */
+  private warmThumbnails(memeId: string, version: number, source: string) {
+    if (!this.thumbnails) return;
+    for (const width of THUMB_WIDTHS) {
+      this.thumbnails.ensure(source, `${memeId}_v${version}`, width).catch(err => this.logger.debug(`Thumbnail ${width}px for ${memeId} v${version} not made yet: ${err?.message || err}`));
+    }
+  }
+
   private writeOutputs(memeId: string, version: number, render: RenderResult) {
     const pngFilename = `meme_${memeId}_v${version}.png`;
     const jpegFilename = `meme_${memeId}_v${version}.jpeg`;
@@ -280,6 +346,7 @@ export class MemeEngineService implements OnModuleInit {
     const jpegPath = path.join(this.outputDir, jpegFilename);
     fs.writeFileSync(pngPath, render.pngBuffer);
     fs.writeFileSync(jpegPath, render.jpegBuffer);
+    this.warmThumbnails(memeId, version, jpegPath);
     return { outputPaths: { png: pngPath, jpeg: jpegPath }, outputUrls: { png: `/output/${pngFilename}`, jpeg: `/output/${jpegFilename}` } };
   }
 
