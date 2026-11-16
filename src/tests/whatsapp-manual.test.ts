@@ -116,6 +116,33 @@ describe('WhatsApp manual flow', () => {
     assert.equal(t.doc.manualSubjectFit, 'contain');
     assert.equal(t.engineInput.design.subjectFit, 'contain');
   });
+
+  it('allows replacing subject and reaction images while in review (AWAITING_APPROVAL)', async () => {
+    const t = build();
+    for (const m of ['manual', 'skip', 'skip', 'skip']) await t.text(m);
+    await t.image('Original Subject');
+    await t.text('done');
+    await t.image('Original Punchline');
+    assert.equal(t.doc.state, 'AWAITING_APPROVAL');
+    const firstSubject = t.engineInput.assets.subjectImages[0].path;
+
+    // Replace subject image while in AWAITING_APPROVAL
+    await t.image('replace');
+    assert.equal(t.doc.state, 'AWAITING_APPROVAL');
+    const replacedSubject = t.engineInput.assets.subjectImages[0].path;
+    assert.notEqual(firstSubject, replacedSubject);
+
+    // Replace reaction image while in AWAITING_APPROVAL
+    const firstReaction = t.engineInput.assets.reactionImage.path;
+    await t.image('replace reaction');
+    assert.equal(t.doc.state, 'AWAITING_APPROVAL');
+    const replacedReaction = t.engineInput.assets.reactionImage.path;
+    assert.notEqual(firstReaction, replacedReaction);
+
+    // Typing 'replace' gives helpful guidance
+    await t.text('replace');
+    assert.ok(t.sent.some(s => s.includes('How to replace an image')));
+  });
 });
 
 describe('WhatsApp viral flow asks for a missing picture', () => {

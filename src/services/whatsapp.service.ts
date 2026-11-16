@@ -577,11 +577,28 @@ export class WhatsAppService {
         }
       }
 
+      // Command: REPLACE / SWAP guidance in review mode
+      if (session.state === 'AWAITING_APPROVAL' && ['replace', 'swap', 'change image', 'replace image', 'replace reaction'].includes(lower)) {
+        await this.sendTextMessage(
+          from,
+          `🔄 *How to replace an image:*\n\n` +
+          `• Send a new photo (or link) to replace the subject image (Slot 1)\n` +
+          `• For multi-image memes, send photo with caption *replace 2* or *replace 3*\n` +
+          `• To replace the reaction photo, send photo with caption *replace reaction*\n` +
+          (session.mode === 'manual' ? `• Or reply *Fit* / *Fill* to toggle image cropping without replacing\n` : '') +
+          `\nSend your photo now, or reply *Approve* to publish!`
+        );
+        return;
+      }
+
       // A pasted link counts as a picture whenever the bot is waiting for one; extra words become the caption/label
       const link = this.extractUrl(text);
-      if (link && this.expectsImage(session)) {
-        await this.receiveImage(session, from, { url: link }, text.replace(link, '').trim(), false);
-        return;
+      if (link) {
+        const wantsReplace = session.state === 'AWAITING_APPROVAL' && (lower.includes('replace') || lower.includes('swap') || /\.(jpe?g|png|webp)($|\?)/i.test(link));
+        if (this.expectsImage(session) || wantsReplace) {
+          await this.receiveImage(session, from, { url: link }, text.replace(link, '').trim(), false);
+          return;
+        }
       }
 
       if (session.state === 'AWAITING_SLOT_IMAGE') {
@@ -657,21 +674,17 @@ export class WhatsAppService {
     compressedPhoto: boolean
   ): Promise<void> {
     try {
-      if (session.state === 'AWAITING_APPROVAL') {
-        await this.sendTextMessage(
-          from,
-          '⚠️ You have a generated meme waiting for approval!\n' +
-          '• Reply *Approve* to publish it to Instagram\n' +
-          '• Reply *Reset* to discard it and use your new image'
-        );
-        return;
-      }
       if (session.state === 'GENERATING' || session.state === 'LAYOUT_ANALYZING') return;
 
       const downloaded = source.url ? await this.downloadImageFromUrl(source.url) : await this.downloadMedia(String(source.mediaId));
 
       if (downloaded.convertedFrom === 'pdf') {
         await this.sendTextMessage(from, `📄 Using page 1 of your PDF (${downloaded.width}x${downloaded.height}px).`);
+      }
+
+      if (session.state === 'AWAITING_APPROVAL') {
+        await this.handleReplacementImage(session, from, downloaded, caption);
+        return;
       }
       // WhatsApp shrinks normal photos to about 1600 px; the same file sent as a Document keeps full quality.
       if (compressedPhoto && session.state !== 'IDLE' && Math.max(downloaded.width, downloaded.height) <= 1700 && !this.qualityTipShown.has(from)) {
@@ -752,6 +765,110 @@ export class WhatsAppService {
       this.logger.error(`Failed to handle WhatsApp image: ${err?.message || err}`);
       await this.sendTextMessage(from, `❌ I could not use that picture: ${err?.message || 'download error'}\nPlease send it again (as a Document for full quality).`);
     }
+  }
+
+  /**
+   * Replaces an image (subject or reaction) for a meme awaiting approval in WhatsApp.
+   * Supports both manual memes and viral adaptation memes.
+   */
+  private async handleReplacementImage(
+    session: WhatsAppSessionDocument,
+    from: string,
+    downloaded: ReceivedImage,
+    caption: string
+  ): Promise<void> {
+    const lowerCap = (caption || '').toLowerCase().trim();
+    const isReaction = lowerCap.includes('reaction') || lowerCap.includes('react');
+
+    // Slot number for subject images: e.g. "replace 2", "slot 2", "2", default 1
+    const slotMatch = lowerCap.match(/(?:slot|image|replace|\b)([1-9]\d?)\b/);
+    const requestedSlot = slotMatch ? parseInt(slotMatch[1], 10) : 1;
+
+    // A) MANUAL MEME FLOW
+    if (session.mode === 'manual') {
+      if (isReaction) {
+        session.reactionImagePath = downloaded.filePath;
+        session.reactionMimeType = downloaded.mimeType;
+        session.reactionLibraryId = null;
+        session.reactionFraming = null;
+        await session.save();
+        await this.sendTextMessage(from, '🔄 Replacing reaction image and re-rendering meme...');
+        await this.generateManualMeme(session, from);
+        return;
+      }
+
+      // Subject image replacement
+      if (!session.manualSubjects) session.manualSubjects = [];
+      const count = session.manualSubjects.length;
+      const targetIdx = count > 0 ? Math.min(requestedSlot - 1, count - 1) : 0;
+      const prevLabel = session.manualSubjects[targetIdx]?.label;
+      const newLabel = caption && !lowerCap.includes('replace') ? caption : prevLabel;
+
+      session.manualSubjects[targetIdx] = {
+        path: downloaded.filePath,
+        mimeType: downloaded.mimeType,
+        label: newLabel
+      };
+
+      // Check aspect ratio if not explicitly chosen
+      const aspect = (downloaded.width || 1) / (downloaded.height || 1);
+      if (downloaded.width && downloaded.height && aspect > 1.35 && !session.manualSubjectFit) {
+        session.manualSubjectFit = 'contain';
+      }
+
+      if (typeof (session as any).markModified === 'function') {
+        (session as any).markModified('manualSubjects');
+      }
+      await session.save();
+      await this.sendTextMessage(from, `🔄 Replacing subject image ${targetIdx + 1} and re-rendering meme...`);
+      await this.generateManualMeme(session, from);
+      return;
+    }
+
+    // B) VIRAL ADAPTATION FLOW
+    if (isReaction) {
+      session.reactionImagePath = downloaded.filePath;
+      session.reactionMimeType = downloaded.mimeType;
+      session.reactionLibraryId = null;
+      session.reactionFraming = null;
+      session.state = 'GENERATING';
+      await session.save();
+      await this.sendTextMessage(from, '🔄 Replacing reaction image and re-adapting meme...');
+      await this.generateAndSendMeme(session, from);
+      return;
+    }
+
+    // Viral subject replacement via memeEngine.applyImageReplacement
+    if (session.lastGeneratedMemeId) {
+      try {
+        await this.sendTextMessage(from, `🔄 Replacing subject image ${requestedSlot}...`);
+        const staged = await this.selection.stageUpload(downloaded.filePath, path.basename(downloaded.filePath));
+        const updatedMeme = await this.memeEngine.applyImageReplacement(
+          session.lastGeneratedMemeId,
+          [{ slot: requestedSlot, token: staged.token }]
+        );
+        await this.deliverMeme(
+          session,
+          from,
+          updatedMeme,
+          updatedMeme.content?.punchline || session.lastGeneratedCaption || ''
+        );
+        return;
+      } catch (err: any) {
+        this.logger.error(`Error replacing image in WhatsApp viral meme: ${err?.message || err}`);
+        await this.sendTextMessage(
+          from,
+          `⚠️ Could not replace image: ${err?.message || err}\n\n` +
+          `Reply *Approve* to keep the current meme, or *Reset* to start fresh.`
+        );
+        return;
+      }
+    }
+
+    await this.sendTextMessage(
+      from,
+      '⚠️ No active meme session found to replace an image on. Send a new reference meme or type *Manual*.'
+    );
   }
 
   /**
@@ -973,6 +1090,7 @@ export class WhatsAppService {
       `Reply:\n` +
       fitHint +
       `👉 *Approve* — Publish to Instagram (@kanyaraasi_memes)\n` +
+      `👉 Send a new photo to *replace* image (or caption "replace reaction")\n` +
       `👉 *Reset* — Discard this meme`;
 
     // Send image preview to user: uploaded to WhatsApp itself, so it arrives even when the server's public address is not reachable
