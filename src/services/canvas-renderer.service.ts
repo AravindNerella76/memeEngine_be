@@ -10,7 +10,7 @@ import {
   TextScales
 } from '../types/meme.types';
 import { ComputedMemeLayout } from './layout-engine.service';
-import { analyzeReactionImage, drawReactionPlan, planReactionPanel } from './reaction-framing';
+import { analyzeReactionImage, drawReactionPlan, drawSoftBackground, planReactionPanel } from './reaction-framing';
 import { ENGLISH_FONTS, FONT_FILES, TELUGU_FONTS } from '../design/fonts';
 import { ElementStyle, RenderStyle, resolveRenderStyle } from '../design/render-style';
 
@@ -331,7 +331,8 @@ export class CanvasRendererService implements OnModuleInit {
       const asset = subjectImages[i];
       if (asset && asset.path) {
         const img = await this.loadAssetImage(asset.path, `Subject image ${i + 1}`, options.loadImage);
-        if (style.image.subjectFit === 'contain') {
+        const shouldContain = (asset as any)?.fit === 'contain' || style.image.subjectFit === 'contain';
+        if (shouldContain) {
           this.drawContainImage(ctx, img, slot.box, radius);
           continue;
         }

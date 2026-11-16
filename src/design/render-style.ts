@@ -189,7 +189,7 @@ export function legacyRenderStyle(specs: DesignSpecifications): RenderStyle {
       punchline: el(46, 24, 1.17, primary)
     },
     canvas: { background: '#000000', headerBackground: specs.headerBgColor || '#000000', cornerRadius: 0, outputScale: 1, punchlineMaxGrowRatio: 0.62, maxHeaderRatio: 0.2 },
-    image: { subjectFit: 'cover', reactionFit: 'cover', portraitAnchorY: 0.28, landscapeAnchorY: 0.4, reactionAnchorY: 0.36, useFocalPoint: true, jpegQuality: null }
+    image: { subjectFit: specs.subjectFit || 'cover', reactionFit: 'cover', portraitAnchorY: 0.28, landscapeAnchorY: 0.4, reactionAnchorY: 0.36, useFocalPoint: true, jpegQuality: null }
   };
 }
 
@@ -273,7 +273,7 @@ function snapshotRenderStyle(specs: DesignSpecifications, snap: StyleSnapshot): 
       punchlineMaxGrowRatio: c.punchlineMaxGrowRatio,
       maxHeaderRatio: c.maxHeaderRatio
     },
-    image: { ...snap.image }
+    image: { ...snap.image, ...(specs.subjectFit ? { subjectFit: specs.subjectFit } : {}) }
   };
 }
 

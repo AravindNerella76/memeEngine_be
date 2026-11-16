@@ -158,6 +158,7 @@ export function validateDesign(raw: unknown, e: Errors): Partial<DesignSpecifica
     shadowBlur: num(raw, 'shadowBlur', 0, 40, e),
     fontSizeScale: num(raw, 'fontSizeScale', 0.5, 1.6, e),
     textAlignment: oneOf(raw, 'textAlignment', ALIGNMENTS, e) as DesignSpecifications['textAlignment'] | undefined,
+    subjectFit: oneOf(raw, 'subjectFit', ['cover', 'contain'], e) as 'cover' | 'contain' | undefined,
     customInstructions: str(raw, 'customInstructions', 500, e, { label: 'design.customInstructions' }),
     reactionFraming: (() => {
       try {

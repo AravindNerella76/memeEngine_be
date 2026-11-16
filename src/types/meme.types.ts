@@ -181,6 +181,11 @@ export interface DesignSpecifications {
   style?: StyleSnapshot;
 
   /**
+   * How subject images fit their slots: 'cover' (fills slot, crops excess edges) or 'contain' (fits whole picture without cropping).
+   */
+  subjectFit?: 'cover' | 'contain';
+
+  /**
    * How the reaction image sits in its panel, when the owner chose (or turned off) the automatic framing of stacked
    * pictures. Absent: decided from the picture itself on every render.
    */
