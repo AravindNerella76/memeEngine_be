@@ -323,6 +323,8 @@ export class MemeEngineService implements OnModuleInit {
       textScales: d?.textScales ? { ...d.textScales } : {},
       textAlignment: d?.textAlignment || 'center',
       customInstructions: d?.customInstructions,
+      // preserve subjectFit (cover vs contain)
+      ...(d?.subjectFit ? { subjectFit: d.subjectFit } : {}),
       // how the owner framed the reaction image (kept through regeneration)
       ...(d?.reactionFraming ? { reactionFraming: d.reactionFraming } : {}),
       // the meme's own settings snapshot (kept through regeneration; older memes have none)

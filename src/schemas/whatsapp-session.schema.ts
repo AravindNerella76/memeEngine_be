@@ -116,6 +116,10 @@ export class WhatsAppSession {
   @Prop({ type: [{ _id: false, path: String, mimeType: String, label: String }], default: [] })
   manualSubjects: ManualSubject[];
 
+  /** Subject image framing in manual mode: 'cover' (fill & crop) or 'contain' (fit whole image). */
+  @Prop({ type: String, default: null })
+  manualSubjectFit: 'cover' | 'contain' | null;
+
   /** How the reaction picture is framed ({ split?, frame?, fit?, focus? }); null until chosen. */
   @Prop({ type: Object, default: null })
   reactionFraming: Record<string, unknown> | null;

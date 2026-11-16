@@ -94,6 +94,28 @@ describe('WhatsApp manual flow', () => {
     assert.equal(other, undefined);
     assert.equal(t.doc.phoneNumber, PHONE);
   });
+
+  it('supports fit toggle during subjects collection and during review (AWAITING_APPROVAL)', async () => {
+    const t = build();
+    for (const m of ['manual', 'skip', 'skip', 'skip']) await t.text(m);
+    await t.image('Tweet Screenshot');
+    await t.text('fit');
+    assert.equal(t.doc.manualSubjectFit, 'contain');
+    await t.text('done');
+    await t.image('Caption punchline');
+    assert.equal(t.doc.state, 'AWAITING_APPROVAL');
+    assert.equal(t.engineInput.design.subjectFit, 'contain');
+
+    // Toggle back to fill while in review
+    await t.text('fill');
+    assert.equal(t.doc.manualSubjectFit, 'cover');
+    assert.equal(t.engineInput.design.subjectFit, 'cover');
+
+    // Toggle back to fit while in review
+    await t.text('fit');
+    assert.equal(t.doc.manualSubjectFit, 'contain');
+    assert.equal(t.engineInput.design.subjectFit, 'contain');
+  });
 });
 
 describe('WhatsApp viral flow asks for a missing picture', () => {

@@ -559,6 +559,24 @@ export class WhatsAppService {
         return;
       }
 
+      // Command: FIT / FILL toggle in review mode for manual memes
+      if (session.state === 'AWAITING_APPROVAL' && session.mode === 'manual' && session.manualSubjects?.length) {
+        if (['fit', 'contain', 'nocrop', 'no crop'].includes(lower)) {
+          session.manualSubjectFit = 'contain';
+          await session.save();
+          await this.sendTextMessage(from, '🔄 Re-rendering with *Fit Whole Image (No Crop)*...');
+          await this.generateManualMeme(session, from);
+          return;
+        }
+        if (['fill', 'cover', 'crop'].includes(lower)) {
+          session.manualSubjectFit = 'cover';
+          await session.save();
+          await this.sendTextMessage(from, '🔄 Re-rendering with *Fill & Crop*...');
+          await this.generateManualMeme(session, from);
+          return;
+        }
+      }
+
       // A pasted link counts as a picture whenever the bot is waiting for one; extra words become the caption/label
       const link = this.extractUrl(text);
       if (link && this.expectsImage(session)) {
@@ -944,11 +962,16 @@ export class WhatsAppService {
     const headline = meme.content?.headline || '';
     const punchline = punchlineText;
 
+    const fitHint = session.mode === 'manual'
+      ? `👉 *${session.manualSubjectFit === 'contain' ? 'Fill' : 'Fit'}* — Switch to ${session.manualSubjectFit === 'contain' ? 'Fill & Crop' : 'Fit Whole Image (No Crop)'}\n`
+      : '';
+
     const previewCaption =
       `🎭 *Meme Ready for Review!*\n\n` +
       (headline ? `📌 *Headline*: ${headline}\n` : '') +
       `💬 *Punchline*: ${punchline}\n\n` +
       `Reply:\n` +
+      fitHint +
       `👉 *Approve* — Publish to Instagram (@kanyaraasi_memes)\n` +
       `👉 *Reset* — Discard this meme`;
 
@@ -1031,7 +1054,20 @@ export class WhatsAppService {
         await this.manualNextStep(session, from, 'statement');
         return;
       case 'MANUAL_SUBJECTS': {
-        if (['done', 'next', 'finish'].includes(text.trim().toLowerCase())) {
+        const lower = text.trim().toLowerCase();
+        if (['fit', 'contain', 'nocrop', 'no crop'].includes(lower)) {
+          session.manualSubjectFit = 'contain';
+          await session.save();
+          await this.sendTextMessage(from, '✅ Set to *Fit Whole Image (No Crop)*. Send more images, or *done*.');
+          return;
+        }
+        if (['fill', 'cover', 'crop'].includes(lower)) {
+          session.manualSubjectFit = 'cover';
+          await session.save();
+          await this.sendTextMessage(from, '✅ Set to *Fill & Crop*. Send more images, or *done*.');
+          return;
+        }
+        if (['done', 'next', 'finish'].includes(lower)) {
           if (!session.manualSubjects?.length) {
             await this.sendTextMessage(from, 'Please send at least one subject image first.');
             return;
@@ -1042,7 +1078,8 @@ export class WhatsAppService {
           }
           session.state = 'MANUAL_REACTION';
           await session.save();
-          await this.sendTextMessage(from, `🎭 ${session.manualSubjects.length} subject image(s) saved. Now send the *reaction image* (a caption becomes the punchline).` + (await this.libraryHint()));
+          const framingNote = session.manualSubjectFit === 'contain' ? ' (Framing: *Fit Whole Image*)' : '';
+          await this.sendTextMessage(from, `🎭 ${session.manualSubjects.length} subject image(s) saved${framingNote}. Now send the *reaction image* (a caption becomes the punchline).` + (await this.libraryHint()));
           return;
         }
         await this.sendTextMessage(from, 'Send a subject image, or *done* when you have sent them all.');
@@ -1070,6 +1107,24 @@ export class WhatsAppService {
         await this.sendTextMessage(from, `Maximum of ${cap} subject images reached. ${session.manualSlotCount ? 'Now send the *reaction image*.' : 'Send *done*.'}`);
         return;
       }
+
+      // Auto-detect wide screenshot or explicit fit caption
+      let isWide = false;
+      const lowerCaption = (caption || '').trim().toLowerCase();
+      if (['fit', 'contain', 'nocrop', 'no crop'].includes(lowerCaption)) {
+        session.manualSubjectFit = 'contain';
+        await session.save();
+      } else {
+        try {
+          const img = await loadImage(downloaded.filePath);
+          if (img?.width && img?.height && (img.width / img.height) > 1.35) {
+            isWide = true;
+            session.manualSubjectFit = 'contain';
+            await session.save();
+          }
+        } catch {}
+      }
+
       // Atomic push: several images can arrive in parallel webhooks.
       const updated = await this.sessionModel.findOneAndUpdate(
         { phoneNumber: from },
@@ -1077,7 +1132,10 @@ export class WhatsAppService {
         { new: true }
       );
       const n = updated?.manualSubjects?.length || 0;
-      const added = `✅ Subject ${n} added${caption ? ` (label: "${caption}")` : ''}.`;
+      const fitNote = (isWide || session.manualSubjectFit === 'contain')
+        ? '\n📐 *Wide image detected:* Set to *Fit Whole Image (No Crop)* so edge text is not cut off. (Send *crop* if you want it filled).'
+        : '';
+      const added = `✅ Subject ${n} added${caption ? ` (label: "${caption}")` : ''}.${fitNote}`;
       if (session.manualSlotCount && n >= session.manualSlotCount) {
         // A saved layout has an exact number of images: continue by itself
         session.state = 'MANUAL_REACTION';
@@ -1159,7 +1217,8 @@ export class WhatsAppService {
       }
 
       const withFraming = session.reactionFraming ? { ...(design || {}), reactionFraming: session.reactionFraming as ReactionFraming } : design;
-      const meme = await this.memeEngine.generateMeme({ content, assets: { subjectImages, reactionImage }, design: withFraming as any, layout: finalLayout });
+      const withFit = session.manualSubjectFit ? { ...(withFraming || {}), subjectFit: session.manualSubjectFit } : withFraming;
+      const meme = await this.memeEngine.generateMeme({ content, assets: { subjectImages, reactionImage }, design: withFit as any, layout: finalLayout });
       this.noteLibraryUse(session);
       await this.deliverMeme(session, to, meme, session.punchline);
     } catch (err: any) {
@@ -1698,6 +1757,7 @@ export class WhatsAppService {
     session.manualHeadline = null;
     session.manualStatement = null;
     session.manualSubjects = [];
+    session.manualSubjectFit = null;
     session.lastGeneratedMemeId = null;
     session.lastGeneratedImageUrl = null;
     session.lastGeneratedCaption = null;
