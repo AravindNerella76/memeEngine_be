@@ -25,6 +25,7 @@ import { ViralAdaptationService } from '../services/viral-adaptation.service';
 import { ThumbnailService } from '../services/thumbnail.service';
 import { UploadedAsset } from '../types/meme.types';
 import { getConfig } from '../config/app-config';
+import { Public } from '../auth/public.decorator';
 import {
   OUTPUT_ROOT,
   UPLOADS_ROOT,
@@ -201,8 +202,9 @@ export class MemeController {
 
   /**
    * One of the meme's source images (subject-N, reaction or reference), for the local details view.
-   * Uploads are not public; this streams only verified images that belong to the meme.
+   * Streams verified images that belong to the meme.
    */
+  @Public()
   @Get(':id/assets/:which')
   async getMemeAsset(@Param('id', MemeIdPipe) id: string, @Param('which') which: string, @Res() res: Response) {
     const file = await this.memeEngine.resolveAssetFile(id, which);
@@ -216,6 +218,7 @@ export class MemeController {
    * A small JPEG of a meme version for the gallery (?v=<version>&w=240|360|480|720). Made on first use and kept
    * on disk. The URL names the version, and the file is rebuilt if its source changes, so it may be cached.
    */
+  @Public()
   @Get(':id/thumb')
   async getMemeThumb(@Param('id', MemeIdPipe) id: string, @Query() query: unknown, @Res() res: Response) {
     const { version, width } = validateThumbQuery(query);
