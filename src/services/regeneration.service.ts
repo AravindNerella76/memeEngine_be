@@ -74,7 +74,7 @@ export function validateOp(raw: unknown, ctx: InterpretationContext): RegenOp | 
       const script = r.script === 'telugu' ? 'telugu' : r.script === 'english' ? 'english' : null;
       const font = typeof r.font === 'string' ? r.font.trim() : '';
       const allowed = script === 'telugu' ? CanvasRendererService.TELUGU_FONTS : CanvasRendererService.ENGLISH_FONTS;
-      const match = allowed.find(f => f.toLowerCase() === font.toLowerCase());
+      const match = allowed.find(f => f.toLowerCase() === font.toLowerCase() || f.replace(/\s+/g, '').toLowerCase() === font.replace(/\s+/g, '').toLowerCase());
       if (!script || !match) return null;
       return { op: 'set_font', script, font: match };
     }

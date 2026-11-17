@@ -145,7 +145,7 @@ import type { ReactionFraming } from '../services/reaction-framing';
 
 export interface DesignSpecifications {
   fontFamily: 'Montserrat' | 'Anton' | 'Arial Black' | 'Impact' | 'Intrepid ExtraBold' | 'Intrepid' | 'Ramabhadra' | 'Mandali' | 'Noto Sans Telugu' | string;
-  teluguFontFamily: 'Ramabhadra' | 'Mandali' | 'Noto Sans Telugu' | string;
+  teluguFontFamily: 'Ramabhadra' | 'Mandali' | 'Noto Sans Telugu' | 'Anek Telugu' | 'AnekTelugu' | string;
   
   // Dimensions
   canvasPreset: CanvasDimensionPreset;

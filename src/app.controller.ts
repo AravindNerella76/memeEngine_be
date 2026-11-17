@@ -12,7 +12,7 @@ export class AppController {
       engine: 'Telugu Meme Generator Engine',
       channel: '@kanyaraasi_memes',
       phase: 1,
-      teluguFontsLoaded: ['Ramabhadra', 'Mandali', 'Noto Sans Telugu'],
+      teluguFontsLoaded: ['Ramabhadra', 'Mandali', 'Noto Sans Telugu', 'Anek Telugu'],
       englishFontsLoaded: ['Anton', 'Arial Black', 'Impact', 'Intrepid ExtraBold'],
       timestamp: new Date().toISOString()
     };

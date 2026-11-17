@@ -38,6 +38,8 @@ async function bootstrap() {
     GlobalFonts.registerFromPath(path.join(fontsDir, 'Ramabhadra-Regular.ttf'), 'Ramabhadra');
     GlobalFonts.registerFromPath(path.join(fontsDir, 'Mandali-Regular.ttf'), 'Mandali');
     GlobalFonts.registerFromPath(path.join(fontsDir, 'NotoSansTelugu-Bold.ttf'), 'Noto Sans Telugu');
+    GlobalFonts.registerFromPath(path.join(fontsDir, 'AnekTelugu-VariableFont_wdth,wght.ttf'), 'Anek Telugu');
+    GlobalFonts.registerFromPath(path.join(fontsDir, 'AnekTelugu-VariableFont_wdth,wght.ttf'), 'AnekTelugu');
     GlobalFonts.registerFromPath(path.join(fontsDir, 'Anton-Regular.ttf'), 'Anton');
     GlobalFonts.registerFromPath(path.join(fontsDir, 'Arial-Black.ttf'), 'Arial Black');
     GlobalFonts.registerFromPath(path.join(fontsDir, 'Impact.ttf'), 'Impact');
