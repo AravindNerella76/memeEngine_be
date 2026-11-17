@@ -810,9 +810,9 @@ export class WhatsAppService {
         label: newLabel
       };
 
-      // Check aspect ratio if not explicitly chosen
+      // Check aspect ratio if not explicitly chosen (>0.82 fits inside tall side-by-side slot)
       const aspect = (downloaded.width || 1) / (downloaded.height || 1);
-      if (downloaded.width && downloaded.height && aspect > 1.35 && !session.manualSubjectFit) {
+      if (downloaded.width && downloaded.height && aspect > 0.82 && !session.manualSubjectFit) {
         session.manualSubjectFit = 'contain';
       }
 
@@ -1226,7 +1226,7 @@ export class WhatsAppService {
         return;
       }
 
-      // Auto-detect wide screenshot or explicit fit caption
+      // Auto-detect wide screenshot, tweet, or square image (aspect > 0.82) vs narrow side-by-side slot (~0.62)
       let isWide = false;
       const lowerCaption = (caption || '').trim().toLowerCase();
       if (['fit', 'contain', 'nocrop', 'no crop'].includes(lowerCaption)) {
@@ -1235,7 +1235,7 @@ export class WhatsAppService {
       } else {
         try {
           const img = await loadImage(downloaded.filePath);
-          if (img?.width && img?.height && (img.width / img.height) > 1.35) {
+          if (img?.width && img?.height && (img.width / img.height) > 0.82) {
             isWide = true;
             session.manualSubjectFit = 'contain';
             await session.save();
