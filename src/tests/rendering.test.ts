@@ -171,6 +171,39 @@ describe('rendering: text, images and validation', () => {
   it('a blank (uniform) image area fails output validation', async () => {
     await assert.rejects(() => renderer.renderMeme(layoutFor(2, { hasHeader: false }), content({ headline: undefined, punchline: 'x' }), assets([files['portrait.jpg'], files['black.jpg']]), design), (e: any) => e instanceof RenderValidationError && /blank/.test(e.message));
   });
+
+  it('detects uniform card/tweet backgrounds and extends them to fill the container without clipping text', () => {
+    // 1. Uniform white card (like tweet screenshot)
+    const whiteCard = createCanvas(400, 300);
+    const wctx = whiteCard.getContext('2d');
+    wctx.fillStyle = '#ffffff';
+    wctx.fillRect(0, 0, 400, 300);
+    wctx.fillStyle = '#000000';
+    wctx.fillText('Tweet content text', 50, 150);
+    const whiteBg = renderer.detectImageBackgroundColor(whiteCard);
+    assert.equal(whiteBg.isUniform, true, 'solid background card is detected as uniform');
+    assert.equal(whiteBg.color, 'rgb(255,255,255)');
+
+    // 2. Uniform dark tweet card
+    const darkCard = createCanvas(400, 300);
+    const dctx = darkCard.getContext('2d');
+    dctx.fillStyle = '#15202b';
+    dctx.fillRect(0, 0, 400, 300);
+    dctx.fillStyle = '#ffffff';
+    dctx.fillText('Dark mode tweet text', 50, 150);
+    const darkBg = renderer.detectImageBackgroundColor(darkCard);
+    assert.equal(darkBg.isUniform, true, 'dark mode tweet card is detected as uniform');
+
+    // 3. Multi-color photo (noisy background)
+    const photo = createCanvas(400, 300);
+    const pctx = photo.getContext('2d');
+    for (let i = 0; i < 200; i++) {
+      pctx.fillStyle = `rgb(${(i * 50) % 256},${(i * 120) % 256},${(i * 70) % 256})`;
+      pctx.fillRect((i * 30) % 400, (i * 20) % 300, 40, 40);
+    }
+    const photoBg = renderer.detectImageBackgroundColor(photo);
+    assert.equal(photoBg.isUniform, false, 'multi-color photo is not detected as uniform');
+  });
 });
 
 describe('design profile', () => {

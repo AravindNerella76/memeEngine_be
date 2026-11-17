@@ -151,18 +151,105 @@ export class CanvasRendererService implements OnModuleInit {
     ctx.restore();
   }
 
-  /** Whole image inside the area, centred, aspect ratio kept (the background shows around it). */
-  drawContainImage(ctx: SKRSContext2D, img: any, dest: BoundingBox, cornerRadius = 0) {
+  /**
+   * Detects whether an image has a uniform card/screenshot background (e.g. tweet, news clip, quote),
+   * and samples its edge color so we can extend the background to fill the container without cropping.
+   */
+  detectImageBackgroundColor(img: any): { color: string; isUniform: boolean } {
+    try {
+      const sampleW = Math.min(img.width, 160);
+      const sampleH = Math.min(img.height, 160);
+      const canvas = createCanvas(sampleW, sampleH);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, sampleW, sampleH);
+
+      const insetX = Math.max(2, Math.floor(sampleW * 0.03));
+      const insetY = Math.max(2, Math.floor(sampleH * 0.03));
+
+      const samples: [number, number][] = [
+        // Top edge
+        [insetX, insetY],
+        [Math.floor(sampleW * 0.25), insetY],
+        [Math.floor(sampleW * 0.5), insetY],
+        [Math.floor(sampleW * 0.75), insetY],
+        [sampleW - 1 - insetX, insetY],
+        // Bottom edge
+        [insetX, sampleH - 1 - insetY],
+        [Math.floor(sampleW * 0.25), sampleH - 1 - insetY],
+        [Math.floor(sampleW * 0.5), sampleH - 1 - insetY],
+        [Math.floor(sampleW * 0.75), sampleH - 1 - insetY],
+        [sampleW - 1 - insetX, sampleH - 1 - insetY],
+        // Left & Right middle
+        [insetX, Math.floor(sampleH * 0.5)],
+        [sampleW - 1 - insetX, Math.floor(sampleH * 0.5)],
+      ];
+
+      const colors = samples.map(([x, y]) => {
+        const p = ctx.getImageData(x, y, 1, 1).data;
+        return { r: p[0], g: p[1], b: p[2], a: p[3] };
+      });
+
+      // If edges are mostly transparent, do not fill
+      const opaqueColors = colors.filter(c => c.a >= 128);
+      if (opaqueColors.length < Math.ceil(samples.length * 0.5)) {
+        return { color: 'transparent', isUniform: false };
+      }
+
+      // Find largest color cluster within tolerance
+      let bestCluster: typeof colors = [];
+      for (let i = 0; i < opaqueColors.length; i++) {
+        const cluster = [opaqueColors[i]];
+        for (let j = 0; j < opaqueColors.length; j++) {
+          if (i === j) continue;
+          const d = Math.hypot(opaqueColors[i].r - opaqueColors[j].r, opaqueColors[i].g - opaqueColors[j].g, opaqueColors[i].b - opaqueColors[j].b);
+          if (d < 28) cluster.push(opaqueColors[j]);
+        }
+        if (cluster.length > bestCluster.length) {
+          bestCluster = cluster;
+        }
+      }
+
+      // Uniform if at least 65% of perimeter samples share the same color
+      const isUniform = bestCluster.length >= Math.ceil(samples.length * 0.65);
+      const avgR = Math.round(bestCluster.reduce((s, c) => s + c.r, 0) / (bestCluster.length || 1));
+      const avgG = Math.round(bestCluster.reduce((s, c) => s + c.g, 0) / (bestCluster.length || 1));
+      const avgB = Math.round(bestCluster.reduce((s, c) => s + c.b, 0) / (bestCluster.length || 1));
+
+      return {
+        color: `rgb(${avgR},${avgG},${avgB})`,
+        isUniform
+      };
+    } catch {
+      return { color: '#000000', isUniform: false };
+    }
+  }
+
+  /**
+   * Whole image inside the area, centered, aspect ratio preserved.
+   * Seamlessly extends the image's background color to fill the entire dest slot
+   * when the image has a uniform background (tweet, news screenshot, quote card).
+   */
+  drawContainImage(ctx: SKRSContext2D, img: any, dest: BoundingBox, cornerRadius = 0, customBgColor?: string) {
+    const bg = customBgColor ? { color: customBgColor, isUniform: true } : this.detectImageBackgroundColor(img);
+
+    ctx.save();
+    ctx.beginPath();
+    if (cornerRadius > 0) ctx.roundRect(dest.x, dest.y, dest.width, dest.height, cornerRadius);
+    else ctx.rect(dest.x, dest.y, dest.width, dest.height);
+    ctx.clip();
+
+    // Fill the destination bounding box with the image's background color (background extend)
+    if (bg.isUniform) {
+      ctx.fillStyle = bg.color;
+      ctx.fillRect(dest.x, dest.y, dest.width, dest.height);
+    }
+
     const scale = Math.min(dest.width / img.width, dest.height / img.height);
     const w = img.width * scale;
     const h = img.height * scale;
     const x = dest.x + (dest.width - w) / 2;
     const y = dest.y + (dest.height - h) / 2;
-    ctx.save();
-    ctx.beginPath();
-    if (cornerRadius > 0) ctx.roundRect(x, y, w, h, cornerRadius);
-    else ctx.rect(x, y, w, h);
-    ctx.clip();
+
     ctx.drawImage(img, 0, 0, img.width, img.height, x, y, w, h);
     ctx.restore();
   }
@@ -331,9 +418,15 @@ export class CanvasRendererService implements OnModuleInit {
       const asset = subjectImages[i];
       if (asset && asset.path) {
         const img = await this.loadAssetImage(asset.path, `Subject image ${i + 1}`, options.loadImage);
-        const shouldContain = (asset as any)?.fit === 'contain' || style.image.subjectFit === 'contain';
-        if (shouldContain) {
-          this.drawContainImage(ctx, img, slot.box, radius);
+        const forceCover = (asset as any)?.fit === 'cover';
+        const forceContain = (asset as any)?.fit === 'contain' || style.image.subjectFit === 'contain';
+        const bg = this.detectImageBackgroundColor(img);
+
+        // If contain is requested, or if the subject image has a uniform card/text background
+        // and cover was not explicitly forced, use contain with background extension so text
+        // is never cropped/overflowed and the slot is completely filled.
+        if (forceContain || (!forceCover && bg.isUniform)) {
+          this.drawContainImage(ctx, img, slot.box, radius, bg.isUniform ? bg.color : undefined);
           continue;
         }
         const isPortrait = (img.width / img.height) < 0.95;
