@@ -6,7 +6,9 @@ import { GlobalFonts } from '@napi-rs/canvas';
 import * as express from 'express';
 import compression = require('compression');
 import * as path from 'path';
+import * as fs from 'fs';
 import { OUTPUT_ROOT } from './security/path-guard';
+import { MemeEngineService } from './services/meme-engine.service';
 import {
   corsOrigin,
   defaultGuardOptions,
@@ -84,6 +86,34 @@ async function bootstrap() {
   );
   // File names carry the meme id and version, so an hour of caching is safe and saves revalidating every image on each visit.
   app.use('/output', express.static(OUTPUT_ROOT, { dotfiles: 'deny', index: false, redirect: false, maxAge: '1h' }));
+
+  // Fallback for missing output files: recover from MongoDB (e.g. after container restart on ephemeral hosts like Render)
+  app.use('/output', async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const match = req.path.match(/^\/meme_([a-f0-9-]+)_v(\d+)\.(jpe?g|png)$/i);
+    if (match) {
+      const [, memeId, versionStr, ext] = match;
+      const version = parseInt(versionStr, 10);
+      const isJpeg = /jpe?g/i.test(ext);
+      try {
+        const memeEngine = app.get(MemeEngineService);
+        const buf = await memeEngine.getImageBuffer(memeId, version, isJpeg ? 'jpeg' : 'png');
+        if (buf) {
+          const destPath = path.join(OUTPUT_ROOT, req.path.replace(/^\//, ''));
+          try {
+            fs.mkdirSync(path.dirname(destPath), { recursive: true });
+            fs.writeFileSync(destPath, buf);
+          } catch {}
+          res.setHeader('Content-Type', isJpeg ? 'image/jpeg' : 'image/png');
+          res.setHeader('Cache-Control', 'public, max-age=3600');
+          res.send(buf);
+          return;
+        }
+      } catch (err: any) {
+        console.warn(`Error recovering output file from MongoDB: ${err?.message || err}`);
+      }
+    }
+    next();
+  });
 
   // Always bind 0.0.0.0 on cloud hosts (Render, Railway, Docker) or when PORT is provided
   const bindHost = process.env.PORT || process.env.RENDER || cfg.host === '0.0.0.0' ? '0.0.0.0' : cfg.host;

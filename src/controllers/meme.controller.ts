@@ -333,7 +333,19 @@ export class MemeController {
 
     // Only files inside the output directory are ever sent, whatever the stored path says
     const isJpeg = format === 'jpeg' || format === 'jpg';
-    const filePath = resolveApprovedFile(isJpeg ? targetPaths?.jpeg : targetPaths?.png, [OUTPUT_ROOT]);
+    let filePath = resolveApprovedFile(isJpeg ? targetPaths?.jpeg : targetPaths?.png, [OUTPUT_ROOT]);
+    if (!filePath) {
+      const buf = await this.memeEngine.getImageBuffer(meme.memeId, targetVersion, isJpeg ? 'jpeg' : 'png');
+      if (buf) {
+        const ext = isJpeg ? 'jpeg' : 'png';
+        const expectedPath = path.join(OUTPUT_ROOT, `meme_${meme.memeId}_v${targetVersion}.${ext}`);
+        try {
+          fs.mkdirSync(path.dirname(expectedPath), { recursive: true });
+          fs.writeFileSync(expectedPath, buf);
+          filePath = expectedPath;
+        } catch {}
+      }
+    }
     if (!filePath) {
       throw new NotFoundException(`Image file for version ${targetVersion} not found on disk`);
     }

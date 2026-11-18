@@ -36,6 +36,7 @@ import { WhatsAppCredentialsService } from './services/whatsapp-credentials.serv
 import { FormatController } from './controllers/format.controller';
 import { ThumbnailService } from './services/thumbnail.service';
 import { ReactionImage, ReactionImageSchema } from './schemas/reaction-image.schema';
+import { MemeImage, MemeImageSchema } from './schemas/meme-image.schema';
 import { ReactionLibraryService } from './services/reaction-library.service';
 import { ReactionController } from './controllers/reaction.controller';
 import { VisionCliRunner } from './vision/vision-cli.runner';
@@ -57,7 +58,8 @@ import { getConfig } from './config/app-config';
       { name: WhatsAppCredentials.name, schema: WhatsAppCredentialsSchema },
       { name: AuthUser.name, schema: AuthUserSchema },
       { name: AuthSession.name, schema: AuthSessionSchema },
-      { name: ReactionImage.name, schema: ReactionImageSchema }
+      { name: ReactionImage.name, schema: ReactionImageSchema },
+      { name: MemeImage.name, schema: MemeImageSchema }
     ])
   ],
   controllers: [

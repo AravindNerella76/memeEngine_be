@@ -22,6 +22,7 @@ import { isStyleSnapshot } from '../design/render-style';
 import { assertSlot, ImageSelectionService, StagedImage, StagedPublic } from './image-selection.service';
 import { applyOps, describeOp, InterpretationContext, RegenerationService } from './regeneration.service';
 import { Meme, MemeDocument } from '../schemas/meme.schema';
+import { MemeImage, MemeImageDocument } from '../schemas/meme-image.schema';
 import {
   MemeContent,
   MemeAssets,
@@ -83,7 +84,8 @@ export class MemeEngineService implements OnModuleInit {
     /** Staged image choices for image replacement (absent in unit tests). */
     @Optional() private readonly selection?: ImageSelectionService,
     /** Makes the gallery's small copies as soon as a meme is saved (absent in unit tests: they are then made on first view). */
-    @Optional() private readonly thumbnails?: ThumbnailService
+    @Optional() private readonly thumbnails?: ThumbnailService,
+    @Optional() @InjectModel(MemeImage.name) private readonly memeImageModel?: Model<MemeImageDocument>
   ) {}
 
   onModuleInit() {
@@ -145,7 +147,24 @@ export class MemeEngineService implements OnModuleInit {
     const v = (m.versions || []).find((x: any) => x.versionNumber === wanted);
     const paths = v?.outputPaths || (wanted === (m.currentVersion ?? 1) ? m.outputPaths : null);
     const file = paths?.jpeg || paths?.png;
-    return file ? { path: file, version: wanted } : null;
+    const targetPath = file || path.join(this.outputDir, `meme_${memeId}_v${wanted}.jpeg`);
+
+    // If the file does not exist on disk (e.g. after container restart on ephemeral storage), restore from MongoDB!
+    if (!fs.existsSync(targetPath)) {
+      const buf = await this.getImageBuffer(memeId, wanted, 'jpeg');
+      if (buf) {
+        try {
+          fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+          fs.writeFileSync(targetPath, buf);
+          this.logger.log(`Restored meme image ${memeId} v${wanted} to disk from MongoDB.`);
+        } catch (e: any) {
+          this.logger.warn(`Could not restore file to disk: ${e.message}`);
+        }
+      } else {
+        return null;
+      }
+    }
+    return { path: targetPath, version: wanted };
   }
 
   async getAllMemes(query?: MemeFilterQuery): Promise<Meme[]> {
@@ -211,11 +230,28 @@ export class MemeEngineService implements OnModuleInit {
   async resolveAssetFile(memeId: string, which: string): Promise<{ path: string; mime: string }> {
     const meme = await this.getMemeById(memeId);
     let asset: any;
+    let subjectIdx: number | null = null;
     if (which === 'reaction') asset = meme.assets?.reactionImage;
     else if (which === 'reference') asset = meme.referenceImage;
-    else if (/^subject-\d{1,2}$/.test(which)) asset = meme.assets?.subjectImages?.[Number(which.split('-')[1])];
+    else if (/^subject-\d{1,2}$/.test(which)) {
+      subjectIdx = Number(which.split('-')[1]);
+      asset = meme.assets?.subjectImages?.[subjectIdx];
+    }
     else throw new BadRequestException('Unknown image');
-    const real = asset ? resolveApprovedFile(asset.path, APPROVED_READ_ROOTS) : null;
+
+    let real = asset ? resolveApprovedFile(asset.path, APPROVED_READ_ROOTS) : null;
+    if (!real && subjectIdx !== null && this.memeImageModel) {
+      try {
+        const doc = await this.memeImageModel.findOne({ memeId, version: meme.currentVersion || 1 }).select('+subjects').lean().exec();
+        const s = doc?.subjects?.find((item: any) => item.index === subjectIdx);
+        if (s?.data) {
+          const destPath = asset?.path || path.join(UPLOADS_ROOT, `${memeId}_subject_${subjectIdx}.${s.mime?.includes('png') ? 'png' : 'jpg'}`);
+          fs.mkdirSync(path.dirname(destPath), { recursive: true });
+          fs.writeFileSync(destPath, s.data);
+          real = destPath;
+        }
+      } catch {}
+    }
     if (!real) throw new NotFoundException('Image not available');
     const header = inspectImageFileHeader(real);
     return { path: real, mime: MIME_BY_TYPE[header.type] };
@@ -343,7 +379,7 @@ export class MemeEngineService implements OnModuleInit {
     }
   }
 
-  private writeOutputs(memeId: string, version: number, render: RenderResult) {
+  private writeOutputs(memeId: string, version: number, render: RenderResult, subjectImages?: UploadedAsset[]) {
     const pngFilename = `meme_${memeId}_v${version}.png`;
     const jpegFilename = `meme_${memeId}_v${version}.jpeg`;
     const pngPath = path.join(this.outputDir, pngFilename);
@@ -351,7 +387,73 @@ export class MemeEngineService implements OnModuleInit {
     fs.writeFileSync(pngPath, render.pngBuffer);
     fs.writeFileSync(jpegPath, render.jpegBuffer);
     this.warmThumbnails(memeId, version, jpegPath);
+    this.persistImageBuffers(memeId, version, render.jpegBuffer, render.pngBuffer, undefined, subjectImages);
     return { outputPaths: { png: pngPath, jpeg: jpegPath }, outputUrls: { png: `/output/${pngFilename}`, jpeg: `/output/${jpegFilename}` } };
+  }
+
+  /**
+   * Persists binary image buffers into MongoDB so they survive ephemeral container restarts (e.g. Render).
+   */
+  async persistImageBuffers(
+    memeId: string,
+    version: number,
+    jpeg: Buffer,
+    png?: Buffer,
+    thumb?: Buffer,
+    subjectImages?: UploadedAsset[]
+  ): Promise<void> {
+    if (!this.memeImageModel) return;
+    try {
+      const subjects: { index: number; data: Buffer; mime: string }[] = [];
+      if (subjectImages && Array.isArray(subjectImages)) {
+        for (let i = 0; i < subjectImages.length; i++) {
+          const img = subjectImages[i];
+          if (img?.path && fs.existsSync(img.path)) {
+            try {
+              const buf = fs.readFileSync(img.path);
+              subjects.push({ index: i, data: buf, mime: img.mimeType || 'image/jpeg' });
+            } catch {}
+          }
+        }
+      }
+
+      await this.memeImageModel.updateOne(
+        { memeId, version },
+        {
+          $set: {
+            memeId,
+            version,
+            jpeg,
+            ...(png ? { png } : {}),
+            ...(thumb ? { thumb } : {}),
+            ...(subjects.length > 0 ? { subjects } : {})
+          }
+        },
+        { upsert: true }
+      );
+      this.logger.debug(`Persisted meme image ${memeId} v${version} to MongoDB.`);
+    } catch (err: any) {
+      this.logger.warn(`Failed to persist meme ${memeId} v${version} to MongoDB: ${err?.message || err}`);
+    }
+  }
+
+  /**
+   * Retrieves binary image buffer from MongoDB for a given meme version.
+   */
+  async getImageBuffer(memeId: string, version = 1, format: 'jpeg' | 'png' = 'jpeg'): Promise<Buffer | null> {
+    if (!this.memeImageModel) return null;
+    try {
+      const selectField = format === 'png' ? '+png +jpeg' : '+jpeg';
+      const img = await this.memeImageModel.findOne({ memeId, version }).select(selectField).lean().exec();
+      if (!img) return null;
+      if (format === 'png') {
+        return (img as any).png || (img as any).jpeg || null;
+      }
+      return (img as any).jpeg || null;
+    } catch (err: any) {
+      this.logger.warn(`Failed to get image buffer for ${memeId} v${version}: ${err?.message || err}`);
+      return null;
+    }
   }
 
   /**
@@ -365,7 +467,7 @@ export class MemeEngineService implements OnModuleInit {
     const memeType = input.layout?.memeType || 'trending_news';
 
     const { computed, render, headerHeightRatio, attempts } = await this.layoutAndRender(fullDesign, { ...input.layout, memeType }, input.content, input.assets, ratios);
-    const outputs = this.writeOutputs(memeId, 1, render);
+    const outputs = this.writeOutputs(memeId, 1, render, input.assets.subjectImages);
 
     const fullLayout: LayoutConfiguration = {
       memeType,
@@ -538,7 +640,7 @@ export class MemeEngineService implements OnModuleInit {
     if (computed.headerBox) updatedLayout.headerHeightRatio = Math.round((computed.headerBox.height / computed.canvasHeight) * 1000) / 1000;
 
     const nextVersion = Math.max(meme.currentVersion || 1, ...(meme.versions || []).map(v => v.versionNumber || 0)) + 1;
-    const outputs = this.writeOutputs(memeId, nextVersion, render);
+    const outputs = this.writeOutputs(memeId, nextVersion, render, assets.subjectImages);
 
     meme.currentVersion = nextVersion;
     meme.design = updatedDesign as any;
@@ -702,7 +804,7 @@ export class MemeEngineService implements OnModuleInit {
       const { render } = await layoutAndRender(this.layoutEngine, this.canvasRenderer, design, layout, content, newAssets, ratios);
 
       const nextVersion = Math.max(meme.currentVersion || 1, ...(meme.versions || []).map(v => v.versionNumber || 0)) + 1;
-      const outputs = this.writeOutputs(memeId, nextVersion, render);
+      const outputs = this.writeOutputs(memeId, nextVersion, render, newAssets.subjectImages);
       meme.currentVersion = nextVersion;
       meme.assets = newAssets as any;
       meme.outputPaths = outputs.outputPaths;
@@ -808,6 +910,13 @@ export class MemeEngineService implements OnModuleInit {
     }
 
     await this.memeModel.deleteOne({ memeId }).exec();
+    if (this.memeImageModel) {
+      try {
+        await this.memeImageModel.deleteMany({ memeId }).exec();
+      } catch (err: any) {
+        this.logger.warn(`Could not delete meme images for ${memeId}: ${err?.message || err}`);
+      }
+    }
     return { success: true, message: `Meme ${memeId} and its associated version assets deleted safely.` };
   }
 }
