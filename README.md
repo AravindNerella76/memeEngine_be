@@ -119,6 +119,10 @@ The review message is the meme with three reply buttons: **Publish**, **Change p
 - **Change punchline** asks for the owner's own new words and re-renders the same pictures and style as the meme's next version (`MemeEngineService.changePunchline`: the words are only trimmed; older versions are never touched). `Cancel` goes back to the meme.
 - **Caption.** The Instagram caption is built like the studio's (`services/instagram-caption.ts`: punchline, headline, topic, follow line, hashtags, within 2200 characters). `Caption: your text` replaces it; swapping a picture keeps an own caption.
 
+## Emoji in meme text
+
+The server draws the text, so emoji must not depend on the machine having an emoji font (flags came out as the letters "IN", recent emoji as empty boxes, and a Linux host without an emoji font drew none). `fonts/NotoColorEmoji.ttf` (Google's Noto Color Emoji, SIL Open Font License; notice in `fonts/NotoColorEmoji.NOTICE.txt`) is registered with the other fonts and sits last in every font stack (`CanvasRendererService.fontFor`), so it only draws characters the meme fonts do not have: letters, digits, symbols and Telugu are drawn exactly as before. It is a 25 MB file, so the fonts folder must be part of what you deploy (it already has to be). Not offered as a choice in Settings. `tests/emoji.test.ts` draws real emoji through the renderer and looks for colours only a real emoji glyph produces.
+
 ## Manual memes in the studio: live preview
 
 `POST /api/memes/upload-and-preview` takes exactly the body of `upload-and-generate` and answers `{ image, width, height }`: the meme laid out and rendered as it will be, **in memory**. No record is saved, no file is kept (the uploaded copies are deleted whatever happens), so trying a change leaves nothing in My Memes. At most two previews are drawn at once (`429` otherwise). The Create page redraws it a moment after you stop typing, sending the pictures at preview size (same proportions), and shows what the engine objects to (a headline that cannot fit) before you press Generate.

@@ -186,7 +186,13 @@ export function legacyRenderStyle(specs: DesignSpecifications): RenderStyle {
       // bullets were drawn with the renderer's built-in shadow, not the design's
       bullets: { ...el(42, 22, 1.2, primary), shadowCss: 'rgba(0,0,0,0.92)', shadowBlur: 8 },
       reactionContext: { ...el(34, 20, 1.1, primary), strokeWidth: specs.outlineThickness || 7 },
-      punchline: el(46, 24, 1.17, primary)
+      punchline: {
+        ...el(46, 24, 1.15, primary),
+        strokeWidth: typeof specs.outlineThickness === 'number' ? specs.outlineThickness : 4,
+        shadowBlur: typeof specs.shadowBlur === 'number' ? specs.shadowBlur : 13,
+        shadowOffsetX: 0,
+        shadowOffsetY: 0
+      }
     },
     canvas: { background: '#000000', headerBackground: specs.headerBgColor || '#000000', cornerRadius: 0, outputScale: 1, punchlineMaxGrowRatio: 0.62, maxHeaderRatio: 0.2 },
     image: { subjectFit: specs.subjectFit || 'cover', reactionFit: 'cover', portraitAnchorY: 0.28, landscapeAnchorY: 0.4, reactionAnchorY: 0.36, useFocalPoint: true, jpegQuality: null }

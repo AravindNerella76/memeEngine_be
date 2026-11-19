@@ -192,11 +192,24 @@ export function defaultSettings(env?: AppConfig): AppSettings {
         heading: typo(48, 26, 1.08),
         labels: typo(33, 18, 1.2),
         supporting: typo(38, 22, 1.17),
-        punchline: typo(46, 24, 1.17),
+        punchline: typo(46, 24, 1.15),
         caption: typo(34, 20, 1.1)
       }
     },
-    effects: { roles: { heading: fx(), labels: fx(), supporting: fx(), punchline: fx(), caption: fx() } },
+    effects: {
+      roles: {
+        heading: fx(),
+        labels: fx(),
+        supporting: fx(),
+        punchline: {
+          fill: { color: '#FFFFFF', opacity: 1 },
+          highlight: { enabled: true, color: '#FFE500' },
+          stroke: { enabled: true, width: 4, color: '#000000', opacity: 1 },
+          shadow: { enabled: true, color: '#000000', blur: 13, offsetX: 0, offsetY: 0, opacity: 1 }
+        },
+        caption: fx()
+      }
+    },
     canvas: {
       aspect: 'portrait_4_5',
       outputScale: 1,

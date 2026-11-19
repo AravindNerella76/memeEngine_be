@@ -11,7 +11,7 @@ import {
 } from '../types/meme.types';
 import { ComputedMemeLayout } from './layout-engine.service';
 import { analyzeReactionImage, drawReactionPlan, drawSoftBackground, planReactionPanel } from './reaction-framing';
-import { ENGLISH_FONTS, FONT_FILES, TELUGU_FONTS } from '../design/fonts';
+import { EMOJI_FONT, ENGLISH_FONTS, FONT_FILES, TELUGU_FONTS } from '../design/fonts';
 import { ElementStyle, RenderStyle, resolveRenderStyle } from '../design/render-style';
 
 export interface RenderResult {
@@ -316,10 +316,10 @@ export class CanvasRendererService implements OnModuleInit {
     const weight = el.weight || 'bold';
     if (this.isTeluguScript(text)) {
       const teluguFont = el.teluguFont || (style as DesignSpecifications).teluguFontFamily || 'Ramabhadra';
-      return `${weight} ${size}px "${teluguFont}", "Noto Sans Telugu", sans-serif`;
+      return `${weight} ${size}px "${teluguFont}", "Noto Sans Telugu", "${EMOJI_FONT}", sans-serif`;
     }
     const engFont = el.englishFont || (style as DesignSpecifications).fontFamily || 'Arial Black';
-    return `${weight} ${size}px "${engFont}", "Intrepid ExtraBold", "Anton", sans-serif`;
+    return `${weight} ${size}px "${engFont}", "Intrepid ExtraBold", "Anton", "${EMOJI_FONT}", sans-serif`;
   }
 
   /** Kept for compatibility: applies the global scale to a base size. */
@@ -371,6 +371,95 @@ export class CanvasRendererService implements OnModuleInit {
     fit.lines.forEach((line, idx) => {
       ctx.font = this.fontFor(line, el, fit.size);
       const color = el.highlightCss && highlightLine(idx, line) ? el.highlightCss : el.fillCss;
+      this.drawStyledText(ctx, line, x, startY + idx * fit.lineH, el, color);
+    });
+  }
+
+  /**
+   * Reaction punchline drawing:
+   * - Anchored low on the reaction image panel (near bottom).
+   * - 4px stroke with 13px blur shadow (matching house style).
+   * - Multi-line hierarchy: when 2 lines are present, line 1 is setup (yellow highlight, ~74% font size),
+   *   and line 2 is the punchline delivery (white fill, 100% font size, larger than line 1).
+   */
+  private drawPunchline(ctx: SKRSContext2D, fit: FitResult, box: BoundingBox, el: ElementStyle) {
+    const lines = fit.lines;
+    const x = this.anchorX(box, el);
+
+    // Single line punchline: render with standard position & highlight/fill
+    if (lines.length <= 1) {
+      const line = lines[0] || '';
+      const lineH = Math.round(fit.size * el.lineHeight);
+      const bottomY = box.y + box.height - 8;
+      const y = el.position === 'middle' ? box.y + box.height / 2 : bottomY - lineH / 2;
+      ctx.font = this.fontFor(line, el, fit.size);
+      const color = el.highlightCss || el.fillCss;
+      this.drawStyledText(ctx, line, x, y, el, color);
+      return;
+    }
+
+    // Two lines: line 2 is distinctly larger than line 1 (~1.35x), with line 1 in yellow and line 2 in white
+    if (lines.length === 2) {
+      const line1 = lines[0];
+      const line2 = lines[1];
+
+      let size2 = fit.size;
+      let size1 = Math.max(el.minSize, Math.round(size2 * 0.74));
+
+      // Ensure line 2 fits horizontally within box.width
+      ctx.font = this.fontFor(line2, el, size2);
+      const w2 = ctx.measureText(line2).width;
+      if (w2 > box.width) {
+        size2 = Math.max(el.minSize, Math.floor(size2 * (box.width / w2)));
+        size1 = Math.max(el.minSize, Math.round(size2 * 0.74));
+      }
+
+      // Ensure line 1 fits horizontally within box.width
+      ctx.font = this.fontFor(line1, el, size1);
+      const w1 = ctx.measureText(line1).width;
+      if (w1 > box.width) {
+        size1 = Math.max(el.minSize, Math.floor(size1 * (box.width / w1)));
+      }
+
+      const h1 = Math.round(size1 * el.lineHeight);
+      const h2 = Math.round(size2 * el.lineHeight);
+      const totalH = h1 + h2;
+
+      // Position anchored low on reaction image (bottom of box with 8px margin)
+      const bottomY = box.y + box.height - 8;
+      let y1: number;
+      let y2: number;
+
+      if (el.position === 'middle') {
+        const startY = box.y + (box.height - totalH) / 2 + h1 / 2;
+        y1 = startY;
+        y2 = startY + h1 / 2 + h2 / 2;
+      } else {
+        // 'bottom': line 2 sits right near the bottom margin, line 1 stacked directly above
+        y2 = bottomY - h2 / 2;
+        y1 = y2 - h2 / 2 - h1 / 2;
+      }
+
+      // Draw Line 1 (Yellow setup)
+      ctx.font = this.fontFor(line1, el, size1);
+      const color1 = el.highlightCss || '#FFE500';
+      this.drawStyledText(ctx, line1, x, y1, el, color1);
+
+      // Draw Line 2 (White punchline, larger)
+      ctx.font = this.fontFor(line2, el, size2);
+      const color2 = el.fillCss || '#FFFFFF';
+      this.drawStyledText(ctx, line2, x, y2, el, color2);
+      return;
+    }
+
+    // 3 or more lines: progressive scaling with last line largest
+    const startY = this.firstLineY(box, fit.lines.length * fit.lineH, fit.lineH, el);
+    lines.forEach((line, idx) => {
+      const isLast = idx === lines.length - 1;
+      const scaleFactor = isLast ? 1.0 : 0.75 + (idx / lines.length) * 0.15;
+      const lineSize = Math.max(el.minSize, Math.round(fit.size * scaleFactor));
+      ctx.font = this.fontFor(line, el, lineSize);
+      const color = idx === 0 && el.highlightCss ? el.highlightCss : el.fillCss;
       this.drawStyledText(ctx, line, x, startY + idx * fit.lineH, el, color);
     });
   }
@@ -590,7 +679,7 @@ export class CanvasRendererService implements OnModuleInit {
         throw new TextFitError('punchline', `The punchline (${punchText.length} characters) is too long to render legibly in the reaction panel. It is never shortened automatically; please use a shorter punchline.`);
       }
       textFit.punchline = { size: fit.size, lines: fit.lines.length };
-      this.drawFitted(ctx, fit, box, el, idx => idx === 0);
+      this.drawPunchline(ctx, fit, box, el);
     }
 
     this.validateOutput(ctx, layout, assets, scale);

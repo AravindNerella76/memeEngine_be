@@ -1,0 +1,16 @@
+NotoColorEmoji.ttf
+==================
+
+Noto Color Emoji, by Google (the Noto project, https://github.com/googlefonts/noto-emoji).
+Licensed under the SIL Open Font License, Version 1.1 (https://openfontlicense.org).
+Copyright Google Inc. All Rights Reserved.
+
+Why it is here: meme text is drawn on the server. Without a bundled emoji font, an emoji only appears if the machine
+running the server happens to have one: flags and recent emoji come out as letters or empty boxes, and a Linux host
+without an emoji font draws none at all. The renderer lists this font after the meme fonts, so it is used only for
+characters the meme fonts do not have.
+
+Under the OFL the font may be bundled and redistributed with software, but it may not be sold on its own, and the
+license text must accompany it: see the link above.
+
+Obtained from the npm package @expo-google-fonts/noto-color-emoji 0.4.8 (400Regular/NotoColorEmoji_400Regular.ttf).

@@ -131,4 +131,15 @@ describe('engine: change the punchline / preview a manual meme', () => {
     });
     assert.deepEqual([square.width, square.height], [1080, 1080]);
   });
+
+  it('renders 2-line punchline with larger second line and positioned down on reaction image', async () => {
+    const twoLines = await engine.previewManual({
+      content: { topic: 'test', headline: 'HEAD', punchline: 'MALLI NOVEMBER EH\nMALLI NOVEMBER EH' },
+      assets: assets(),
+      design: { canvasPreset: 'portrait_4_5' } as any,
+      layout: { memeType: 'comparison' }
+    });
+    assert.deepEqual([twoLines.width, twoLines.height], [1080, 1350]);
+    assert.match(twoLines.image, /^data:image\/jpeg;base64,/);
+  });
 });

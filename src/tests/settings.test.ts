@@ -46,8 +46,8 @@ describe('settings model', () => {
       name: '@kanyaraasi_memes house style',
       canvas: { preset: 'portrait_4_5', width: 1080, height: 1350 },
       typography: { englishFont: 'Arial Black', teluguFont: 'Ramabhadra', fontSizeScale: 1, textScales: {} },
-      colors: { primary: '#FFE500', secondary: '#FFFFFF', headerBackground: '#000000', headerText: '#FFE500', outline: '#000000', shadow: 'rgba(0,0,0,0.95)' },
-      effects: { outlineThickness: 8, shadowBlur: 8, shadowOffsetX: 3, shadowOffsetY: 3 },
+      colors: { primary: '#FFE500', secondary: '#FFFFFF', headerBackground: '#000000', headerText: '#FFE500', outline: '#000000', shadow: '#000000' },
+      effects: { outlineThickness: 4, shadowBlur: 13, shadowOffsetX: 0, shadowOffsetY: 0 },
       imagery: { subjectAspectPreference: [0.75, 0.667], reactionAspect: 16 / 9, gaps: 0, dividerLines: false, borders: false },
       layout: { headerHeightRatio: 0.082 }
     });
@@ -187,14 +187,14 @@ describe('render style', () => {
   });
 
   it('new memes use their snapshot; values changed by regeneration apply to every role', () => {
-    const design = designFromSettings(withPatch({ effects: { roles: { caption: { stroke: { width: 4 } } } } }));
+    const design = designFromSettings(withPatch({ effects: { roles: { caption: { stroke: { width: 2 } } } } }));
     const st = resolveRenderStyle(design);
     assert.equal(st.legacy, false);
-    assert.equal(st.elements.reactionContext.strokeWidth, 4);
-    const regen = resolveRenderStyle({ ...design, fontFamily: 'Anton', outlineThickness: 16, primaryTextColor: '#00FF00', shadowColor: 'rgba(255,0,0,0.5)' });
+    assert.equal(st.elements.reactionContext.strokeWidth, 2);
+    const regen = resolveRenderStyle({ ...design, fontFamily: 'Anton', outlineThickness: 8, primaryTextColor: '#00FF00', shadowColor: 'rgba(255,0,0,0.5)' });
     assert.ok(Object.values(regen.elements).every(e => e.englishFont === 'Anton'));
-    assert.equal(regen.elements.punchline.strokeWidth, 16, 'outline doubled (8 -> 16)');
-    assert.equal(regen.elements.reactionContext.strokeWidth, 8, 'proportional: the caption 4 -> 8');
+    assert.equal(regen.elements.punchline.strokeWidth, 8, 'outline doubled (4 -> 8)');
+    assert.equal(regen.elements.reactionContext.strokeWidth, 4, 'proportional: the caption 2 -> 4');
     assert.equal(regen.elements.punchline.highlightCss, '#00FF00');
     assert.equal(regen.elements.headline.highlightCss, '#FFE500', 'the heading keeps its own highlight colour');
     assert.equal(regen.elements.punchline.shadowCss, 'rgba(255,0,0,0.5)');
