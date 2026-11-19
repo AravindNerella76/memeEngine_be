@@ -30,6 +30,22 @@ signed in once (run `agy` in a terminal). Settings: copy `.env.example` to `.env
 Every meme stores a **generation report** (analysis, identity decisions, queries, candidates,
 rejections with reasons, licences, timings): `GET /api/memes/:id/report`.
 
+### Running it in the background, with live progress
+
+The app does not wait on one long request. It starts the same pipeline as a job and watches it:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/memes/adapt-viral/jobs` | same multipart body and validation as `adapt-viral`; answers `202` at once with the job (`429` if one is already running) |
+| `GET /api/memes/adapt-viral/jobs/:jobId` | the job now: `status` (`running` / `done` / `failed`), `elapsedMs`, the four `stages` (`analysis`, `identity`, `discovery`, `render`) with their state and a note, each picture `slot` with its own state, a short `log`, and when finished the `result` (the same body `adapt-viral` returns) or the `error` (the same `message` and `details`) |
+| `GET /api/memes/adapt-viral/jobs/active` | `{ job }`: the one still running, so a refreshed page or another device can pick it up |
+
+Progress is reported by the pipeline itself at each real boundary (a stage began, a picture was found for slot 2:
+counts and a provider name, never titles or links), not estimated. Jobs live in memory for 30 minutes after they
+finish; a server restart loses only the progress view, never a finished meme (it is saved by the pipeline).
+`POST /api/memes/adapt-viral` still works unchanged (one long request), and the WhatsApp bot calls the pipeline
+directly, so neither is affected.
+
 ## Settings (`/api/settings`, frontend `/settings`)
 
 One record in the existing `design_profiles` collection (`profileId: kanyaraasi-default`) holds
@@ -86,6 +102,26 @@ The bot walks the same steps as the app: reference screenshot, reaction image, p
 - **Pictures are uploaded to WhatsApp** (Cloud API media upload, then sent by media id), so a finished meme or a sheet arrives whatever the server's public address is. Only if the upload fails is the picture sent as a link to `PUBLIC_BASE_URL`, which WhatsApp must then be able to download. Meta accepts such a link and fails later, so the bot also listens to delivery-status webhooks: a failed delivery is logged with Meta's reason, and when a picture could not be loaded the user is told once (look in *My Memes*) instead of getting nothing.
 - Picture sheets are also written to the output folder as `wa_sheet_*.jpg` (older than 6 hours are removed), for the link fallback.
 - Code: `services/whatsapp.service.ts` (conversation), `services/whatsapp-reaction-ui.ts` (sheets, choices, answers; pure and tested).
+
+### Reliability: one line per person, one run per meme
+
+- **Messages are handled in the order they were sent, one at a time per person.** Meta delivers messages in separate requests that can overlap; handled at once, several photos sent together were saved in the order they finished downloading and two replies could overwrite each other's changes. Each person now has a line (`inLane`).
+- **A meme being made does not freeze the chat.** The line is released when a generation starts, so `Status`, `Reset` and any other message are answered meanwhile (`Status` shows the elapsed time and what the engine is doing). Each person has at most one run (`runs`, in memory): `Reset`/`Discard` cancels it, and a result that arrives after that is saved in the studio but never delivered into the fresh chat.
+- **Progress is told as it happens**, from the pipeline's real stages (who was identified, each picture as it is found, "setting your punchline"), always before the meme itself. After 75 s of quiet it says it is still working, and the typing indicator is refreshed every 20 s (`status: read` + `typing_indicator`, best effort).
+- **A restart or a failure never leaves the chat stuck.** A session found in `GENERATING` with no run in memory (the server restarted) is detected on the next message and moved to `AWAITING_RETRY`; a failed generation also goes there, with every input kept. `Retry` runs it again; any other text is taken as a new punchline and runs it with that. (A restart-notice message is not itself mistaken for a punchline.)
+- **No dead ends.** A message with no meaning in the current state (free text under a finished meme, a picture while busy, a voice note) is answered with where things stand and what to do next. Emoji reactions to a message are ignored on purpose.
+
+### Under a finished meme
+
+The review message is the meme with three reply buttons: **Publish**, **Change punchline**, **Discard** (WhatsApp allows three buttons of up to 20 characters under a picture; if they cannot be sent, the old picture-with-commands message is used). Button ids carry the meme (`pub:<id>`, `pl:<id>`, `no:<id>`), so a tap on an older meme's buttons never acts on a newer one.
+
+- **Only `Approve`, `Publish` or the Publish button publish.** A casual `ok`, `yes` or 👍 never posts to Instagram: it is answered with how to publish.
+- **Change punchline** asks for the owner's own new words and re-renders the same pictures and style as the meme's next version (`MemeEngineService.changePunchline`: the words are only trimmed; older versions are never touched). `Cancel` goes back to the meme.
+- **Caption.** The Instagram caption is built like the studio's (`services/instagram-caption.ts`: punchline, headline, topic, follow line, hashtags, within 2200 characters). `Caption: your text` replaces it; swapping a picture keeps an own caption.
+
+## Manual memes in the studio: live preview
+
+`POST /api/memes/upload-and-preview` takes exactly the body of `upload-and-generate` and answers `{ image, width, height }`: the meme laid out and rendered as it will be, **in memory**. No record is saved, no file is kept (the uploaded copies are deleted whatever happens), so trying a change leaves nothing in My Memes. At most two previews are drawn at once (`429` otherwise). The Create page redraws it a moment after you stop typing, sending the pictures at preview size (same proportions), and shows what the engine objects to (a headline that cannot fit) before you press Generate.
 
 ## Replacing images (no manual editor)
 

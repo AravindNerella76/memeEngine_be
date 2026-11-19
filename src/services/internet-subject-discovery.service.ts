@@ -21,7 +21,7 @@ import {
 import { getConfig, getEnvConfig } from '../config/app-config';
 import { politeFetch } from '../security/polite-fetch';
 import { VisionCliRunner } from '../vision/vision-cli.runner';
-import { DiscoveryEngine, DiscoveryRunResult, rightsForCandidate } from '../discovery/discovery-engine';
+import { DiscoveryEngine, DiscoveryRunResult, SlotProgressListener, rightsForCandidate } from '../discovery/discovery-engine';
 import { rightsAllowed } from '../discovery/rights';
 import { ImageCandidate } from '../discovery/discovery.types';
 import { SlotDiscoveryPlan, ImageSearchProvider } from '../discovery/discovery.types';
@@ -172,7 +172,8 @@ export class InternetSubjectDiscoveryService implements OnModuleInit {
   async discoverForSlots(
     plans: SlotDiscoveryPlan[],
     referencePath: string | null,
-    enabledProviderIds?: string[]
+    enabledProviderIds?: string[],
+    onSlot?: SlotProgressListener
   ): Promise<DiscoveryRunResult> {
     const cfg = getConfig();
     let providers = this.getProviders();
@@ -196,7 +197,7 @@ export class InternetSubjectDiscoveryService implements OnModuleInit {
       log: m => this.logger.log(m),
       rightsLookup: this.rightsLookup
     });
-    return engine.run(plans, referencePath);
+    return engine.run(plans, referencePath, onSlot);
   }
 
   /**

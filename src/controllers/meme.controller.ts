@@ -11,7 +11,8 @@ import {
   UseInterceptors,
   UploadedFiles,
   Res,
-  HttpCode
+  HttpCode,
+  HttpException
 } from '@nestjs/common';
 import { FileFieldsInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
@@ -54,6 +55,20 @@ import {
   validateViralOverrides
 } from '../security/request-validation';
 import type { ReactionFraming } from '../services/reaction-framing';
+import { AdaptationJobService } from '../services/adaptation-job.service';
+import type { ProgressSink } from '../jobs/adaptation-progress';
+
+/** A viral adaptation request after validation (shared by the synchronous endpoint and the background job). */
+interface ViralRequest {
+  refFile: MulterUploadedFile | undefined;
+  rxFile: MulterUploadedFile;
+  punchline: string;
+  reactionContext: string | undefined;
+  preferredFont: string | undefined;
+  selectedProviders?: string[];
+  own: { draftId?: string; overrides?: { slot: number; token: string }[] };
+  reactionFraming?: ReactionFraming;
+}
 
 export interface MulterUploadedFile {
   fieldname: string;
@@ -161,7 +176,8 @@ export class MemeController {
   constructor(
     private readonly memeEngine: MemeEngineService,
     private readonly viralAdaptation: ViralAdaptationService,
-    private readonly thumbnails: ThumbnailService
+    private readonly thumbnails: ThumbnailService,
+    private readonly jobs: AdaptationJobService
   ) {}
 
   /**
@@ -390,50 +406,91 @@ export class MemeController {
   ) {
     const uploaded = flattenUploads(files);
     try {
-      await verifyAndNormalizeUploads(uploaded);
-      const { content, design, layout, subjectLabels } = validateUploadPayload(rawPayload);
-
-      const subjectImages: UploadedAsset[] = [];
-      (files?.subjectImages || []).forEach((f, idx) => {
-        subjectImages.push({
-          id: randomUUID(),
-          originalName: sanitizeDisplayName(f.originalname),
-          filename: f.filename,
-          path: f.path,
-          mimeType: f.mimetype,
-          role: idx === 0 ? 'subject_primary' : (idx === 1 ? 'subject_secondary' : 'subject_item'),
-          orderIndex: idx,
-          label: subjectLabels[idx] || undefined
-        });
-      });
-
-      let reactionImage: UploadedAsset | undefined;
-      if (files?.reactionImage && files.reactionImage.length > 0) {
-        const rx = files.reactionImage[0];
-        reactionImage = {
-          id: randomUUID(),
-          originalName: sanitizeDisplayName(rx.originalname),
-          filename: rx.filename,
-          path: rx.path,
-          mimeType: rx.mimetype,
-          role: 'reaction_punchline',
-          orderIndex: 99
-        };
-      }
-
-      return await this.memeEngine.generateMeme({
-        content,
-        assets: {
-          subjectImages,
-          reactionImage
-        },
-        design,
-        layout
-      });
+      return await this.memeEngine.generateMeme(await this.assembleManual(files, rawPayload, uploaded));
     } catch (err) {
       discardUploads(uploaded);
       throw err;
     }
+  }
+
+  private previewsRunning = 0;
+
+  /**
+   * A real preview of a meme being built by hand (same body as upload-and-generate): rendered exactly as it will be,
+   * in memory. Nothing is saved, and the uploaded copies are deleted whatever happens.
+   */
+  @Post('upload-and-preview')
+  @HttpCode(200)
+  @UseInterceptors(
+    FileFieldsInterceptor(
+      [
+        { name: 'subjectImages', maxCount: 10 },
+        { name: 'reactionImage', maxCount: 1 }
+      ],
+      uploadOptions
+    )
+  )
+  async uploadAndPreview(
+    @UploadedFiles()
+    files: {
+      subjectImages?: MulterUploadedFile[];
+      reactionImage?: MulterUploadedFile[];
+    },
+    @Body('payload') rawPayload: unknown
+  ) {
+    const uploaded = flattenUploads(files);
+    try {
+      // a few at a time: the page asks again as the person types, and renders are heavy
+      if (this.previewsRunning >= 2) throw new HttpException({ statusCode: 429, message: 'A preview is already being drawn. Try again in a moment.' }, 429);
+      this.previewsRunning++;
+      try {
+        return await this.memeEngine.previewManual(await this.assembleManual(files, rawPayload, uploaded));
+      } finally {
+        this.previewsRunning--;
+      }
+    } finally {
+      discardUploads(uploaded);
+    }
+  }
+
+  /** The uploaded pictures and the JSON payload of the manual form, checked and put together. */
+  private async assembleManual(
+    files: { subjectImages?: MulterUploadedFile[]; reactionImage?: MulterUploadedFile[] },
+    rawPayload: unknown,
+    uploaded: MulterUploadedFile[]
+  ) {
+    await verifyAndNormalizeUploads(uploaded);
+    const { content, design, layout, subjectLabels } = validateUploadPayload(rawPayload);
+
+    const subjectImages: UploadedAsset[] = [];
+    (files?.subjectImages || []).forEach((f, idx) => {
+      subjectImages.push({
+        id: randomUUID(),
+        originalName: sanitizeDisplayName(f.originalname),
+        filename: f.filename,
+        path: f.path,
+        mimeType: f.mimetype,
+        role: idx === 0 ? 'subject_primary' : (idx === 1 ? 'subject_secondary' : 'subject_item'),
+        orderIndex: idx,
+        label: subjectLabels[idx] || undefined
+      });
+    });
+
+    let reactionImage: UploadedAsset | undefined;
+    if (files?.reactionImage && files.reactionImage.length > 0) {
+      const rx = files.reactionImage[0];
+      reactionImage = {
+        id: randomUUID(),
+        originalName: sanitizeDisplayName(rx.originalname),
+        filename: rx.filename,
+        path: rx.path,
+        mimeType: rx.mimetype,
+        role: 'reaction_punchline',
+        orderIndex: 99
+      };
+    }
+
+    return { content, assets: { subjectImages, reactionImage }, design, layout };
   }
 
   /**
@@ -482,46 +539,12 @@ export class MemeController {
       referenceImage?: MulterUploadedFile[];
       reactionImage?: MulterUploadedFile[];
     },
-    @Body('punchline') punchline?: unknown,
-    @Body('reactionContext') reactionContext?: unknown,
-    @Body('fontFamily') preferredFont?: unknown,
-    @Body('selectedProviders') selectedProviders?: unknown,
-    @Body('draftId') draftId?: unknown,
-    @Body('slotOverrides') slotOverrides?: unknown,
-    @Body('reactionFraming') reactionFraming?: unknown
+    @Body() body?: Record<string, unknown>
   ) {
     const uploaded = flattenUploads(files);
     try {
-      const own = validateViralOverrides({ draftId, slotOverrides });
-      const framing = validateReactionFraming(reactionFraming);
-      if (!own.draftId && (!files?.referenceImage || files.referenceImage.length === 0)) {
-        throw new BadRequestException('Input 1 missing: Viral Meme Reference screenshot is required.');
-      }
-      if (!files?.reactionImage || files.reactionImage.length === 0) {
-        throw new BadRequestException('Input 2 missing: Meme Reacting Image is required.');
-      }
-      if (typeof punchline !== 'string' || !punchline.trim()) {
-        throw new BadRequestException('Input 3 missing: Reacting Image Text (punchline) is required.');
-      }
-      const fields = validateViralFields({
-        punchline,
-        reactionContext,
-        fontFamily: preferredFont,
-        selectedProviders
-      });
-
-      await verifyAndNormalizeUploads(uploaded);
-
-      return await this.runViralAdaptation(
-        own.draftId ? undefined : files.referenceImage![0],
-        files.reactionImage[0],
-        fields.punchline,
-        fields.reactionContext,
-        fields.fontFamily,
-        fields.selectedProviders,
-        own,
-        framing
-      );
+      const request = await this.prepareViralRequest(files, body, uploaded);
+      return await this.runViralAdaptation(request);
     } catch (err) {
       // Nothing references these files yet: do not leave rejected or failed uploads on disk
       discardUploads(uploaded);
@@ -529,16 +552,103 @@ export class MemeController {
     }
   }
 
-  private async runViralAdaptation(
-    refFile: MulterUploadedFile | undefined,
-    rxFile: MulterUploadedFile,
-    punchline: string,
-    reactionContext: string | undefined,
-    preferredFont: string | undefined,
-    selectedProviders?: string[],
-    own: { draftId?: string; overrides?: { slot: number; token: string }[] } = {},
-    reactionFraming?: ReactionFraming
+  /**
+   * The same adaptation, run in the background: answers at once with a job, and the app watches its real progress
+   * (GET adapt-viral/jobs/:jobId). It can leave the page, refresh or close the tab and still collect the meme.
+   * Validation is identical to adapt-viral, so a bad request is refused here, before any work starts.
+   */
+  @Post('adapt-viral/jobs')
+  @HttpCode(202)
+  @UseInterceptors(
+    FileFieldsInterceptor(
+      [
+        { name: 'referenceImage', maxCount: 1 },
+        { name: 'reactionImage', maxCount: 1 }
+      ],
+      uploadOptions
+    )
+  )
+  async startViralJob(
+    @UploadedFiles()
+    files: {
+      referenceImage?: MulterUploadedFile[];
+      reactionImage?: MulterUploadedFile[];
+    },
+    @Body() body?: Record<string, unknown>
   ) {
+    const uploaded = flattenUploads(files);
+    try {
+      const request = await this.prepareViralRequest(files, body, uploaded);
+      // checked in the same breath as the start (no await between), so two requests cannot both slip in
+      if (this.viralAdaptation.isBusy()) {
+        throw new HttpException({ statusCode: 429, message: 'Another meme is still being made. Wait for it to finish, then try again.' }, 429);
+      }
+      return this.jobs.start(
+        sink => this.runViralAdaptation(request, sink),
+        () => discardUploads(uploaded) // a failed run leaves nothing that references these files
+      );
+    } catch (err) {
+      discardUploads(uploaded);
+      throw err;
+    }
+  }
+
+  /** The meme being made right now, if any: lets the app pick its progress up again after a refresh or a closed tab. */
+  @Get('adapt-viral/jobs/active')
+  activeViralJob() {
+    return { job: this.jobs.active() ?? null };
+  }
+
+  @Get('adapt-viral/jobs/:jobId')
+  viralJob(@Param('jobId') jobId: string) {
+    const view = /^[0-9a-f-]{36}$/i.test(jobId) ? this.jobs.get(jobId) : undefined;
+    if (!view) {
+      throw new NotFoundException('That job is no longer known. If the server was restarted, a finished meme is still in My Memes.');
+    }
+    return view;
+  }
+
+  /** Validates the three inputs and the options, and checks what was uploaded really is an image. */
+  private async prepareViralRequest(
+    files: { referenceImage?: MulterUploadedFile[]; reactionImage?: MulterUploadedFile[] },
+    body: Record<string, unknown> | undefined,
+    uploaded: MulterUploadedFile[]
+  ): Promise<ViralRequest> {
+    const b = body || {};
+    const own = validateViralOverrides({ draftId: b.draftId, slotOverrides: b.slotOverrides });
+    const framing = validateReactionFraming(b.reactionFraming);
+    if (!own.draftId && (!files?.referenceImage || files.referenceImage.length === 0)) {
+      throw new BadRequestException('Input 1 missing: Viral Meme Reference screenshot is required.');
+    }
+    if (!files?.reactionImage || files.reactionImage.length === 0) {
+      throw new BadRequestException('Input 2 missing: Meme Reacting Image is required.');
+    }
+    if (typeof b.punchline !== 'string' || !b.punchline.trim()) {
+      throw new BadRequestException('Input 3 missing: Reacting Image Text (punchline) is required.');
+    }
+    const fields = validateViralFields({
+      punchline: b.punchline,
+      reactionContext: b.reactionContext,
+      fontFamily: b.fontFamily,
+      selectedProviders: b.selectedProviders
+    });
+
+    await verifyAndNormalizeUploads(uploaded);
+
+    return {
+      refFile: own.draftId ? undefined : files.referenceImage![0],
+      rxFile: files.reactionImage[0],
+      punchline: fields.punchline,
+      reactionContext: fields.reactionContext,
+      preferredFont: fields.fontFamily,
+      selectedProviders: fields.selectedProviders,
+      own,
+      reactionFraming: framing
+    };
+  }
+
+  private async runViralAdaptation(request: ViralRequest, onProgress?: ProgressSink) {
+    const { refFile, rxFile, punchline, reactionContext, preferredFont, selectedProviders, own, reactionFraming } = request;
     // The orchestrator runs: analysis -> identity -> internet discovery + visual verification ->
     // layout -> render -> persistence (with the generation report). The punchline is passed verbatim.
     const { meme, adaptationMetadata } = await this.viralAdaptation.adapt({
@@ -550,7 +660,8 @@ export class MemeController {
       reactionContext,
       fontFamily: preferredFont,
       selectedProviders,
-      reactionFraming
+      reactionFraming,
+      onProgress
     });
     const { generationReport, ...rest } = meme;
     return { ...rest, adaptationMetadata };

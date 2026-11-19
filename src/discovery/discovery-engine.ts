@@ -77,6 +77,16 @@ export class SlotDiscoveryError extends Error {
   }
 }
 
+/** What the engine tells a listener about the slot it is working on (counts and a provider id: no titles or links). */
+export interface SlotProgress {
+  slotId: string;
+  state: 'searching' | 'found' | 'failed';
+  provider?: string;
+  candidatesConsidered?: number;
+  visualChecks?: number;
+}
+export type SlotProgressListener = (e: SlotProgress) => void;
+
 export interface DiscoveryRunResult {
   assets: UploadedAsset[];
   reports: SlotDiscoveryReport[];
@@ -248,16 +258,32 @@ export class DiscoveryEngine {
     this.deps.log?.(msg);
   }
 
-  async run(plans: SlotDiscoveryPlan[], referencePath: string | null): Promise<DiscoveryRunResult> {
+  async run(plans: SlotDiscoveryPlan[], referencePath: string | null, onSlot?: SlotProgressListener): Promise<DiscoveryRunResult> {
     const runDir = path.join(this.deps.storageDir, `.run-${randomUUID()}`);
     fs.mkdirSync(runDir, { recursive: true });
     const reports: SlotDiscoveryReport[] = [];
     const visionCalls: VisionCallMeta[] = [];
     const selected: { slotId: string; plan: SlotDiscoveryPlan; ev: EvaluatedCandidate; info: DownloadInfo; url: string }[] = [];
+    // progress is a courtesy to the app: a listener that throws must never stop a search
+    const tell = (e: SlotProgress) => {
+      try {
+        onSlot?.(e);
+      } catch {
+        /* ignored */
+      }
+    };
     try {
       for (const plan of plans) {
+        tell({ slotId: plan.slotId, state: 'searching' });
         const r = await this.discoverSlot(plan, referencePath, runDir, selected, visionCalls);
         reports.push(r.report);
+        tell({
+          slotId: plan.slotId,
+          state: r.chosen ? 'found' : 'failed',
+          provider: r.chosen?.ev.candidate.provider,
+          candidatesConsidered: r.report.candidatesConsidered,
+          visualChecks: r.report.visualChecks
+        });
         if (!r.chosen) {
           throw new SlotDiscoveryError(this.failureMessage(plan, r.report), plan.slotId, reports, visionCalls);
         }

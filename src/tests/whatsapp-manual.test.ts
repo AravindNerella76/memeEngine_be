@@ -197,14 +197,22 @@ describe('WhatsApp viral flow asks for a missing picture', () => {
     assert.equal(t.doc.viralDraftId, null);
   });
 
-  it('still reports ordinary failures and resets to idle', async () => {
+  it('reports ordinary failures and keeps every input so "Retry" can run it again', async () => {
     const v = viralTest(false);
-    (v.t.svc as any).viralAdaptation.adapt = async () => { throw new Error('vision CLI crashed'); };
+    let fail = true;
+    const okMeme = { meme: { memeId: 'v9', outputUrls: { jpeg: '/output/v9.jpeg' }, content: { punchline: 'Line' } } };
+    (v.t.svc as any).viralAdaptation.adapt = async () => { if (fail) throw new Error('vision CLI crashed'); return okMeme; };
     await v.t.image('');
     await v.t.image('');
     await v.t.text('Line');
-    assert.equal(v.t.doc.state, 'IDLE');
-    assert.ok(v.t.sent.some(m => m.includes('Generation Failed') && m.includes('vision CLI crashed')));
+    assert.equal(v.t.doc.state, 'AWAITING_RETRY');
+    assert.ok(v.t.sent.some(m => m.includes('could not make that meme') && m.includes('vision CLI crashed') && m.includes('Retry')));
+    assert.ok(v.t.doc.referenceImagePath && v.t.doc.reactionImagePath && v.t.doc.punchline === 'Line', 'nothing the person sent is thrown away');
+
+    fail = false;
+    await v.t.text('retry');
+    assert.equal(v.t.doc.state, 'AWAITING_APPROVAL');
+    assert.equal(v.t.doc.lastGeneratedMemeId, 'v9');
   });
 
   it('asks again when another slot needs a picture, and rejects an unusable picture', async () => {

@@ -19,6 +19,7 @@ import { RegenerationService } from './services/regeneration.service';
 import { ViralMemeAnalyzerService } from './services/viral-meme-analyzer.service';
 import { InternetSubjectDiscoveryService } from './services/internet-subject-discovery.service';
 import { ViralAdaptationService } from './services/viral-adaptation.service';
+import { AdaptationJobService } from './services/adaptation-job.service';
 import { DesignProfileRecord, DesignProfileSchema, DesignProfileService } from './design/design-profile.service';
 import { Meme, MemeSchema } from './schemas/meme.schema';
 import { InstagramAccount, InstagramAccountSchema } from './schemas/instagram-account.schema';
@@ -89,6 +90,7 @@ import { getConfig } from './config/app-config';
     ViralMemeAnalyzerService,
     InternetSubjectDiscoveryService,
     ViralAdaptationService,
+    AdaptationJobService,
     DesignProfileService,
     SettingsPreviewService,
     ImageSelectionService,

@@ -4,6 +4,9 @@ import { Model } from 'mongoose';
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
+import { AsyncLocalStorage } from 'async_hooks';
+import type { ProgressSink } from '../jobs/adaptation-progress';
+import { buildCaption } from './instagram-caption';
 import { getConfig } from '../config/app-config';
 import { isAllowedPhone } from '../config/phone-list';
 import { WhatsAppSession, WhatsAppSessionDocument } from '../schemas/whatsapp-session.schema';
@@ -45,10 +48,70 @@ export interface ReceivedImage {
   convertedFrom: ConvertedFrom;
 }
 
+/** One meme being made for one person. Kept in memory: it ends with the process, which is how a restart is noticed. */
+interface Run {
+  id: number;
+  kind: 'viral' | 'manual';
+  startedAt: number;
+  /** Set when the person sent Reset: the result is dropped instead of being delivered. */
+  cancelled: boolean;
+  /** What the engine is doing now, in words (for "still working" answers). */
+  stage: string;
+  /** When the bot last wrote to the person (so a quiet stretch gets a short "still working"). */
+  lastSaid: number;
+}
+
+/** What each pipeline stage is called when talking to the person. */
+const STAGE_WORDS: Record<string, string> = {
+  analysis: 'reading your reference screenshot',
+  identity: 'working out who is who',
+  discovery: 'finding and checking pictures',
+  render: 'setting the type'
+};
+
+/** The session state in plain words ("Status" shows this, never the internal name). */
+const STATE_WORDS: Record<string, string> = {
+  IDLE: 'Ready for a new meme',
+  AWAITING_REACTION: 'Waiting for your reaction image',
+  AWAITING_PUNCHLINE: 'Waiting for your punchline',
+  GENERATING: 'Making your meme',
+  AWAITING_APPROVAL: 'Your meme is ready and waiting for you',
+  AWAITING_RETRY: 'Waiting for Retry',
+  AWAITING_NEW_PUNCHLINE: 'Waiting for your new punchline',
+  AWAITING_SLOT_IMAGE: 'Waiting for a picture of your own',
+  AWAITING_FRAMING: 'Waiting for you to choose a frame',
+  LIBRARY_FOLDERS: 'Browsing your reaction library',
+  LIBRARY_PICK: 'Choosing from your reaction library',
+  LAYOUT_EXAMPLE: 'Waiting for an example meme',
+  LAYOUT_ANALYZING: 'Learning a layout',
+  LAYOUT_NAME: 'Waiting for a layout name',
+  MANUAL_TYPE: 'Manual meme: choosing a layout',
+  MANUAL_HEADLINE: 'Manual meme: waiting for the headline',
+  MANUAL_STATEMENT: 'Manual meme: waiting for the statement',
+  MANUAL_SUBJECTS: 'Manual meme: collecting subject images',
+  MANUAL_REACTION: 'Manual meme: waiting for the reaction image',
+  MANUAL_PUNCHLINE: 'Manual meme: waiting for the punchline'
+};
+
+/** The honest version of the wait: a viral meme takes minutes, and the person is told as it goes. */
+const GENERATING_VIRAL_TEXT = '⏳ *Making your meme.* This usually takes 2–4 minutes: I read the reference, find and check the pictures, then set your punchline. I will message you as I go.';
+
+/** Say "still working" when this much quiet has passed during a run. */
+const QUIET_MS = 75_000;
+const TYPING_REFRESH_MS = 20_000;
+
 @Injectable()
 export class WhatsAppService {
   private readonly logger = new Logger(WhatsAppService.name);
   private readonly seenMessageIds = new Set<string>();
+  /** One line per person: their messages are handled one at a time, in the order they arrived. */
+  private readonly lanes = new Map<string, Promise<void>>();
+  private readonly laneStore = new AsyncLocalStorage<{ release: () => void }>();
+  /** The meme being made right now for each person. */
+  private readonly runs = new Map<string, Run>();
+  private runSeq = 0;
+  /** The last message id each person sent (the typing indicator answers a message). */
+  private readonly lastIncoming = new Map<string, string>();
   private readonly mediaDir = path.join(__dirname, '..', '..', 'uploads', 'whatsapp');
   /** Where picture sheets are written (served publicly under /output so WhatsApp can fetch them). */
   protected sheetDir = OUTPUT_ROOT;
@@ -390,6 +453,7 @@ export class WhatsAppService {
       return;
     }
 
+    const work: Promise<void>[] = [];
     for (const entry of body.entry) {
       for (const change of entry.changes || []) {
         if (change?.field === 'messages') {
@@ -404,13 +468,109 @@ export class WhatsAppService {
                 this.seenMessageIds.delete(this.seenMessageIds.values().next().value as string);
               }
             }
-            const from = msg.from;
-            await this.handleUserMessage(from, msg);
+            // Each person has one line: their messages are handled in the order they arrived, never at the same time
+            work.push(this.dispatch(msg.from, msg));
           }
           // Meta also reports what became of each message we sent (delivered, read, failed)
-          for (const st of value?.statuses || []) await this.handleStatus(st);
+          for (const st of value?.statuses || []) work.push(this.handleStatus(st));
         }
       }
+    }
+    await Promise.all(work);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // One line per person, and one run per meme
+  //
+  // Meta delivers messages in separate requests that can overlap. Handled at the same time, several photos sent together
+  // were saved in the order they finished downloading (not the order they were sent), and two replies could overwrite each
+  // other's changes to the session. So a person's messages go through a line, one at a time. A meme takes minutes to make,
+  // so the line is released as soon as the work starts: "status" and "reset" still answer meanwhile.
+  // ---------------------------------------------------------------------------------------------
+
+  private async inLane(phone: string, work: () => Promise<void>): Promise<void> {
+    const before = this.lanes.get(phone) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    const tail = before.then(() => gate);
+    this.lanes.set(phone, tail);
+    await before;
+    try {
+      await this.laneStore.run({ release }, work);
+    } finally {
+      release(); // safe to call again if the work already let go early
+      if (this.lanes.get(phone) === tail) this.lanes.delete(phone);
+    }
+  }
+
+  /** Lets the next message through while this one carries on (called when a long run starts). A no-op outside the line. */
+  private yieldLane(): void {
+    this.laneStore.getStore()?.release();
+  }
+
+  private async dispatch(from: string, msg: any): Promise<void> {
+    await this.inLane(String(from), async () => {
+      try {
+        await this.handleUserMessage(String(from), msg);
+      } catch (err: any) {
+        this.logger.error(`WhatsApp message from ${from} failed: ${err?.stack || err?.message || err}`);
+        await this.sendTextMessage(String(from), '⚠️ Something went wrong on my side. Please try again, or send *Reset* to start over.').catch(() => undefined);
+      }
+    });
+  }
+
+  private beginRun(phone: string, kind: 'viral' | 'manual'): Run {
+    const run: Run = { id: ++this.runSeq, kind, startedAt: Date.now(), cancelled: false, stage: 'starting', lastSaid: Date.now() };
+    this.runs.set(phone, run);
+    return run;
+  }
+
+  private endRun(phone: string, run: Run): void {
+    if (this.runs.get(phone) === run) this.runs.delete(phone);
+  }
+
+  /** Reset (or a new start) while a meme is being made: its result will be dropped, not delivered over the new chat. */
+  private cancelRun(phone: string): void {
+    const run = this.runs.get(phone);
+    if (run) {
+      run.cancelled = true;
+      this.runs.delete(phone);
+    }
+  }
+
+  /**
+   * While a run is going: after a quiet stretch say it is still working, and keep the "typing…" indicator alive.
+   * Returns the function that stops it. Never throws.
+   */
+  private watchRun(phone: string, run: Run): () => void {
+    const timer = setInterval(() => {
+      if (run.cancelled) return;
+      const idle = Date.now() - run.lastSaid;
+      if (idle >= QUIET_MS) {
+        run.lastSaid = Date.now();
+        const s = Math.round((Date.now() - run.startedAt) / 1000);
+        void this.sendTextMessage(phone, `⏳ Still working… ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')} so far, ${run.stage}.`).catch(() => undefined);
+      } else {
+        void this.markReadTyping(this.lastIncoming.get(phone));
+      }
+    }, TYPING_REFRESH_MS);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
+  /** Blue ticks and the "typing…" indicator for the message just received (best effort: a refusal changes nothing). */
+  private async markReadTyping(messageId: string | undefined): Promise<void> {
+    if (!messageId) return;
+    try {
+      const cfg = await this.currentCredentials();
+      if (!cfg.accessToken || !cfg.phoneNumberId) return;
+      await fetch(`https://graph.facebook.com/${cfg.apiVersion}/${cfg.phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messaging_product: 'whatsapp', status: 'read', message_id: messageId, typing_indicator: { type: 'text' } })
+      });
+    } catch {
+      /* a courtesy: never worth a failure */
     }
   }
 
@@ -465,10 +625,28 @@ export class WhatsAppService {
 
     const type = message.type;
 
-    // A tap on a list row or a button (the frame question)
+    // Blue ticks and "typing…" straight away, so the person sees the bot has their message
+    if (message.id) {
+      this.lastIncoming.set(from, String(message.id));
+      void this.markReadTyping(String(message.id));
+    }
+
+    // The server restarted (or the run was lost) while a meme was being made: say so instead of staying silent for good
+    if (session.state === 'GENERATING' && !this.runs.has(from)) {
+      const offeredRetry = await this.recoverLostRun(session, from);
+      if (offeredRetry) {
+        // the message that arrived is not an answer to a question nobody has asked yet: only a command carries on
+        const word = type === 'text' ? String(message.text?.body || '').trim().toLowerCase() : '';
+        if (!['retry', 'try again', 'reset', 'cancel', 'clear', 'new', 'discard', 'status', 'help', 'menu'].includes(word)) return;
+      }
+    }
+
+    // A tap on a list row or a button: the frame question, or an action under a finished meme
     if (type === 'interactive') {
       const reply = message.interactive?.list_reply || message.interactive?.button_reply;
-      if (session.state === 'AWAITING_FRAMING' && reply?.id) await this.answerFraming(session, from, String(reply.id));
+      const id = reply?.id ? String(reply.id) : '';
+      if (/^(pub|pl|no):/.test(id)) await this.answerReviewButton(session, from, id);
+      else if (session.state === 'AWAITING_FRAMING' && id) await this.answerFraming(session, from, id);
       return;
     }
 
@@ -476,6 +654,13 @@ export class WhatsAppService {
     if (type === 'text') {
       const text = (message.text?.body || '').trim();
       const lower = text.toLowerCase();
+
+      // The new punchline for a finished meme (after "Change punchline"): whatever is typed next is the punchline, even a word
+      // the bot also uses ("hello"). Only the ways out (reset, status, cancel) keep their meaning.
+      if (session.state === 'AWAITING_NEW_PUNCHLINE' && !['reset', 'clear', 'new', 'discard', 'status', 'cancel'].includes(lower)) {
+        await this.applyNewPunchline(session, from, text);
+        return;
+      }
 
       // Command: HELP / MENU
       if (['hi', 'hello', 'help', 'menu', 'start'].includes(lower)) {
@@ -491,26 +676,47 @@ export class WhatsAppService {
           `📎 *Best quality:* send pictures as a *Document* (📎 → Document): JPG, PNG, WebP, HEIC or PDF. ` +
           `You can also paste a direct image link.\n\n` +
           `📐 *Layouts:* send *Layouts* to see your saved meme layouts, or *New layout* to teach me one from an example meme.\n\n` +
+          `Under a finished meme: tap *Publish*, *Change punchline* or *Discard*.\n\n` +
           `Commands:\n` +
           `• *Approve* — Publish pending meme to Instagram (@kanyaraasi_memes)\n` +
+          `• *Caption: your text* — Use your own Instagram caption\n` +
+          `• *Retry* — Run the last meme again if it failed\n` +
           `• *Reset* — Clear current draft and start fresh\n` +
           `• *Status* — Check current state`
         );
         return;
       }
 
-      // Command: RESET / CANCEL
-      if (['reset', 'cancel', 'clear', 'new'].includes(lower)) {
+      // "Cancel" while typing a new punchline only goes back to the meme; it does not throw the meme away
+      if (session.state === 'AWAITING_NEW_PUNCHLINE' && lower === 'cancel') {
+        session.state = 'AWAITING_APPROVAL';
+        await session.save();
+        await this.sendTextMessage(from, '👍 Kept the punchline as it was.');
+        await this.sendReviewActions(session, from);
+        return;
+      }
+
+      // Command: RESET / CANCEL / DISCARD (a meme still being made is dropped, not delivered into the fresh chat)
+      if (['reset', 'cancel', 'clear', 'new', 'discard'].includes(lower)) {
+        const wasMaking = this.runs.has(from);
+        this.cancelRun(from);
         await this.resetSession(session);
-        await this.sendTextMessage(from, '🧹 Session cleared! Send a *reference meme screenshot* to start fresh.');
+        await this.sendTextMessage(
+          from,
+          wasMaking
+            ? '🧹 Stopped. The meme being made is dropped. Send a *reference meme screenshot* to start fresh.'
+            : '🧹 Session cleared! Send a *reference meme screenshot* to start fresh.'
+        );
         return;
       }
 
       // Command: STATUS
       if (lower === 'status') {
+        const run = this.runs.get(from);
+        const secs = run ? Math.round((Date.now() - run.startedAt) / 1000) : 0;
         await this.sendTextMessage(
           from,
-          `📊 Current Status: *${session.state}*\n` +
+          `📊 *${STATE_WORDS[session.state] || 'Working'}*${run ? ` (${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} so far, ${run.stage})` : ''}\n` +
           `Reference Image: ${session.referenceImagePath ? '✅ Ready' : '❌ Not set'}\n` +
           `Reaction Image: ${session.reactionImagePath ? `✅ Ready${session.reactionLibraryId ? ' (from your library)' : ''}` : '❌ Not set'}\n` +
           (session.reactionFraming ? `Framing: ${describeFraming(session.reactionFraming as ReactionFraming)}\n` : '') +
@@ -519,43 +725,52 @@ export class WhatsAppService {
         return;
       }
 
+
       // Reaction library and the "which frame?" question
       if (await this.handleReactionFlowText(session, from, text, lower)) return;
 
       // Layout library: list / add / name / delete saved layouts (and the naming step after learning one)
       if (await this.handleLayoutCommand(session, from, text, lower)) return;
 
-      // Command: APPROVE / PUBLISH
-      if (!this.isManualState(session) && ['approve', 'approved', 'publish', 'yes', 'ok'].includes(lower)) {
+      // After a failure or a restart: "Retry" runs it again; any other text is taken as a new punchline
+      if (session.state === 'AWAITING_RETRY' && text) {
+        if (lower === 'retry' || lower === 'try again') {
+          await this.runAgain(session, from);
+          return;
+        }
+        session.punchline = text;
+        await this.runAgain(session, from);
+        return;
+      }
+
+      // Command: APPROVE / PUBLISH. Only these words publish: a casual "ok" or "yes" must never post publicly.
+      if (!this.isManualState(session) && ['approve', 'approved', 'publish'].includes(lower)) {
         if (session.state === 'AWAITING_APPROVAL' && session.lastGeneratedMemeId) {
-          await this.sendTextMessage(from, '🚀 *Publishing to Instagram (@kanyaraasi_memes)...* Please wait 10-20 seconds.');
-          try {
-            const pubResult = await this.instagramPublisher.publishMeme(
-              session.lastGeneratedMemeId,
-              undefined,
-              session.lastGeneratedCaption || session.punchline || 'Meme by @kanyaraasi_memes'
-            );
-
-            await this.sendTextMessage(
-              from,
-              `🎉 *Successfully Published to Instagram!*\n\n` +
-              `📱 Account: *@${pubResult.username || 'kanyaraasi_memes'}*\n` +
-              `🔗 View Post: ${pubResult.permalink || 'https://www.instagram.com/kanyaraasi_memes'}\n\n` +
-              `Send a new reference meme anytime to create your next post! 🚀`
-            );
-
-            await this.resetSession(session);
-          } catch (err: any) {
-            this.logger.error(`Instagram publish error via WhatsApp: ${err?.message || err}`);
-            await this.sendTextMessage(
-              from,
-              `❌ *Publishing to Instagram Failed:*\n${err?.message || err}\n\n` +
-              `Reply *Approve* to retry, or *Reset* to discard.`
-            );
-          }
+          await this.publishCurrent(session, from);
         } else {
           await this.sendTextMessage(from, '⚠️ No meme is currently waiting for approval. Send a *reference meme screenshot* to create one!');
         }
+        return;
+      }
+
+      // A casual "ok"/"yes"/"👍" under a finished meme: remind how to publish instead of publishing
+      if (session.state === 'AWAITING_APPROVAL' && ['ok', 'okay', 'yes', 'y', 'yep', 'sure', '👍'].includes(lower)) {
+        await this.sendTextMessage(from, '👍 To post it to Instagram, tap *Publish* (or send *Approve*). I will not post anything unless you do.');
+        await this.sendReviewActions(session, from);
+        return;
+      }
+
+      // Your own Instagram caption for the meme waiting for approval: "Caption: text"
+      if (session.state === 'AWAITING_APPROVAL' && /^caption\s*[:\-]/i.test(text)) {
+        const own = text.replace(/^caption\s*[:\-]\s*/i, '').trim();
+        if (!own) {
+          await this.sendTextMessage(from, 'Send it like this: *Caption: your text*');
+          return;
+        }
+        session.lastGeneratedCaption = own.slice(0, 2200);
+        await session.save();
+        await this.sendTextMessage(from, '✅ Caption saved. It will be used when you publish.');
+        await this.sendReviewActions(session, from);
         return;
       }
 
@@ -630,7 +845,7 @@ export class WhatsAppService {
         session.state = 'GENERATING';
         await session.save();
 
-        await this.sendTextMessage(from, '⏳ *Generating your meme...* Running AI vision analysis & discovering clean subject images. This takes ~30-60s.');
+        await this.sendTextMessage(from, GENERATING_VIRAL_TEXT);
         await this.generateAndSendMeme(session, from);
         return;
       }
@@ -645,13 +860,92 @@ export class WhatsAppService {
         await this.sendTextMessage(from, '🎭 Please send the *reaction image* (e.g. Brahmanandam, Pawan Kalyan, etc.) to continue.' + (await this.libraryHint()));
         return;
       }
+
+      // Anything else is a state this text has no meaning in (a meme being made, one waiting for approval...): never silence
+      await this.nudge(session, from);
+      return;
     }
 
     // Pictures: compressed photos ("image"), original-quality files ("document": JPG/PNG/WebP/HEIC/PDF)
     if (type === 'image' || type === 'document') {
       const media = message[type] || {};
       await this.receiveImage(session, from, { mediaId: media.id }, String(media.caption || '').trim(), type === 'image');
+      return;
     }
+
+    // Voice notes, videos, locations, contacts: say what the bot can use. (Emoji reactions to a message are ignored on purpose.)
+    if (['audio', 'voice', 'video', 'sticker', 'location', 'contacts'].includes(type)) {
+      await this.sendTextMessage(from, '🙂 I can only work with *pictures* and *text*. Send a picture (best as a Document 📎), or *Help* to see what I can do.');
+    }
+  }
+
+  /**
+   * An answer for a message that has no meaning in the state the chat is in. Says where things stand and what to do
+   * next, so the chat never goes quiet.
+   */
+  private async nudge(session: WhatsAppSessionDocument, from: string): Promise<void> {
+    switch (session.state) {
+      case 'GENERATING': {
+        const run = this.runs.get(from);
+        const secs = run ? Math.round((Date.now() - run.startedAt) / 1000) : 0;
+        await this.sendTextMessage(
+          from,
+          `⏳ Still making your meme${run ? ` (${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} so far, ${run.stage})` : ''}. I will send it here the moment it is ready.\n_Send *Reset* to stop it._`
+        );
+        return;
+      }
+      case 'AWAITING_APPROVAL':
+        await this.sendTextMessage(from, '👇 Your meme is waiting. Tap a button below, or send a photo to replace an image.');
+        await this.sendReviewActions(session, from);
+        return;
+      case 'AWAITING_RETRY':
+        await this.sendTextMessage(from, 'Send *Retry* to make it again, a new *punchline* to try it with that, or *Reset* to start over.');
+        return;
+      default:
+        await this.sendTextMessage(from, `🤔 I did not understand that. ${STATE_WORDS[session.state] || 'Send *Help* to see what I can do'} — send *Help* for the steps, or *Reset* to start over.`);
+    }
+  }
+
+  /** The server restarted (or the run was lost) while a meme was being made: the inputs are safe, so offer to run it again. */
+  private async recoverLostRun(session: WhatsAppSessionDocument, from: string): Promise<boolean> {
+    const manual = session.mode === 'manual';
+    const complete = manual
+      ? Boolean(session.manualSubjects?.length && session.reactionImagePath && session.punchline)
+      : Boolean(session.referenceImagePath && session.reactionImagePath && session.punchline);
+    this.logger.warn(`WhatsApp session ${from} was GENERATING with no run in memory (restart?): ${complete ? 'offering a retry' : 'clearing it'}`);
+    if (complete) {
+      session.state = 'AWAITING_RETRY';
+      await session.save();
+      await this.sendTextMessage(from, '⚠️ I lost track of the meme I was making (the server restarted). Your pictures and punchline are still here.\nSend *Retry* to make it again, or *Reset* to start over.');
+      return true;
+    }
+    await this.resetSession(session);
+    await this.sendTextMessage(from, '⚠️ I lost track of what we were doing (the server restarted). Send a *reference meme screenshot* to start again.');
+    return false;
+  }
+
+  /** "Retry" (or a new punchline) after a failure or a restart: the same inputs, run again. */
+  private async runAgain(session: WhatsAppSessionDocument, from: string): Promise<void> {
+    if (this.runs.has(from)) {
+      await this.nudge(session, from);
+      return;
+    }
+    if (session.mode === 'manual') {
+      if (!session.manualSubjects?.length || !session.reactionImagePath || !session.punchline) {
+        await this.sendTextMessage(from, 'Some of your pictures are missing, so I cannot retry. Send *Manual* to start again.');
+        return;
+      }
+      await this.generateManualMeme(session, from);
+      return;
+    }
+    if (!session.referenceImagePath || !session.reactionImagePath || !session.punchline) {
+      await this.sendTextMessage(from, 'Some of your inputs are missing, so I cannot retry. Send a *reference meme screenshot* to start again.');
+      return;
+    }
+    session.state = 'GENERATING';
+    await session.save();
+    await this.sendTextMessage(from, GENERATING_VIRAL_TEXT);
+    await this.generateAndSendMeme(session, from);
   }
 
   private static readonly IMAGE_STATES = ['IDLE', 'AWAITING_REACTION', 'MANUAL_SUBJECTS', 'MANUAL_REACTION', 'AWAITING_SLOT_IMAGE', 'LAYOUT_EXAMPLE', 'AWAITING_FRAMING', 'LIBRARY_FOLDERS', 'LIBRARY_PICK'];
@@ -674,7 +968,15 @@ export class WhatsAppService {
     compressedPhoto: boolean
   ): Promise<void> {
     try {
-      if (session.state === 'GENERATING' || session.state === 'LAYOUT_ANALYZING') return;
+      // Busy: say so (a picture that is silently ignored looks like a lost message) and do not download it
+      if (session.state === 'GENERATING') {
+        await this.sendTextMessage(from, '⏳ I am making your meme right now, so I did not use that picture. Send it again once the meme arrives, or *Reset* to stop.');
+        return;
+      }
+      if (session.state === 'LAYOUT_ANALYZING') {
+        await this.sendTextMessage(from, '📐 I am still learning the last layout, so I did not use that picture. Send it again in a moment.');
+        return;
+      }
 
       const downloaded = source.url ? await this.downloadImageFromUrl(source.url) : await this.downloadMedia(String(source.mediaId));
 
@@ -761,6 +1063,9 @@ export class WhatsAppService {
         await this.afterReaction(session, from, 'viral', { updated: replacing });
         return;
       }
+
+      // A state a picture has no place in (waiting for a retry, for a new punchline, a layout name...): say what is expected
+      await this.nudge(session, from);
     } catch (err: any) {
       this.logger.error(`Failed to handle WhatsApp image: ${err?.message || err}`);
       await this.sendTextMessage(from, `❌ I could not use that picture: ${err?.message || 'download error'}\nPlease send it again (as a Document for full quality).`);
@@ -851,7 +1156,8 @@ export class WhatsAppService {
           session,
           from,
           updatedMeme,
-          updatedMeme.content?.punchline || session.lastGeneratedCaption || ''
+          updatedMeme.content?.punchline || session.punchline || '',
+          { keepCaption: true } // swapping a picture does not change the caption the owner may have written
         );
         return;
       } catch (err: any) {
@@ -880,6 +1186,11 @@ export class WhatsAppService {
    * that picture instead of failing.
    */
   private async generateAndSendMeme(session: WhatsAppSessionDocument, to: string): Promise<void> {
+    // From here the meme takes minutes: let the person's next message through (status, reset) while it is made
+    const run = this.beginRun(to, 'viral');
+    this.yieldLane();
+    const stopWatching = this.watchRun(to, run);
+    const voice = this.runVoice(to, run);
     try {
       if (!session.referenceImagePath || !session.reactionImagePath || !session.punchline) {
         throw new Error('Missing reference image, reaction image, or punchline');
@@ -889,7 +1200,11 @@ export class WhatsAppService {
       let meme: any;
       let adaptation: any;
       for (let attempt = 0; ; attempt++) {
-        if (!session.viralDraftId) await this.analyzeReference(session);
+        if (!session.viralDraftId) {
+          run.stage = STAGE_WORDS.analysis;
+          voice.say('📖 Reading your reference screenshot…');
+          await this.analyzeReference(session);
+        }
         try {
           adaptation = await this.viralAdaptation.adapt({
             draftId: session.viralDraftId as string,
@@ -897,7 +1212,8 @@ export class WhatsAppService {
             reaction: this.uploadOf(session.reactionImagePath, session.reactionMimeType),
             punchline: session.punchline,
             reactionContext: session.reactionContext || undefined,
-            reactionFraming: (session.reactionFraming as ReactionFraming | null) || undefined
+            reactionFraming: (session.reactionFraming as ReactionFraming | null) || undefined,
+            onProgress: voice.sink
           });
           meme = adaptation.meme;
           break;
@@ -911,6 +1227,13 @@ export class WhatsAppService {
         }
       }
 
+      // Reset was sent while it was being made: the meme is saved in the studio, but nothing is delivered into the fresh chat
+      await voice.drain();
+      if (run.cancelled) {
+        this.logger.log(`WhatsApp run for ${to} was cancelled; the finished meme is saved in the studio but not delivered.`);
+        return;
+      }
+
       session.viralDraftId = null;
       session.viralOverrides = [];
       session.viralMissing = [];
@@ -920,6 +1243,8 @@ export class WhatsAppService {
         await this.sendTextMessage(to, '📐 I learned a new layout from that reference. Send *Layouts* to see it and give it a name.');
       }
     } catch (err: any) {
+      await voice.drain();
+      if (run.cancelled) return;
       const missing = this.missingSlotsFromError(err, new Set((session.viralOverrides || []).map(o => o.slot)), session);
       if (missing.length) {
         this.logger.warn(`Discovery needs a picture from the user for slot(s) ${missing.join(', ')}: ${err?.message || err}`);
@@ -930,17 +1255,61 @@ export class WhatsAppService {
         return;
       }
       this.logger.error(`Error in WhatsApp meme generation: ${err?.message || err}`);
-      await this.sendTextMessage(
-        to,
-        `❌ *Generation Failed:*\n${err?.message || 'Internal processing error'}\n\n` +
-        `Reply *Reset* to start fresh or try sending your inputs again.`
-      );
+      // every input is kept: "Retry" runs it again, a new punchline text runs it with that punchline
       session.viralDraftId = null;
       session.viralOverrides = [];
       session.viralMissing = [];
-      session.state = 'IDLE';
+      session.state = 'AWAITING_RETRY';
       await session.save();
+      await this.sendTextMessage(
+        to,
+        `❌ *I could not make that meme:*\n${err?.message || 'Internal processing error'}\n\n` +
+        `Your pictures and punchline are saved. Send *Retry* to try again, a new *punchline* to try it with that, or *Reset* to start over.`
+      );
+    } finally {
+      stopWatching();
+      this.endRun(to, run);
     }
+  }
+
+  /**
+   * What the bot says while a viral meme is made: a few short messages from the pipeline's real stages (who was
+   * identified, each picture as it is found), in order and never after the meme itself. Nothing is estimated.
+   */
+  private runVoice(to: string, run: Run): { say: (text: string) => void; sink: ProgressSink; drain: () => Promise<unknown> } {
+    let chain: Promise<unknown> = Promise.resolve();
+    const say = (text: string) => {
+      chain = chain
+        .then(async () => {
+          if (run.cancelled) return;
+          run.lastSaid = Date.now();
+          await this.sendTextMessage(to, text);
+        })
+        .catch(() => undefined);
+    };
+    const subjects = new Map<string, string>();
+    let found = 0;
+    let told = false;
+    const sink: ProgressSink = e => {
+      if (e.type === 'stage') {
+        if (e.state === 'active') run.stage = STAGE_WORDS[e.stage] || run.stage;
+        if (e.stage === 'identity' && e.state === 'done' && e.note && e.note !== 'Pictures chosen by you') {
+          say(`🔎 I know who is who: ${e.note}.\nNow finding verified pictures…`);
+        }
+        if (e.stage === 'discovery' && e.state === 'done' && !told) {
+          told = true;
+          say('🎨 All pictures found. Setting your punchline…');
+        }
+      } else if (e.type === 'slots') {
+        e.slots.forEach(s => subjects.set(s.slotId, s.subject));
+      } else if (e.type === 'slot' && e.state === 'found') {
+        found++;
+        const total = subjects.size;
+        // the last one is followed by the "all found" line, so it is not announced twice
+        if (!total || found < total) say(`🖼️ Picture ${found}${total ? ` of ${total}` : ''} found: ${subjects.get(e.slotId) || 'verified'} ✅`);
+      }
+    };
+    return { say, sink, drain: () => chain };
   }
 
   private uploadOf(filePath: string, mimeType: string | null | undefined) {
@@ -1066,7 +1435,7 @@ export class WhatsAppService {
   }
 
   /** Sends the rendered meme to the user for review and moves the session to AWAITING_APPROVAL. */
-  private async deliverMeme(session: WhatsAppSessionDocument, to: string, meme: any, punchlineText: string): Promise<void> {
+  private async deliverMeme(session: WhatsAppSessionDocument, to: string, meme: any, punchlineText: string, opts: { keepCaption?: boolean } = {}): Promise<void> {
     // Construct public HTTPS image URL for Meta WhatsApp
     const relativeImageUrl = meme.outputUrls?.jpeg || meme.outputUrls?.png;
     const publicBase = getConfig().instagram.publicBaseUrl;
@@ -1078,11 +1447,16 @@ export class WhatsAppService {
 
     const headline = meme.content?.headline || '';
     const punchline = punchlineText;
+    const memeId: string | null = meme.memeId || (meme._id ? meme._id.toString() : null);
+
+    // The Instagram caption is the studio's: punchline, headline, topic, follow line, hashtags (an own caption survives image swaps)
+    const caption = opts.keepCaption && session.lastGeneratedCaption ? session.lastGeneratedCaption : buildCaption(meme.content || { punchline });
 
     const fitHint = session.mode === 'manual'
       ? `👉 *${session.manualSubjectFit === 'contain' ? 'Fill' : 'Fit'}* — Switch to ${session.manualSubjectFit === 'contain' ? 'Fill & Crop' : 'Fit Whole Image (No Crop)'}\n`
       : '';
 
+    // The same words when the buttons cannot be shown
     const previewCaption =
       `🎭 *Meme Ready for Review!*\n\n` +
       (headline ? `📌 *Headline*: ${headline}\n` : '') +
@@ -1093,21 +1467,189 @@ export class WhatsAppService {
       `👉 Send a new photo to *replace* image (or caption "replace reaction")\n` +
       `👉 *Reset* — Discard this meme`;
 
+    // The message under the picture: the meme's words, the caption it will go out with, and three buttons
+    const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+    const buttonBody =
+      `🎭 *Your meme is ready*\n\n` +
+      (headline ? `📌 ${clip(headline, 120)}\n` : '') +
+      `💬 ${clip(punchline, 260)}\n\n` +
+      `📝 Caption ready for Instagram. Send *Caption: your text* to change it.\n` +
+      (session.mode === 'manual' ? `Send *${session.manualSubjectFit === 'contain' ? 'Fill' : 'Fit'}* to change the cropping. ` : '') +
+      `Send a photo to replace an image.`;
+
     // Send image preview to user: uploaded to WhatsApp itself, so it arrives even when the server's public address is not reachable
     const localFile: string | undefined = meme.outputPaths?.jpeg || meme.outputPaths?.png;
-    const sent = await this.sendPicture(to, { filePath: localFile, mimeType: localFile && /\.png$/i.test(localFile) ? 'image/png' : 'image/jpeg', url: publicImageUrl }, previewCaption);
+    const pic = { filePath: localFile, mimeType: localFile && /\.png$/i.test(localFile) ? 'image/png' : 'image/jpeg', url: publicImageUrl };
+    let sent = memeId ? await this.sendImageWithButtons(to, pic, buttonBody, this.reviewButtons(memeId)) : false;
+    if (!sent) sent = await this.sendPicture(to, pic, previewCaption);
     if (!sent) {
       // Fallback to text with link if image send fails
       await this.sendTextMessage(to, `🎭 *Meme Ready!*\nView image: ${publicImageUrl}\n\n${previewCaption}`);
     }
 
     session.state = 'AWAITING_APPROVAL';
-    session.lastGeneratedMemeId = meme.memeId || (meme._id ? meme._id.toString() : null);
+    session.lastGeneratedMemeId = memeId;
     session.lastGeneratedImageUrl = publicImageUrl;
-    session.lastGeneratedCaption = punchline;
+    session.lastGeneratedCaption = caption;
     await session.save();
 
     this.logger.log(`Generated meme ${session.lastGeneratedMemeId} sent to WhatsApp user ${to}`);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The finished meme: Publish / Change punchline / Discard (taps, or the same words typed)
+  // ---------------------------------------------------------------------------------------------
+
+  /** The three buttons. The id carries the meme, so a tap on an older meme's buttons never acts on a newer one. */
+  private reviewButtons(memeId: string): { id: string; title: string }[] {
+    return [
+      { id: `pub:${memeId}`, title: '✅ Publish' },
+      { id: `pl:${memeId}`, title: 'Change punchline' },
+      { id: `no:${memeId}`, title: '🗑️ Discard' }
+    ];
+  }
+
+  /** The buttons again, without the picture (after a question or a change), or plain words when buttons cannot be sent. */
+  private async sendReviewActions(session: WhatsAppSessionDocument, to: string): Promise<void> {
+    if (!session.lastGeneratedMemeId) return;
+    const sent = await this.sendButtonsMessage(to, 'What next for this meme?', this.reviewButtons(session.lastGeneratedMemeId));
+    if (!sent) await this.sendTextMessage(to, 'What next? *Approve* publishes it to Instagram, *Reset* discards it, or send a photo to replace an image.');
+  }
+
+  /** Posts the meme waiting for approval to Instagram with its caption. Only ever reached by "Approve"/"Publish" or the Publish button. */
+  private async publishCurrent(session: WhatsAppSessionDocument, from: string): Promise<void> {
+    if (!session.lastGeneratedMemeId) return;
+    await this.sendTextMessage(from, '🚀 *Publishing to Instagram (@kanyaraasi_memes)...* Please wait 10-20 seconds.');
+    try {
+      const pubResult = await this.instagramPublisher.publishMeme(
+        session.lastGeneratedMemeId,
+        undefined,
+        session.lastGeneratedCaption || buildCaption({ punchline: session.punchline || '' }) || 'Meme by @kanyaraasi_memes'
+      );
+
+      await this.sendTextMessage(
+        from,
+        `🎉 *Successfully Published to Instagram!*\n\n` +
+        `📱 Account: *@${pubResult.username || 'kanyaraasi_memes'}*\n` +
+        `🔗 View Post: ${pubResult.permalink || 'https://www.instagram.com/kanyaraasi_memes'}\n\n` +
+        `Send a new reference meme anytime to create your next post! 🚀`
+      );
+
+      await this.resetSession(session);
+    } catch (err: any) {
+      this.logger.error(`Instagram publish error via WhatsApp: ${err?.message || err}`);
+      await this.sendTextMessage(from, `❌ *Publishing to Instagram Failed:*\n${err?.message || err}\n\nTap *Publish* (or send *Approve*) to retry, or *Reset* to discard.`);
+      if (session.state === 'AWAITING_APPROVAL') await this.sendReviewActions(session, from);
+    }
+  }
+
+  /** A tap on Publish / Change punchline / Discard under a finished meme (`pub:<memeId>` | `pl:<memeId>` | `no:<memeId>`). */
+  private async answerReviewButton(session: WhatsAppSessionDocument, from: string, id: string): Promise<void> {
+    const cut = id.indexOf(':');
+    const action = id.slice(0, cut);
+    const memeId = id.slice(cut + 1);
+    const waiting = session.state === 'AWAITING_APPROVAL' || session.state === 'AWAITING_NEW_PUNCHLINE';
+    if (!waiting || !session.lastGeneratedMemeId || session.lastGeneratedMemeId !== memeId) {
+      await this.sendTextMessage(from, 'ℹ️ That button belongs to an older meme, so I ignored it. Send *Status* to see where we are.');
+      if (session.state === 'AWAITING_APPROVAL') await this.sendReviewActions(session, from);
+      return;
+    }
+    if (action === 'pub') {
+      await this.publishCurrent(session, from);
+    } else if (action === 'pl') {
+      session.state = 'AWAITING_NEW_PUNCHLINE';
+      await session.save();
+      await this.sendTextMessage(from, '✏️ Send the *new punchline*, exactly as you want it on the meme. (It is used as typed. *Cancel* keeps the old one.)');
+    } else if (action === 'no') {
+      this.cancelRun(from);
+      await this.resetSession(session);
+      await this.sendTextMessage(from, '🗑️ Discarded. It stays in *My Memes* in the studio if you want it later. Send a *reference meme screenshot* to start a new one.');
+    }
+  }
+
+  /** The new punchline typed after "Change punchline": same pictures and style, re-rendered as the meme's next version. */
+  private async applyNewPunchline(session: WhatsAppSessionDocument, from: string, text: string): Promise<void> {
+    if (!session.lastGeneratedMemeId) {
+      await this.resetSession(session);
+      await this.sendTextMessage(from, 'I no longer have that meme. Send a *reference meme screenshot* to start again.');
+      return;
+    }
+    await this.sendTextMessage(from, '✏️ Changing the punchline…');
+    try {
+      const updated: any = await this.memeEngine.changePunchline(session.lastGeneratedMemeId, text);
+      const words = String(updated?.content?.punchline ?? text.trim());
+      session.punchline = words;
+      await this.deliverMeme(session, from, updated, words);
+    } catch (err: any) {
+      session.state = 'AWAITING_APPROVAL';
+      await session.save();
+      await this.sendTextMessage(from, `⚠️ I could not change the punchline: ${err?.response?.message || err?.message || err}\nThe meme is as it was.`);
+      await this.sendReviewActions(session, from);
+    }
+  }
+
+  /**
+   * An interactive message with up to three reply buttons (titles up to 20 characters), optionally under a picture.
+   * Returns false when it could not be sent, so the caller can fall back to plain words.
+   */
+  async sendButtonsMessage(
+    to: string,
+    body: string,
+    buttons: { id: string; title: string }[],
+    header?: { type: 'image'; image: { id?: string; link?: string } }
+  ): Promise<boolean> {
+    const cfg = await this.currentCredentials();
+    if (!cfg.accessToken || !cfg.phoneNumberId) return false;
+    try {
+      const res = await fetch(`https://graph.facebook.com/${cfg.apiVersion}/${cfg.phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to,
+          type: 'interactive',
+          interactive: {
+            type: 'button',
+            ...(header ? { header } : {}),
+            body: { text: body.slice(0, 1024) },
+            action: { buttons: buttons.slice(0, 3).map(b => ({ type: 'reply', reply: { id: b.id.slice(0, 256), title: b.title.slice(0, 20) } })) }
+          }
+        })
+      });
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        this.logger.warn(`Could not send WhatsApp buttons (using plain words instead): ${JSON.stringify(errJson)}`);
+        this.credentials?.noteSendResult(errJson);
+        return false;
+      }
+      this.credentials?.noteSendResult(null);
+      return true;
+    } catch (err: any) {
+      this.logger.warn(`Error sending WhatsApp buttons: ${err?.message || err}`);
+      return false;
+    }
+  }
+
+  /** A picture with buttons under it: uploaded to WhatsApp first (no public address needed), its link only if that fails. */
+  async sendImageWithButtons(
+    to: string,
+    pic: { buffer?: Buffer; filePath?: string; mimeType?: string; url: string },
+    body: string,
+    buttons: { id: string; title: string }[]
+  ): Promise<boolean> {
+    let image: { id?: string; link?: string } = { link: pic.url };
+    try {
+      const buffer = pic.buffer ?? (pic.filePath ? await fs.promises.readFile(pic.filePath) : null);
+      if (buffer && buffer.length > 0 && buffer.length <= 5 * 1024 * 1024) {
+        const mime = pic.mimeType || 'image/jpeg';
+        const id = await this.uploadMedia(buffer, mime, mime === 'image/png' ? 'picture.png' : 'picture.jpg');
+        if (id) image = { id };
+      }
+    } catch (err: any) {
+      this.logger.warn(`Could not upload the picture for the buttons message (${err?.message || err}); using its link.`);
+    }
+    return this.sendButtonsMessage(to, body, buttons, { type: 'image', image });
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1279,9 +1821,12 @@ export class WhatsAppService {
   }
 
   private async generateManualMeme(session: WhatsAppSessionDocument, to: string): Promise<void> {
+    const run = this.beginRun(to, 'manual');
+    run.stage = STAGE_WORDS.render;
     session.state = 'GENERATING';
     await session.save();
-    await this.sendTextMessage(to, '⏳ *Generating your meme...*');
+    this.yieldLane();
+    await this.sendTextMessage(to, '⏳ *Making your meme…* this takes a few seconds.');
     try {
       const subjects = session.manualSubjects || [];
       if (!subjects.length || !session.reactionImagePath || !session.punchline) {
@@ -1337,15 +1882,22 @@ export class WhatsAppService {
       const withFraming = session.reactionFraming ? { ...(design || {}), reactionFraming: session.reactionFraming as ReactionFraming } : design;
       const withFit = session.manualSubjectFit ? { ...(withFraming || {}), subjectFit: session.manualSubjectFit } : withFraming;
       const meme = await this.memeEngine.generateMeme({ content, assets: { subjectImages, reactionImage }, design: withFit as any, layout: finalLayout });
+      if (run.cancelled) return; // Reset was sent meanwhile: the meme is saved in the studio, nothing is delivered
       this.noteLibraryUse(session);
       await this.deliverMeme(session, to, meme, session.punchline);
     } catch (err: any) {
+      if (run.cancelled) return;
       this.logger.error(`Error in WhatsApp manual meme generation: ${err?.message || err}`);
+      // the pictures and words are kept: "Retry" runs it again, a new punchline runs it with that
+      session.state = 'AWAITING_RETRY';
+      await session.save();
       await this.sendTextMessage(
         to,
-        `❌ *Generation Failed:*\n${err?.message || 'Internal processing error'}\n\nSend *Manual* to try again.`
+        `❌ *I could not make that meme:*\n${err?.message || 'Internal processing error'}\n\n` +
+        `Your pictures and words are saved. Send *Retry* to try again, a new *punchline* to try it with that, or *Reset* to start over.`
       );
-      await this.resetSession(session);
+    } finally {
+      this.endRun(to, run);
     }
   }
 
@@ -1846,6 +2398,7 @@ export class WhatsAppService {
   }
 
   private async resetSession(session: WhatsAppSessionDocument): Promise<void> {
+    this.cancelRun(session.phoneNumber); // a meme still being made for this chat is dropped, not delivered into the fresh start
     session.state = 'IDLE';
     session.referenceImagePath = null;
     session.referenceMimeType = null;

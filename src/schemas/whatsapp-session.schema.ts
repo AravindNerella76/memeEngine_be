@@ -9,6 +9,11 @@ export type WhatsAppState =
   | 'AWAITING_PUNCHLINE'
   | 'GENERATING'
   | 'AWAITING_APPROVAL'
+  // the meme could not be made (or the server restarted while it was being made); every input is still here, so
+  // "Retry" runs it again and a new punchline text runs it with that punchline
+  | 'AWAITING_RETRY'
+  // the owner tapped "Change punchline" on the review message: the next text is the new punchline
+  | 'AWAITING_NEW_PUNCHLINE'
   // viral flow: discovery could not find a verified picture, the user is asked to send one
   | 'AWAITING_SLOT_IMAGE'
   // reaction library: browsing folders / choosing a picture from a numbered sheet

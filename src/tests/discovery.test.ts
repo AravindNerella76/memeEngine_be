@@ -326,6 +326,23 @@ describe('DiscoveryEngine (mocked providers, downloads and verifier)', () => {
     fs.unlinkSync(r.assets[0].path);
   });
 
+  it('tells a progress listener when each slot starts and what it found, and a listener that throws changes nothing', async () => {
+    images.set('https://img.test/prog1.jpg', picture(11));
+    const p = provider('fake', () => [cand('Pawan Kalyan portrait', { imageUrl: 'https://img.test/prog1.jpg' })]);
+    const { e } = engine([p], verifier(() => ({})));
+    const seen: { slotId: string; state: string; provider?: string }[] = [];
+    const plan = makePlan('Pawan Kalyan');
+    const r = await e.run([plan], null, ev => {
+      seen.push(ev);
+      throw new Error('a broken listener must not stop the search');
+    });
+    assert.deepEqual(seen.map(s => s.state), ['searching', 'found']);
+    assert.ok(seen.every(s => s.slotId === plan.slotId));
+    assert.equal(seen[1].provider, 'fake');
+    assert.equal(r.assets.length, 1);
+    fs.unlinkSync(r.assets[0].path);
+  });
+
   it('a candidate the vision model rejects is never used (wrong person that passed the metadata)', async () => {
     images.set('https://img.test/naga.jpg', picture(4));
     images.set('https://img.test/akhil.jpg', picture(5));

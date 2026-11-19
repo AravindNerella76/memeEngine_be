@@ -107,15 +107,41 @@ describe('WhatsApp pictures are uploaded, not linked', () => {
     assert.equal(calls[0].json.image.link, 'https://good.example/big.jpg');
   });
 
-  it('a delivered meme goes out by upload with its caption', async () => {
+  it('a delivered meme goes out by upload under three buttons: Publish, Change punchline, Discard', async () => {
     const calls = installMeta();
     const { svc } = build();
     const session: any = { phoneNumber: PHONE, state: 'GENERATING', async save() { return this; } };
-    await svc.deliverMeme(session, PHONE, { memeId: 'm1', outputUrls: { jpeg: '/output/m1.jpeg' }, outputPaths: { jpeg: JPEG }, content: { headline: 'HEAD' } }, 'My punchline');
+    await svc.deliverMeme(session, PHONE, { memeId: 'm1', outputUrls: { jpeg: '/output/m1.jpeg' }, outputPaths: { jpeg: JPEG }, content: { headline: 'HEAD', punchline: 'My punchline' } }, 'My punchline');
     assert.equal(session.state, 'AWAITING_APPROVAL');
     const msg = calls.find(c => /messages$/.test(c.url))!;
-    assert.equal(msg.json.image.id, 'MEDIA123');
-    assert.match(msg.json.image.caption, /My punchline/);
+    assert.equal(msg.json.type, 'interactive');
+    assert.equal(msg.json.interactive.type, 'button');
+    assert.deepEqual(msg.json.interactive.header, { type: 'image', image: { id: 'MEDIA123' } }, 'the picture is uploaded, not linked');
+    assert.match(msg.json.interactive.body.text, /My punchline/);
+    const buttons = msg.json.interactive.action.buttons.map((b: any) => b.reply);
+    assert.deepEqual(buttons.map((b: any) => b.id), ['pub:m1', 'pl:m1', 'no:m1']);
+    assert.ok(buttons.every((b: any) => b.title.length <= 20), 'WhatsApp allows 20 characters per button');
+    // the Instagram caption is the studio's: punchline, headline, follow line and hashtags
+    assert.match(session.lastGeneratedCaption, /My punchline[\s\S]*HEAD[\s\S]*Follow @kanyaraasi_memes[\s\S]*#telugumemes/);
+  });
+
+  it('when buttons cannot be sent, the same meme goes out as a picture with the written commands', async () => {
+    const calls: Call[] = [];
+    globalThis.fetch = (async (url: any, init: any = {}) => {
+      const call: Call = { url: String(url), method: init.method || 'GET' };
+      if (typeof init.body === 'string') call.json = JSON.parse(init.body);
+      calls.push(call);
+      const isUpload = /\/media$/.test(call.url);
+      const refuse = call.json?.type === 'interactive';
+      return new Response(JSON.stringify(refuse ? { error: { message: 'no buttons', code: 100 } } : isUpload ? { id: 'MEDIA123' } : { messages: [{ id: 'wamid.1' }] }), { status: refuse ? 400 : 200, headers: { 'content-type': 'application/json' } });
+    }) as any;
+    const { svc } = build();
+    const session: any = { phoneNumber: PHONE, state: 'GENERATING', async save() { return this; } };
+    await svc.deliverMeme(session, PHONE, { memeId: 'm1', outputUrls: { jpeg: '/output/m1.jpeg' }, outputPaths: { jpeg: JPEG }, content: { punchline: 'My punchline' } }, 'My punchline');
+    const image = calls.filter(c => /messages$/.test(c.url) && c.json?.type === 'image').pop()!;
+    assert.equal(image.json.image.id, 'MEDIA123');
+    assert.match(image.json.image.caption, /My punchline[\s\S]*Approve/);
+    assert.equal(session.state, 'AWAITING_APPROVAL');
   });
 });
 

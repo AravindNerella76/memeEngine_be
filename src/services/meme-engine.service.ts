@@ -40,7 +40,7 @@ import {
   safeDeleteFile
 } from '../security/path-guard';
 import { ImageValidationError, MAX_UPLOAD_BYTES, MIME_BY_TYPE, inspectImageFileHeader, verifyImageBuffer } from '../security/image-verify';
-import { escapeRegex, THUMB_WIDTHS } from '../security/request-validation';
+import { escapeRegex, THUMB_WIDTHS, validateViralFields } from '../security/request-validation';
 import { ThumbnailService } from './thumbnail.service';
 import { safeFetch } from '../security/safe-fetch';
 import { getConfig } from '../config/app-config';
@@ -833,6 +833,63 @@ export class MemeEngineService implements OnModuleInit {
     } finally {
       this.replacing.delete(memeId);
     }
+  }
+
+  /**
+   * The owner's own new punchline on an existing meme: the same pictures, layout and style, re-rendered with the new
+   * words as the next version (older versions are never touched). The words are only trimmed, never altered. This is
+   * the owner's text; it is not the AI rewriting anything.
+   */
+  async changePunchline(memeId: string, rawPunchline: unknown): Promise<MemeDocument> {
+    const { punchline } = validateViralFields({ punchline: rawPunchline });
+    if (this.replacing.has(memeId)) throw new ConflictException('A change to this meme is already being applied.');
+    this.replacing.add(memeId);
+    try {
+      const meme = await this.getMemeById(memeId);
+      const previous = String(plain(meme.content)?.punchline ?? '');
+      if (previous === punchline) throw new UnprocessableEntityException('That already is the punchline of this meme.');
+      const design = this.normalizeDesign(plain(meme.design));
+      const layout: LayoutConfiguration = plain(meme.layout);
+      const content: MemeContent = { ...plain(meme.content), punchline };
+      const assets = this.approveAssets(JSON.parse(JSON.stringify(plain(meme.assets))));
+      const ratios = await this.measureAssets(assets);
+      const { render } = await this.layoutAndRender(design, layout, content, assets, ratios);
+
+      const nextVersion = Math.max(meme.currentVersion || 1, ...(meme.versions || []).map(v => v.versionNumber || 0)) + 1;
+      const outputs = this.writeOutputs(memeId, nextVersion, render, assets.subjectImages);
+      meme.currentVersion = nextVersion;
+      meme.content = content as any;
+      meme.outputPaths = outputs.outputPaths;
+      meme.outputUrls = outputs.outputUrls;
+      meme.versions.push({
+        versionNumber: nextVersion,
+        instruction: 'Changed the punchline',
+        createdAt: new Date(),
+        design: plain(meme.design),
+        layout: plain(meme.layout),
+        content,
+        ...outputs,
+        appliedChanges: ['Punchline changed to your new text'],
+        interpreter: 'punchline_edit',
+        assets: JSON.parse(JSON.stringify(assets))
+      } as any);
+      return await meme.save();
+    } finally {
+      this.replacing.delete(memeId);
+    }
+  }
+
+  /**
+   * A real preview of a meme being built by hand: laid out and rendered exactly as it will be, in memory. Nothing is
+   * saved (no record, no file), so trying a change costs nothing and leaves nothing behind in My Memes.
+   */
+  async previewManual(rawInput: GenerateMemeInput): Promise<{ image: string; width: number; height: number }> {
+    const input: GenerateMemeInput = { ...rawInput, assets: this.approveAssets(rawInput.assets) };
+    const design = await this.designForNewMeme(input.design);
+    const ratios = await this.measureAssets(input.assets);
+    const memeType = input.layout?.memeType || 'trending_news';
+    const { render } = await layoutAndRender(this.layoutEngine, this.canvasRenderer, design, { ...input.layout, memeType }, input.content, input.assets, ratios, { formats: ['jpeg'] });
+    return { image: `data:image/jpeg;base64,${render.jpegBuffer.toString('base64')}`, width: render.width, height: render.height };
   }
 
   /**

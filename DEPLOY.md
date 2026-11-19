@@ -98,8 +98,10 @@ studio.example.com {
 }
 ```
 
-**nginx instead?** A meme takes 2–4 minutes and the browser waits on one request, so raise the read timeout
-(nginx's default of 60 s would cut every generation off):
+**nginx instead?** The studio starts a meme as a background job and polls it, so no single request lasts minutes
+and the default timeouts are fine for it. The older one-request endpoint (`POST /api/memes/adapt-viral`, also used by
+scripts) still takes 2–4 minutes, so raise the read timeout if you call that one through nginx (the default of 60 s
+would cut it off):
 
 ```nginx
 location /api/ { proxy_pass http://127.0.0.1:3000; proxy_read_timeout 600s; client_max_body_size 25m;

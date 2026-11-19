@@ -39,6 +39,7 @@ import { FormatLibraryService } from './format-library.service';
 import { LayoutEngineService } from './layout-engine.service';
 import { CanvasRendererService } from './canvas-renderer.service';
 import type { ReactionFraming } from './reaction-framing';
+import type { ProgressSink } from '../jobs/adaptation-progress';
 
 export interface ViralUpload {
   path: string;
@@ -68,6 +69,8 @@ export interface ViralAdaptInput {
   selectedProviders?: string[];
   /** The owner's choice for how the reaction image is framed (absent: decided from the picture). */
   reactionFraming?: ReactionFraming;
+  /** Told what the pipeline is doing, as it does it (the live progress view). Optional; it can never fail a run. */
+  onProgress?: ProgressSink;
 }
 
 function scriptOf(s: string): 'telugu' | 'english' | 'mixed' {
@@ -206,8 +209,20 @@ export class ViralAdaptationService {
     }
   }
 
+  /** True while the number of adaptations allowed at once (Settings > Advanced) is already running. */
+  isBusy(): boolean {
+    return this.active >= getConfig().adaptationMaxConcurrent;
+  }
+
   async adapt(input: ViralAdaptInput): Promise<{ meme: any; adaptationMetadata: Record<string, unknown> }> {
     const cfg = getConfig();
+    const say: ProgressSink = e => {
+      try {
+        input.onProgress?.(e);
+      } catch {
+        /* progress is a courtesy: it must never fail a meme */
+      }
+    };
     if (this.active >= cfg.adaptationMaxConcurrent) {
       throw new HttpException({ statusCode: 429, message: 'Another viral adaptation is still running. Please wait for it to finish and try again.' }, 429);
     }
@@ -226,10 +241,17 @@ export class ViralAdaptationService {
     try {
       // 1. Reference analysis (sandboxed vision model, verification-code checked); reused from a draft when there is one
       let t = Date.now();
+      if (draft) say({ type: 'stage', stage: 'analysis', state: 'skipped', note: 'Already read when you chose your pictures' });
+      else say({ type: 'stage', stage: 'analysis', state: 'active', note: 'The AI is reading your screenshot' });
       const run = draft ? draft.run : await this.analyzer.analyzeReference(reference.path);
       timings.analysisMs = draft ? 0 : Date.now() - t;
       if (draft) warnings.push('The analysis of the reference was done earlier (when you chose your own images) and reused.');
       const analysis = run.analysis;
+      if (!draft) {
+        const n = analysis.slots.length;
+        say({ type: 'stage', stage: 'analysis', state: 'done', note: `${n} picture${n === 1 ? '' : 's'} to fill · ${String(analysis.memeFormat).replace(/_/g, ' ')}` });
+        say({ type: 'log', text: `Read the reference: ${n} picture${n === 1 ? '' : 's'}, ${String(analysis.memeFormat).replace(/_/g, ' ')}.` });
+      }
       if (analysis.suspectedPromptInjection) warnings.push('The reference screenshot contained text addressed to the AI. It was treated as plain data and ignored.');
       if (!analysis.reactionPanel.present) warnings.push('No reaction panel was detected in the reference; your reaction image and punchline were added at the bottom.');
 
@@ -243,6 +265,7 @@ export class ViralAdaptationService {
 
       // 2. Identity of every slot
       t = Date.now();
+      say({ type: 'stage', stage: 'identity', state: 'active', note: 'Deciding who is in each picture' });
       const groundingText = groundingTextOf(analysis);
       const identities = analysis.slots.map(slot => ({
         slot,
@@ -277,6 +300,9 @@ export class ViralAdaptationService {
         });
       }
       identities.filter(i => !overrideBySlot.has(i.slot.index)).forEach(i => i.decision.warnings.forEach(w => warnings.push(`slot ${i.slot.index + 1}: ${w}`)));
+      const subjectNames = identities.map(i => i.decision.searchName).filter(Boolean) as string[];
+      say({ type: 'stage', stage: 'identity', state: 'done', note: subjectNames.length ? subjectNames.join(' · ') : 'Pictures chosen by you' });
+      if (subjectNames.length) say({ type: 'log', text: `Identified: ${subjectNames.join(', ')}.` });
 
       // 3. Content: reference text + the user's exact punchline (the reference punchline is never read)
       const statement = analysis.overlayText.statement
@@ -358,8 +384,38 @@ export class ViralAdaptationService {
       });
       t = Date.now();
       const empty: DiscoveryRunResult = { assets: [], reports: [], visionCalls: [], warnings: [] };
-      const found = plans.length ? await this.discovery.discoverForSlots(plans, reference.path, input.selectedProviders) : empty;
+      // every picture of the meme, in order, so the app can show each one's own progress
+      say({
+        type: 'slots',
+        slots: identities.map(({ slot, decision }) => ({ slotId: slot.slotId, index: slot.index, subject: decision.searchName || slot.label || `Picture ${slot.index + 1}` }))
+      });
+      for (const { slot } of identities) if (overrideBySlot.has(slot.index)) say({ type: 'slot', slotId: slot.slotId, state: 'yours', note: 'Your own picture' });
+      if (plans.length) {
+        say({ type: 'stage', stage: 'discovery', state: 'active', note: `Finding ${plans.length} picture${plans.length === 1 ? '' : 's'} on the internet` });
+      } else {
+        say({ type: 'stage', stage: 'discovery', state: 'skipped', note: 'You chose every picture yourself' });
+      }
+      const subjectOf = new Map(plans.map(p => [p.slotId, p.subjectName]));
+      const found = plans.length
+        ? await this.discovery.discoverForSlots(plans, reference.path, input.selectedProviders, e => {
+            const who = subjectOf.get(e.slotId) || 'a picture';
+            if (e.state === 'searching') {
+              say({ type: 'slot', slotId: e.slotId, state: 'searching', note: 'Searching and checking candidates' });
+              say({ type: 'log', text: `Looking for ${who}…` });
+            } else if (e.state === 'found') {
+              const n = e.candidatesConsidered || 0;
+              const v = e.visualChecks || 0;
+              const how = `${n} candidate${n === 1 ? '' : 's'} weighed${v ? `, ${v} checked by the AI` : ''}`;
+              say({ type: 'slot', slotId: e.slotId, state: 'found', note: how });
+              say({ type: 'log', text: `Found a verified picture of ${who} (${how}).` });
+            } else {
+              say({ type: 'slot', slotId: e.slotId, state: 'failed', note: 'No verified picture found' });
+              say({ type: 'log', text: `No verified picture of ${who} could be found.` });
+            }
+          })
+        : empty;
       timings.discoveryMs = Date.now() - t;
+      if (plans.length) say({ type: 'stage', stage: 'discovery', state: 'done', note: `${found.assets.length} verified` });
       discovered = [...found.assets];
       warnings.push(...found.warnings);
 
@@ -505,6 +561,8 @@ export class ViralAdaptationService {
       }
 
       t = Date.now();
+      say({ type: 'stage', stage: 'render', state: 'active', note: `Setting the type on ${design.width}×${design.height}` });
+      say({ type: 'log', text: 'Setting your punchline and rendering the meme…' });
       const meme = await this.memeEngine.generateMeme(
         {
           content,
