@@ -9,6 +9,8 @@ import type { ProgressSink } from '../jobs/adaptation-progress';
 import { buildCaption } from './instagram-caption';
 import { getConfig } from '../config/app-config';
 import { isAllowedPhone } from '../config/phone-list';
+// a real (not type-only) import: Nest reads the constructor's parameter types at runtime to inject the service
+import { BotReply, WhatsAppLoginService } from '../auth/whatsapp-login.service';
 import { WhatsAppSession, WhatsAppSessionDocument } from '../schemas/whatsapp-session.schema';
 import { ViralAdaptationService } from './viral-adaptation.service';
 import { InstagramPublisherService } from './instagram-publisher.service';
@@ -127,7 +129,9 @@ export class WhatsAppService {
     // Token and phone number ID saved in the app (Settings > WhatsApp); falls back to the server settings
     @Optional() private readonly credentials?: WhatsAppCredentialsService,
     // The owner's saved reaction pictures (the Reactions page of the app)
-    @Optional() private readonly reactions?: ReactionLibraryService
+    @Optional() private readonly reactions?: ReactionLibraryService,
+    // "Send this code to sign in" for the studio's sign-in page, and "Sign out everywhere"
+    @Optional() private readonly login?: WhatsAppLoginService
   ) {
     if (!fs.existsSync(this.mediaDir)) {
       fs.mkdirSync(this.mediaDir, { recursive: true });
@@ -601,13 +605,42 @@ export class WhatsAppService {
   }
 
   /**
+   * The studio's sign-in page shows a code; an allowed number sends it here. Returns true when the message was about
+   * signing in (and has been answered), false when the chat should handle it as usual. A code from a number that is not
+   * allowed is never approved: it falls through to the usual "authorized users only" answer.
+   */
+  private async answerSignIn(from: string, message: any, allowed: boolean): Promise<boolean> {
+    if (!this.login) return false;
+    let reply: BotReply | null = null;
+    try {
+      if (message?.type === 'text') reply = await this.login.onWhatsAppText(from, message.text?.body, allowed);
+      else if (message?.type === 'interactive') {
+        const id = message.interactive?.button_reply?.id || message.interactive?.list_reply?.id;
+        if (id) reply = await this.login.onWhatsAppButton(from, String(id), allowed);
+      }
+    } catch (err: any) {
+      this.logger.error(`WhatsApp sign-in message from ${from} failed: ${err?.stack || err?.message || err}`);
+      if (!allowed) return false;
+      reply = { text: '⚠️ I could not finish that sign-in on my side. Send the code again in a moment, or use the password on the sign-in page.' };
+    }
+    if (!reply) return false;
+    if (message?.id) void this.markReadTyping(String(message.id));
+    const sent = reply.buttons?.length ? await this.sendButtonsMessage(from, reply.text, reply.buttons) : false;
+    if (!sent) await this.sendTextMessage(from, reply.buttons?.length ? reply.fallback || reply.text : reply.text);
+    return true;
+  }
+
+  /**
    * Conversational state machine for handling messages from a user
    */
   private async handleUserMessage(from: string, message: any): Promise<void> {
     const cfg = await this.currentCredentials();
+    const allowed = isAllowedPhone(cfg.allowedPhone, from);
+    // A studio sign-in code (or "Sign out everywhere") is answered before anything else and never touches the meme chat
+    if (await this.answerSignIn(from, message, allowed)) return;
     // Security check: restrict to configured phone number if specified
     // Fail closed: with no allowed number configured nobody is authorised. Several numbers may be allowed.
-    if (!isAllowedPhone(cfg.allowedPhone, from)) {
+    if (!allowed) {
       this.logger.warn(`Rejected message from unauthorized phone: ${from}`);
       if (cfg.allowedPhone) {
         await this.sendTextMessage(from, '⛔ This Meme Engine WhatsApp bot is configured for authorized users only.');
@@ -682,7 +715,10 @@ export class WhatsAppService {
           `• *Caption: your text* — Use your own Instagram caption\n` +
           `• *Retry* — Run the last meme again if it failed\n` +
           `• *Reset* — Clear current draft and start fresh\n` +
-          `• *Status* — Check current state`
+          `• *Status* — Check current state
+
+` +
+          `🔐 *Studio sign-in:* send the code shown on the studio's sign-in page. *Sign out everywhere* ends every studio sign-in at once.`
         );
         return;
       }

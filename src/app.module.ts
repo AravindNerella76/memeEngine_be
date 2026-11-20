@@ -2,6 +2,8 @@ import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { MongooseModule } from '@nestjs/mongoose';
 import { AuthController } from './auth/auth.controller';
+import { WhatsAppLoginController } from './auth/whatsapp-login.controller';
+import { WhatsAppLoginService } from './auth/whatsapp-login.service';
 import { AuthGuard } from './auth/auth.guard';
 import { AuthService } from './auth/auth.service';
 import { AuthSession, AuthSessionSchema, AuthUser, AuthUserSchema } from './auth/auth.schemas';
@@ -66,6 +68,7 @@ import { getConfig } from './config/app-config';
   controllers: [
     AppController,
     AuthController,
+    WhatsAppLoginController,
     MemeController,
     DesignProfileController,
     SettingsController,
@@ -78,6 +81,7 @@ import { getConfig } from './config/app-config';
   ],
   providers: [
     AuthService,
+    WhatsAppLoginService,
     ThumbnailService,
     ReactionLibraryService,
     // Every route needs a signed-in session unless it is marked @Public()

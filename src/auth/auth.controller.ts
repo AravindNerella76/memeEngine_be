@@ -1,10 +1,11 @@
-import { BadRequestException, Body, Controller, Get, HttpCode, Post, Req, Res } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, HttpCode, Optional, Post, Req, Res } from '@nestjs/common';
 import type { Response } from 'express';
 import { getConfig } from '../config/app-config';
 import { AuthedRequest } from './auth.guard';
 import { AuthService, ClientInfo, TooManyAttemptsException } from './auth.service';
 import { clearedSessionCookie, readCookie, sessionCookie, sessionCookieName } from './cookies';
 import { Public } from './public.decorator';
+import { WhatsAppLoginService } from './whatsapp-login.service';
 
 const clientOf = (req: AuthedRequest): ClientInfo => ({ ip: req.ip || req.socket?.remoteAddress || 'unknown', userAgent: String(req.headers['user-agent'] || '') });
 
@@ -20,7 +21,16 @@ function strings(body: unknown, ...keys: string[]): string[] {
 
 @Controller('api/auth')
 export class AuthController {
-  constructor(private readonly auth: AuthService) {}
+  constructor(private readonly auth: AuthService, @Optional() private readonly whatsapp?: WhatsAppLoginService) {}
+
+  /** Can this page offer "send a code from WhatsApp"? Quick (no call to Meta); the code request checks the rest. */
+  private async whatsappLogin(): Promise<boolean> {
+    try {
+      return Boolean(this.whatsapp && (await this.whatsapp.configured()).ok);
+    } catch {
+      return false;
+    }
+  }
 
   /** Who am I? Never an error: the app calls this first to decide between the sign-in page and the studio. */
   @Public()
@@ -29,8 +39,8 @@ export class AuthController {
     res.setHeader('Cache-Control', 'no-store');
     if (!getConfig().auth.enabled) return { authEnabled: false, authenticated: true, username: null };
     const session = await this.auth.sessionFromRequest(req);
-    if (session) return { authEnabled: true, authenticated: true, username: session.username, ...this.auth.staticFlags(session.username) };
-    return { authEnabled: true, authenticated: false, setupRequired: !(await this.auth.ownerExists()) };
+    if (session) return { authEnabled: true, authenticated: true, username: session.username, whatsappLogin: await this.whatsappLogin(), ...this.auth.staticFlags(session.username) };
+    return { authEnabled: true, authenticated: false, setupRequired: !(await this.auth.ownerExists()), whatsappLogin: await this.whatsappLogin() };
   }
 
   @Public()

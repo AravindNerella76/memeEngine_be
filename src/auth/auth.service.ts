@@ -20,6 +20,13 @@ export interface ClientInfo {
   userAgent: string;
 }
 
+/** What is remembered about how a session was made (shown under Account > Sessions). */
+export interface SessionOrigin {
+  method: 'password' | 'whatsapp';
+  phoneTail?: string;
+  challengeId?: string;
+}
+
 export class TooManyAttemptsException extends HttpException {
   constructor(public readonly retryAfterSec: number) {
     super(
@@ -156,7 +163,42 @@ export class AuthService implements OnModuleInit {
     return { ...created, username: user.username };
   }
 
-  private async createSession(userId: string, client: ClientInfo): Promise<{ token: string; maxAgeSeconds: number }> {
+  /**
+   * The account a WhatsApp sign-in opens. The studio has one owner: the fixed login from the environment when there is
+   * one, otherwise the account made first. null when no account exists yet (then the one-time setup comes first).
+   */
+  async ownerAccount(): Promise<{ id: string; username: string } | null> {
+    const c = getConfig().auth;
+    const fixed = c.staticUsername && c.staticPassword ? normalizeUsername(c.staticUsername) : null;
+    const user = (fixed && (await this.users.findOne({ username: fixed }))) || (await this.users.findOne({}).sort({ createdAt: 1, _id: 1 }));
+    return user ? { id: String(user._id), username: user.username } : null;
+  }
+
+  /** Signs the owner in because an allowed WhatsApp number sent this browser's code (checked by the caller). */
+  async signInWithWhatsApp(phone: string, client: ClientInfo, challengeId: string): Promise<{ token: string; username: string; maxAgeSeconds: number }> {
+    const owner = await this.ownerAccount();
+    if (!owner) throw new ConflictException({ statusCode: 409, code: 'setup_required', message: 'Create the owner account first (npm run auth:create-owner).' });
+    const tail = String(phone).replace(/\D/g, '').slice(-4);
+    await this.users.updateOne({ _id: owner.id }, { $set: { lastLoginAt: new Date() } });
+    const created = await this.createSession(owner.id, client, { method: 'whatsapp', phoneTail: tail, challengeId });
+    this.logger.log(`Signed in "${owner.username}" with WhatsApp (number ending ${tail}) from ${client.ip}`);
+    return { ...created, username: owner.username };
+  }
+
+  /** "That wasn't me" in WhatsApp: ends the sign-in that this code made. Returns how many were ended (0 or 1). */
+  async endSessionsOfChallenge(challengeId: string): Promise<number> {
+    if (!challengeId) return 0;
+    const r = await this.sessions.deleteMany({ challengeId: String(challengeId) });
+    return r.deletedCount || 0;
+  }
+
+  /** "Sign out everywhere": every sign-in of every device ends. */
+  async endAllSessions(): Promise<number> {
+    const r = await this.sessions.deleteMany({});
+    return r.deletedCount || 0;
+  }
+
+  private async createSession(userId: string, client: ClientInfo, origin: SessionOrigin = { method: 'password' }): Promise<{ token: string; maxAgeSeconds: number }> {
     const c = getConfig().auth;
     const now = Date.now();
     const absolute = now + c.sessionMaxDays * DAY_MS;
@@ -169,7 +211,10 @@ export class AuthService implements OnModuleInit {
       absoluteExpiresAt: new Date(absolute),
       lastSeenAt: new Date(now),
       userAgent: String(client.userAgent || '').slice(0, 300),
-      ip: String(client.ip || '').slice(0, 64)
+      ip: String(client.ip || '').slice(0, 64),
+      method: origin.method,
+      phoneTail: origin.phoneTail || '',
+      ...(origin.challengeId ? { challengeId: origin.challengeId } : {})
     });
     return { token, maxAgeSeconds: Math.floor((idle - now) / 1000) };
   }
@@ -221,7 +266,9 @@ export class AuthService implements OnModuleInit {
       signedInAt: (r as any).createdAt as Date,
       lastSeenAt: r.lastSeenAt,
       userAgent: r.userAgent,
-      ip: r.ip
+      ip: r.ip,
+      method: (r as any).method === 'whatsapp' ? 'whatsapp' : 'password',
+      phoneTail: (r as any).phoneTail || ''
     }));
   }
 

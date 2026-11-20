@@ -136,6 +136,11 @@ export interface WhatsAppConfig {
   apiVersion: string;
   /** Meta app secret used to verify webhook signatures (WHATSAPP_APP_SECRET, falls back to META_APP_SECRET). */
   appSecret?: string;
+  /**
+   * WHATSAPP_DISPLAY_PHONE: the bot's own number as people dial it ("+91 93477 08120"). Optional: without it the number
+   * is asked from Meta. Shown on the sign-in page so the owner knows where to send the sign-in code.
+   */
+  displayPhone?: string;
 }
 
 export type LogLevelSetting = 'error' | 'warn' | 'log' | 'debug' | 'verbose';
@@ -169,6 +174,11 @@ export interface AuthConfig {
   maxFailures: number;
   /** AUTH_LOCK_MINUTES: how long a lock lasts. */
   lockMinutes: number;
+  /**
+   * AUTH_WHATSAPP_LOGIN (default true): sign in by sending a one-time code from an allowed WhatsApp number. Only offered
+   * when the WhatsApp bot is fully set up (token, phone number ID, app secret, allowed numbers).
+   */
+  whatsappLogin: boolean;
 }
 
 export interface AppConfig {
@@ -273,7 +283,8 @@ function loadAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
     sessionMaxDays: int(env, 'AUTH_SESSION_MAX_DAYS', 30, 1, 365),
     trustProxy: int(env, 'TRUST_PROXY', 0, 0, 5),
     maxFailures: int(env, 'AUTH_MAX_FAILURES', 5, 3, 20),
-    lockMinutes: int(env, 'AUTH_LOCK_MINUTES', 15, 1, 1440)
+    lockMinutes: int(env, 'AUTH_LOCK_MINUTES', 15, 1, 1440),
+    whatsappLogin: bool(env, 'AUTH_WHATSAPP_LOGIN', true)
   };
 }
 
@@ -458,7 +469,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       verifyToken: str(env, 'WHATSAPP_VERIFY_TOKEN') || '',
       allowedPhone: normalizePhoneList(str(env, 'WHATSAPP_ALLOWED_PHONE')), // one or several numbers, comma-separated
       apiVersion: str(env, 'WHATSAPP_API_VERSION') || 'v21.0',
-      appSecret: str(env, 'WHATSAPP_APP_SECRET') || str(env, 'META_APP_SECRET')
+      appSecret: str(env, 'WHATSAPP_APP_SECRET') || str(env, 'META_APP_SECRET'),
+      displayPhone: str(env, 'WHATSAPP_DISPLAY_PHONE')
     },
     auth: loadAuthConfig(env),
     limits: { maxUploadBytes: HARD_MAX_UPLOAD_BYTES },
@@ -573,7 +585,8 @@ export function describeConfig(cfg: AppConfig): Record<string, unknown> {
       cookieSecure: cfg.auth.cookieSecure,
       trustProxy: cfg.auth.trustProxy,
       sessionIdleDays: cfg.auth.sessionIdleDays,
-      sessionMaxDays: cfg.auth.sessionMaxDays
+      sessionMaxDays: cfg.auth.sessionMaxDays,
+      whatsappLogin: cfg.auth.whatsappLogin
     },
     whatsapp: {
       phoneNumberId: cfg.whatsapp.phoneNumberId,

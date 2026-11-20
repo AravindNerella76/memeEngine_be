@@ -187,6 +187,29 @@ state-changing request the browser labels cross-site is refused.
 | `AUTH_SESSION_IDLE_DAYS` / `AUTH_SESSION_MAX_DAYS` | `7` / `30` | Session lifetime. |
 | `AUTH_MAX_FAILURES` / `AUTH_LOCK_MINUTES` | `5` / `15` | Wrong-password limit and lock time. |
 
+**Sign in with WhatsApp.** When the WhatsApp bot is set up (access token, phone number ID, app secret and at least
+one allowed number), the sign-in page offers a second way in: it shows a one-time 6-digit code, a QR code (on a
+computer) or a "Send code on WhatsApp" button (on a phone) that opens WhatsApp with `Login 482915` already typed.
+Send it from an allowed number and the page opens the studio by itself, usually within a second.
+
+- What proves it is you is the sender: only the allowed numbers can approve a code, and the webhook only accepts
+  messages Meta signed with the app secret. The page waits with a secret token, never with the code, so a code seen
+  on someone's screen is useless to anyone else. Codes work once and last 5 minutes; a page being looked at gets a
+  fresh one by itself. New codes are limited per address (12 per 10 minutes) and overall (100 waiting).
+- The bot answers with the device and address that asked for the code and a **That wasn't me** button that ends
+  exactly that sign-in. Sending **Sign out everywhere** to the bot ends every sign-in and every waiting code.
+- A code sent from a number that is not allowed approves nothing; the waiting page says which number (last 4 digits)
+  it came from. Bare digits only count as a sign-in when they match a code that was handed out, so the meme chat is
+  never interrupted.
+- It signs in the owner account (the static login if set, otherwise the account created first) and shows up under
+  Account › Sessions as "WhatsApp · 8120". Password sign-in keeps working on its own tab.
+- Codes live in the server's memory: after a restart the page simply gets a new code.
+
+| `.env` setting | Default | Meaning |
+|---|---|---|
+| `AUTH_WHATSAPP_LOGIN` | `true` | `false` hides WhatsApp sign-in (password only). |
+| `WHATSAPP_DISPLAY_PHONE` | asked from Meta | The bot's number shown on the sign-in page, e.g. `+91 90000 11111`. |
+
 **Temporary static login.** `AUTH_STATIC_USERNAME` + `AUTH_STATIC_PASSWORD` define a fixed login straight from the
 environment, so there is nothing to run (useful on a host without a shell). The account is created or updated at
 every start; changing the password in the environment and restarting replaces it and signs everyone out. The

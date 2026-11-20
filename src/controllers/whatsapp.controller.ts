@@ -1,9 +1,10 @@
-import { BadRequestException, Controller, Delete, Get, Post, Put, Query, Body, Res, Req, Headers, HttpCode, Logger, RawBodyRequest } from '@nestjs/common';
+import { BadRequestException, Controller, Delete, Get, Post, Put, Query, Body, Res, Req, Headers, HttpCode, Logger, Optional, RawBodyRequest } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { verifyMetaSignature } from '../security/http-guards';
 import { WhatsAppService } from '../services/whatsapp.service';
 import { CREDENTIAL_FIELDS, CredentialField, WhatsAppCredentialsService, WhatsAppStatus } from '../services/whatsapp-credentials.service';
 import { Public } from '../auth/public.decorator';
+import { WhatsAppLoginService } from '../auth/whatsapp-login.service';
 
 @Controller('api/whatsapp')
 export class WhatsAppController {
@@ -11,7 +12,9 @@ export class WhatsAppController {
 
   constructor(
     private readonly whatsappService: WhatsAppService,
-    private readonly credentials: WhatsAppCredentialsService
+    private readonly credentials: WhatsAppCredentialsService,
+    // the sign-in page shows the bot's number: look it up again after the token or phone number ID changes
+    @Optional() private readonly whatsappLogin?: WhatsAppLoginService
   ) {}
 
   /**
@@ -79,7 +82,9 @@ export class WhatsAppController {
   async saveCredentials(@Body() body: Partial<Record<CredentialField, unknown>>): Promise<WhatsAppStatus> {
     const input: Partial<Record<CredentialField, unknown>> = {};
     for (const f of CREDENTIAL_FIELDS) if (body && f in body) input[f] = body[f];
-    return this.credentials.saveAndVerify(input);
+    const out = await this.credentials.saveAndVerify(input);
+    this.whatsappLogin?.forgetBotNumber();
+    return out;
   }
 
   /**
@@ -91,6 +96,8 @@ export class WhatsAppController {
     if (field !== undefined && field !== 'all' && !(CREDENTIAL_FIELDS as string[]).includes(field)) {
       throw new BadRequestException('Unknown field.');
     }
-    return this.credentials.clearSaved(field as CredentialField | 'all' | undefined);
+    const out = await this.credentials.clearSaved(field as CredentialField | 'all' | undefined);
+    this.whatsappLogin?.forgetBotNumber();
+    return out;
   }
 }

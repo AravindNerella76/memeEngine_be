@@ -48,5 +48,17 @@ export class AuthSession {
 
   @Prop({ type: String, default: '' })
   ip: string;
+
+  /** How this sign-in was made: a password, or a code sent from an allowed WhatsApp number. */
+  @Prop({ type: String, default: 'password' })
+  method: 'password' | 'whatsapp';
+
+  /** WhatsApp sign-ins: the last 4 digits of the number that sent the code (never the whole number). */
+  @Prop({ type: String, default: '' })
+  phoneTail: string;
+
+  /** WhatsApp sign-ins: the code's id, so "That wasn't me" in WhatsApp can end exactly this sign-in. */
+  @Prop({ type: String, default: undefined, index: { sparse: true } })
+  challengeId?: string;
 }
 export const AuthSessionSchema = SchemaFactory.createForClass(AuthSession);
