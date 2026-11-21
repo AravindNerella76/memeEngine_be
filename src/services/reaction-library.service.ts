@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ReactionImage, ReactionImageDocument } from '../schemas/reaction-image.schema';
 import { ImageValidationError, verifyImageBuffer } from '../security/image-verify';
+import { isHeic, normalizeImageBuffer } from '../security/image-normalize';
 import { ValidatedReactionPatch, ValidatedReactionQuery, escapeRegex } from '../security/request-validation';
 import { sanitizeDisplayName } from '../security/path-guard';
 
@@ -115,6 +116,16 @@ export class ReactionLibraryService {
 
     if ((await this.model.estimatedDocumentCount().exec()) >= MAX_LIBRARY_IMAGES) {
       throw new BadRequestException(`The library holds ${MAX_LIBRARY_IMAGES} pictures already. Remove some before adding more.`);
+    }
+
+    // an iPhone photo (HEIC/HEIF) is stored as an ordinary JPEG/PNG: browsers and the renderer cannot use HEIC
+    if (isHeic(input.buffer)) {
+      try {
+        input = { ...input, buffer: (await normalizeImageBuffer(input.buffer)).buffer };
+      } catch (err) {
+        if (err instanceof ImageValidationError) throw new BadRequestException(`"${sanitizeDisplayName(input.originalName)}" was rejected: ${err.message}`);
+        throw err;
+      }
     }
 
     let verified;

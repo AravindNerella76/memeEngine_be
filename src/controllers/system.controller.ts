@@ -1,10 +1,12 @@
-import { Body, Controller, Get, Post, Put } from '@nestjs/common';
+import { Body, Controller, Get, Optional, Post, Put, Query, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { getConfig } from '../config/app-config';
 import { DesignProfileService } from '../design/design-profile.service';
 import { VisionCliRunner } from '../vision/vision-cli.runner';
 import { InternetSubjectDiscoveryService } from '../services/internet-subject-discovery.service';
 import { CanvasRendererService } from '../services/canvas-renderer.service';
 import { WhatsAppCredentialsService } from '../services/whatsapp-credentials.service';
+import { HealthService } from '../services/health.service';
 
 /** Personal design profile (house style). A settings record, not a meme editor. */
 @Controller('api/design-profile')
@@ -33,8 +35,19 @@ export class SystemController {
   constructor(
     private readonly runner: VisionCliRunner,
     private readonly discovery: InternetSubjectDiscoveryService,
-    private readonly whatsapp: WhatsAppCredentialsService
+    private readonly whatsapp: WhatsAppCredentialsService,
+    @Optional() private readonly health?: HealthService
   ) {}
+
+  /**
+   * Every connection the studio depends on, in plain words, with what to do about each problem. ?live=1 also asks
+   * Meta whether the WhatsApp token works (a few seconds). Never returns secrets.
+   */
+  @Get('health')
+  async healthReport(@Query('live') live: string | undefined, @Res({ passthrough: true }) res: Response) {
+    res.setHeader('Cache-Control', 'no-store');
+    return this.health!.report(live === '1' || live === 'true');
+  }
 
   @Get('status')
   async status() {

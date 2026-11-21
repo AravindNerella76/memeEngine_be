@@ -210,6 +210,22 @@ Send it from an allowed number and the page opens the studio by itself, usually 
 | `AUTH_WHATSAPP_LOGIN` | `true` | `false` hides WhatsApp sign-in (password only). |
 | `WHATSAPP_DISPLAY_PHONE` | asked from Meta | The bot's number shown on the sign-in page, e.g. `+91 90000 11111`. |
 
+**New sign-in alerts.** Every sign-in (password or WhatsApp code) is sent to the allowed WhatsApp numbers and to
+devices with notifications on: device, address and how, with a **That wasn't me** button that ends exactly that
+session. Sign-in paused after wrong passwords is reported too. WhatsApp delivers these only within 24 hours of your
+last message to the bot, unless an approved template is set (`WHATSAPP_ALERT_TEMPLATE`, body variables device /
+address / how, one quick-reply button). `AUTH_SIGNIN_ALERTS=false` turns them off.
+
+**Notifications (Web Push).** Settings › Notifications turns them on per device: "meme ready / failed" (with the meme
+as a picture) and "new sign-ins". The server signs with a VAPID key pair (made once and stored encrypted, or
+`VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY`); only the push services browsers use are accepted as addresses; a device that
+signs out stops receiving. iPhone: only from the studio added to the Home Screen. While a meme is made the browser
+tab shows a progress ring and "62% · …" in its title.
+
+**Health.** `/health` in the studio (`GET /api/system/health`, `?live=1` also asks Meta) checks the database, disk,
+sign-in setup, WhatsApp token / allowed numbers / incoming webhooks / delivery failures, Instagram, the public address,
+AI vision, image sources and quotas, and notifications, each with what to do about it.
+
 **Temporary static login.** `AUTH_STATIC_USERNAME` + `AUTH_STATIC_PASSWORD` define a fixed login straight from the
 environment, so there is nothing to run (useful on a host without a shell). The account is created or updated at
 every start; changing the password in the environment and restarting replaces it and signs everyone out. The

@@ -57,6 +57,7 @@ import {
 import type { ReactionFraming } from '../services/reaction-framing';
 import { AdaptationJobService } from '../services/adaptation-job.service';
 import type { ProgressSink } from '../jobs/adaptation-progress';
+import { isHeic, normalizeImageBuffer } from '../security/image-normalize';
 
 /** A viral adaptation request after validation (shared by the synchronous endpoint and the background job). */
 interface ViralRequest {
@@ -89,8 +90,12 @@ if (!fs.existsSync(UPLOADS_ROOT)) {
 // Uploads: first gate (cheap) on declared extension + MIME type. The real gate is the content
 // check in verifyAndNormalizeUploads(); a declared type is never trusted on its own.
 // .jfif / .jpe are real-world JPEG extensions (Windows saves .jfif); the content check decides what is truly an image
-const ALLOWED_UPLOAD_EXTS = new Set(['.jpg', '.jpeg', '.jfif', '.jpe', '.png', '.webp']);
-const ALLOWED_UPLOAD_MIMES = new Set(['image/jpeg', 'image/pjpeg', 'image/png', 'image/webp']);
+const ALLOWED_UPLOAD_EXTS = new Set(['.jpg', '.jpeg', '.jfif', '.jpe', '.png', '.webp', '.heic', '.heif']);
+const ALLOWED_UPLOAD_MIMES = new Set(['image/jpeg', 'image/pjpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'image/heic-sequence', 'image/heif-sequence']);
+// iPhone photos (HEIC/HEIF): many browsers on Windows and Android send them with no type or a generic one. The content
+// check below decides; such a file is converted to JPEG/PNG on arrival, so nothing after it ever sees HEIC.
+const HEIC_EXTS = new Set(['.heic', '.heif']);
+const GENERIC_MIMES = new Set(['', 'application/octet-stream']);
 
 const multerStorage = diskStorage({
   destination: (req, file, cb) => {
@@ -109,8 +114,9 @@ const imageFileFilter = (
   cb: (error: Error | null, acceptFile?: boolean) => void
 ) => {
   const ext = extname(file.originalname).toLowerCase();
-  if (!ALLOWED_UPLOAD_EXTS.has(ext) || !ALLOWED_UPLOAD_MIMES.has(file.mimetype)) {
-    return cb(new BadRequestException('Only JPEG, PNG and WebP images are accepted'), false);
+  const mimeOk = ALLOWED_UPLOAD_MIMES.has(file.mimetype) || (HEIC_EXTS.has(ext) && GENERIC_MIMES.has(file.mimetype || ''));
+  if (!ALLOWED_UPLOAD_EXTS.has(ext) || !mimeOk) {
+    return cb(new BadRequestException('Only JPEG, PNG, WebP and HEIC (iPhone) images are accepted'), false);
   }
   cb(null, true);
 };
@@ -152,6 +158,7 @@ export async function verifyAndNormalizeUploads(files: MulterUploadedFile[]): Pr
   }
   for (const f of files) {
     try {
+      await convertHeicUpload(f);
       const verified = await verifyImageFile(f.path);
       const currentExt = extname(f.path).toLowerCase();
       if (!ACCEPTED_EXTS_BY_TYPE[verified.type].includes(currentExt)) {
@@ -169,6 +176,29 @@ export async function verifyAndNormalizeUploads(files: MulterUploadedFile[]): Pr
       throw err;
     }
   }
+}
+
+/**
+ * An iPhone photo (HEIC/HEIF, recognised by its content, not its name): decoded and stored as JPEG/PNG in place of the
+ * original, so every later step works with an ordinary image. Anything else is left alone.
+ */
+async function convertHeicUpload(f: MulterUploadedFile): Promise<void> {
+  const head = Buffer.alloc(16);
+  const fd = fs.openSync(f.path, 'r');
+  try {
+    fs.readSync(fd, head, 0, 16, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (!isHeic(head)) return;
+  const converted = await normalizeImageBuffer(await fs.promises.readFile(f.path));
+  const target = path.join(path.dirname(f.path), path.parse(f.path).name + converted.ext);
+  await fs.promises.writeFile(target, converted.buffer);
+  if (target !== f.path) safeDeleteFile(f.path, UPLOADS_ROOT);
+  f.path = target;
+  f.filename = path.basename(target);
+  f.mimetype = converted.mime;
+  f.size = converted.buffer.length;
 }
 
 @Controller('api/memes')

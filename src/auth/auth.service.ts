@@ -1,6 +1,7 @@
 import { HttpException, Injectable, Logger, OnModuleInit, UnauthorizedException, BadRequestException, ConflictException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { isValidObjectId, Model } from 'mongoose';
+import { EventEmitter } from 'events';
 import type { Request } from 'express';
 import { getConfig } from '../config/app-config';
 import { AttemptTracker } from './attempt-tracker';
@@ -18,6 +19,26 @@ export interface AuthContext {
 export interface ClientInfo {
   ip: string;
   userAgent: string;
+}
+
+/** A new sign-in happened (the session already exists). Listeners: sign-in alerts on WhatsApp and push. */
+export interface SignInEvent {
+  sessionId: string;
+  username: string;
+  method: 'password' | 'whatsapp';
+  ip: string;
+  userAgent: string;
+  /** WhatsApp sign-ins: the full number that approved it (that number already got a reply, so it is not alerted). */
+  approvedBy?: string;
+  at: Date;
+}
+
+/** Sign-in was paused after too many wrong passwords. */
+export interface LockoutEvent {
+  username: string;
+  ip: string;
+  minutes: number;
+  at: Date;
 }
 
 /** What is remembered about how a session was made (shown under Account > Sessions). */
@@ -55,6 +76,8 @@ export function normalizeUsername(raw: unknown): string | null {
 export class AuthService implements OnModuleInit {
   private readonly logger = new Logger(AuthService.name);
   private ownerKnown = false;
+  /** 'signin' (SignInEvent) and 'lockout' (LockoutEvent). Listeners must never throw; errors are swallowed anyway. */
+  readonly events = new EventEmitter();
 
   // Three nets, so an attacker cannot lock the owner out from their own address:
   //  - per username AND address: the strict one (a few wrong tries, then a lock)
@@ -148,7 +171,10 @@ export class AuthService implements OnModuleInit {
       this.byIp.fail(keys.ip);
       this.byUser.fail(keys.user);
       this.logger.warn(`Failed sign-in for "${String(username || '(invalid)').slice(0, 40)}" from ${client.ip}${locked ? ' (now locked)' : ''}`);
-      if (locked) throw new TooManyAttemptsException(getConfig().auth.lockMinutes * 60);
+      if (locked) {
+        this.emit('lockout', { username: String(username || '(invalid)').slice(0, 60), ip: client.ip, minutes: getConfig().auth.lockMinutes, at: new Date() } satisfies LockoutEvent);
+        throw new TooManyAttemptsException(getConfig().auth.lockMinutes * 60);
+      }
       throw new UnauthorizedException({ statusCode: 401, code: 'invalid_credentials', message: 'Wrong username or password.' });
     }
 
@@ -160,6 +186,7 @@ export class AuthService implements OnModuleInit {
 
     const created = await this.createSession(String(user._id), client);
     this.logger.log(`Signed in "${user.username}" from ${client.ip}`);
+    this.emit('signin', { sessionId: created.sessionId, username: user.username, method: 'password', ip: client.ip, userAgent: client.userAgent, at: new Date() } satisfies SignInEvent);
     return { ...created, username: user.username };
   }
 
@@ -182,6 +209,7 @@ export class AuthService implements OnModuleInit {
     await this.users.updateOne({ _id: owner.id }, { $set: { lastLoginAt: new Date() } });
     const created = await this.createSession(owner.id, client, { method: 'whatsapp', phoneTail: tail, challengeId });
     this.logger.log(`Signed in "${owner.username}" with WhatsApp (number ending ${tail}) from ${client.ip}`);
+    this.emit('signin', { sessionId: created.sessionId, username: owner.username, method: 'whatsapp', ip: client.ip, userAgent: client.userAgent, approvedBy: String(phone).replace(/\D/g, ''), at: new Date() } satisfies SignInEvent);
     return { ...created, username: owner.username };
   }
 
@@ -192,19 +220,41 @@ export class AuthService implements OnModuleInit {
     return r.deletedCount || 0;
   }
 
+  /** "That wasn't me" under a sign-in alert: ends that one session. Returns whether it still existed. */
+  async endSession(sessionId: string): Promise<boolean> {
+    if (!isValidObjectId(sessionId)) return false;
+    const r = await this.sessions.deleteOne({ _id: sessionId });
+    return (r.deletedCount || 0) > 0;
+  }
+
+  /** Which of these session hashes still belong to a live session (push only reaches devices that are signed in). */
+  async liveSessionHashes(hashes: string[]): Promise<Set<string>> {
+    if (!hashes.length) return new Set();
+    const rows = await this.sessions.find({ tokenHash: { $in: hashes }, expiresAt: { $gt: new Date() } }, { tokenHash: 1 }).lean();
+    return new Set(rows.map(r => r.tokenHash));
+  }
+
+  private emit(event: 'signin' | 'lockout', payload: SignInEvent | LockoutEvent): void {
+    try {
+      this.events.emit(event, payload);
+    } catch (err: any) {
+      this.logger.warn(`A ${event} listener failed: ${err?.message || err}`);
+    }
+  }
+
   /** "Sign out everywhere": every sign-in of every device ends. */
   async endAllSessions(): Promise<number> {
     const r = await this.sessions.deleteMany({});
     return r.deletedCount || 0;
   }
 
-  private async createSession(userId: string, client: ClientInfo, origin: SessionOrigin = { method: 'password' }): Promise<{ token: string; maxAgeSeconds: number }> {
+  private async createSession(userId: string, client: ClientInfo, origin: SessionOrigin = { method: 'password' }): Promise<{ token: string; maxAgeSeconds: number; sessionId: string }> {
     const c = getConfig().auth;
     const now = Date.now();
     const absolute = now + c.sessionMaxDays * DAY_MS;
     const idle = Math.min(now + c.sessionIdleDays * DAY_MS, absolute);
     const token = newSessionToken();
-    await this.sessions.create({
+    const doc = await this.sessions.create({
       tokenHash: hashToken(token),
       userId,
       expiresAt: new Date(idle),
@@ -216,7 +266,7 @@ export class AuthService implements OnModuleInit {
       phoneTail: origin.phoneTail || '',
       ...(origin.challengeId ? { challengeId: origin.challengeId } : {})
     });
-    return { token, maxAgeSeconds: Math.floor((idle - now) / 1000) };
+    return { token, maxAgeSeconds: Math.floor((idle - now) / 1000), sessionId: String(doc._id) };
   }
 
   /** Who is making this request? null when there is no valid, unexpired session cookie. */

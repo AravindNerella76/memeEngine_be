@@ -40,6 +40,8 @@ export const POLL_HOLD_MS = 25_000;
 const BOT_CACHE_OK_MS = 6 * 3600_000;
 const BOT_CACHE_FAIL_MS = 60_000;
 export const DENY_PREFIX = 'auth:deny:';
+/** "That wasn't me" under a sign-in alert: ends that session (by its id). */
+export const END_SESSION_PREFIX = 'auth:end:';
 const SIGN_OUT_EVERYWHERE = new Set(['sign out everywhere', 'signout everywhere', 'log out everywhere', 'logout everywhere', 'sign out all', 'logout all', 'log out all']);
 
 /** "+91 93477 08120" from whatever Meta or the .env gave ("919347708120", "+1 555-012-3456"). */
@@ -221,6 +223,7 @@ export class WhatsAppLoginService {
 
   /** A reply button was tapped. Returns the answer when it was ours ("That wasn't me"), null otherwise. */
   async onWhatsAppButton(phone: string, id: string, allowed: boolean): Promise<BotReply | null> {
+    if (id.startsWith(END_SESSION_PREFIX)) return allowed ? this.endFromAlert(phone, id.slice(END_SESSION_PREFIX.length)) : null;
     if (!id.startsWith(DENY_PREFIX)) return null;
     if (!allowed) return null;
     const c = this.challenges.get(id.slice(DENY_PREFIX.length));
@@ -238,6 +241,20 @@ export class WhatsAppLoginService {
       };
     }
     return { text: '🔒 That sign-in had already ended. Nothing else changed.' };
+  }
+
+  private async endFromAlert(phone: string, sessionId: string): Promise<BotReply> {
+    const ended = await this.auth.endSession(sessionId);
+    if (!ended) return { text: '🔒 That sign-in had already ended. Nothing else changed.' };
+    this.logger.warn(`A sign-in was ended from its WhatsApp alert ("That wasn't me", number ending ${phoneTail(phone)})`);
+    return {
+      text:
+        `🔒 *Signed out.* That sign-in has ended.
+
+` +
+        `If it used the password, change the password now (Settings › Account) so it cannot simply sign in again. ` +
+        `Send *Sign out everywhere* to end every other sign-in too.`
+    };
   }
 
   private async signOutEverywhere(phone: string): Promise<BotReply> {

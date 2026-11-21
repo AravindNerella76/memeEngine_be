@@ -141,6 +141,21 @@ export interface WhatsAppConfig {
    * is asked from Meta. Shown on the sign-in page so the owner knows where to send the sign-in code.
    */
   displayPhone?: string;
+  /**
+   * WHATSAPP_ALERT_TEMPLATE (+ WHATSAPP_ALERT_TEMPLATE_LANG, default "en"): an approved Meta message template for sign-in
+   * alerts. WhatsApp only delivers free-form messages within 24 h of your last message to the bot; a template is
+   * delivered any time. Its body takes 3 variables (device, address, how) and may have one quick-reply button.
+   */
+  alertTemplate?: string;
+  alertTemplateLang: string;
+}
+
+/** Web push (notifications with the tab closed). Keys are generated and saved in the database when not set here. */
+export interface PushConfig {
+  vapidPublicKey?: string;
+  vapidPrivateKey?: string;
+  /** PUSH_CONTACT: a mailto: or https: address push services may use to reach the server's operator. */
+  contact: string;
 }
 
 export type LogLevelSetting = 'error' | 'warn' | 'log' | 'debug' | 'verbose';
@@ -179,6 +194,8 @@ export interface AuthConfig {
    * when the WhatsApp bot is fully set up (token, phone number ID, app secret, allowed numbers).
    */
   whatsappLogin: boolean;
+  /** AUTH_SIGNIN_ALERTS (default true): tell the allowed WhatsApp numbers (and push devices) about every new sign-in. */
+  signInAlerts: boolean;
 }
 
 export interface AppConfig {
@@ -192,6 +209,7 @@ export interface AppConfig {
   instagram: InstagramConfig;
   whatsapp: WhatsAppConfig;
   auth: AuthConfig;
+  push: PushConfig;
   limits: { maxUploadBytes: number };
   /** Adds a redacted configuration snapshot to generation reports and logs pipeline details. */
   diagnostics: boolean;
@@ -284,8 +302,16 @@ function loadAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
     trustProxy: int(env, 'TRUST_PROXY', 0, 0, 5),
     maxFailures: int(env, 'AUTH_MAX_FAILURES', 5, 3, 20),
     lockMinutes: int(env, 'AUTH_LOCK_MINUTES', 15, 1, 1440),
-    whatsappLogin: bool(env, 'AUTH_WHATSAPP_LOGIN', true)
+    whatsappLogin: bool(env, 'AUTH_WHATSAPP_LOGIN', true),
+    signInAlerts: bool(env, 'AUTH_SIGNIN_ALERTS', true)
   };
+}
+
+/** Push services want a way to reach the operator: PUSH_CONTACT, else the studio's https address, else a placeholder. */
+function pushContact(contact: string | undefined, appUrl: string | undefined): string {
+  if (contact && /^(mailto:|https:\/\/)/i.test(contact)) return contact;
+  if (appUrl && /^https:\/\//i.test(appUrl)) return appUrl.replace(/\/+$/, '');
+  return 'mailto:studio@example.com';
 }
 
 function model(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
@@ -470,7 +496,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       allowedPhone: normalizePhoneList(str(env, 'WHATSAPP_ALLOWED_PHONE')), // one or several numbers, comma-separated
       apiVersion: str(env, 'WHATSAPP_API_VERSION') || 'v21.0',
       appSecret: str(env, 'WHATSAPP_APP_SECRET') || str(env, 'META_APP_SECRET'),
-      displayPhone: str(env, 'WHATSAPP_DISPLAY_PHONE')
+      displayPhone: str(env, 'WHATSAPP_DISPLAY_PHONE'),
+      alertTemplate: str(env, 'WHATSAPP_ALERT_TEMPLATE'),
+      alertTemplateLang: str(env, 'WHATSAPP_ALERT_TEMPLATE_LANG') || 'en'
+    },
+    push: {
+      vapidPublicKey: str(env, 'VAPID_PUBLIC_KEY'),
+      vapidPrivateKey: str(env, 'VAPID_PRIVATE_KEY'),
+      contact: pushContact(str(env, 'PUSH_CONTACT'), str(env, 'APP_PUBLIC_URL'))
     },
     auth: loadAuthConfig(env),
     limits: { maxUploadBytes: HARD_MAX_UPLOAD_BYTES },
@@ -586,7 +619,8 @@ export function describeConfig(cfg: AppConfig): Record<string, unknown> {
       trustProxy: cfg.auth.trustProxy,
       sessionIdleDays: cfg.auth.sessionIdleDays,
       sessionMaxDays: cfg.auth.sessionMaxDays,
-      whatsappLogin: cfg.auth.whatsappLogin
+      whatsappLogin: cfg.auth.whatsappLogin,
+      signInAlerts: cfg.auth.signInAlerts
     },
     whatsapp: {
       phoneNumberId: cfg.whatsapp.phoneNumberId,

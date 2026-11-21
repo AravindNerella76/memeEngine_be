@@ -115,6 +115,10 @@ export class WhatsAppService {
   /** The last message id each person sent (the typing indicator answers a message). */
   private readonly lastIncoming = new Map<string, string>();
   private readonly mediaDir = path.join(__dirname, '..', '..', 'uploads', 'whatsapp');
+  /** When Meta last delivered anything to the webhook (the health page: "is the bot hearing anything at all?"). */
+  lastWebhookAt: Date | null = null;
+  /** The last message WhatsApp accepted from us but could not deliver (Meta reports it later, as a status). */
+  lastDeliveryFailure: { at: Date; code: number | null; title: string; recipientTail: string } | null = null;
   /** Where picture sheets are written (served publicly under /output so WhatsApp can fetch them). */
   protected sheetDir = OUTPUT_ROOT;
 
@@ -456,6 +460,7 @@ export class WhatsAppService {
     if (body?.object !== 'whatsapp_business_account' || !Array.isArray(body?.entry)) {
       return;
     }
+    this.lastWebhookAt = new Date();
 
     const work: Promise<void>[] = [];
     for (const entry of body.entry) {
@@ -590,6 +595,7 @@ export class WhatsAppService {
     const err = Array.isArray(st.errors) ? st.errors[0] : null;
     const detail = [err?.code ? `(${err.code})` : '', err?.title, err?.error_data?.details || err?.message].filter(Boolean).join(' ');
     this.logger.error(`WhatsApp could not deliver message ${st.id} to ${st.recipient_id}: ${detail || 'no reason given'}`);
+    this.lastDeliveryFailure = { at: new Date(), code: Number(err?.code) || null, title: String(err?.title || err?.message || 'no reason given').slice(0, 200), recipientTail: String(st.recipient_id || '').slice(-4) };
     if (!st.id || this.reportedFailures.has(st.id)) return;
     this.reportedFailures.add(st.id);
     if (this.reportedFailures.size > 500) this.reportedFailures.delete(this.reportedFailures.values().next().value as string);
@@ -617,6 +623,9 @@ export class WhatsAppService {
       else if (message?.type === 'interactive') {
         const id = message.interactive?.button_reply?.id || message.interactive?.list_reply?.id;
         if (id) reply = await this.login.onWhatsAppButton(from, String(id), allowed);
+      } else if (message?.type === 'button' && message.button?.payload) {
+        // a quick-reply button under a template message (the sign-in alert template) arrives as type "button"
+        reply = await this.login.onWhatsAppButton(from, String(message.button.payload), allowed);
       }
     } catch (err: any) {
       this.logger.error(`WhatsApp sign-in message from ${from} failed: ${err?.stack || err?.message || err}`);
@@ -1663,6 +1672,36 @@ export class WhatsAppService {
       return true;
     } catch (err: any) {
       this.logger.warn(`Error sending WhatsApp buttons: ${err?.message || err}`);
+      return false;
+    }
+  }
+
+  /**
+   * An approved template message: delivered even outside the 24-hour window that free-form messages need. `body` fills
+   * the template's {{1}}, {{2}}... in order; `buttonPayloads` give its quick-reply buttons their payloads, in order.
+   */
+  async sendTemplateMessage(to: string, name: string, language: string, body: string[], buttonPayloads: string[] = []): Promise<boolean> {
+    const cfg = await this.currentCredentials();
+    if (!cfg.accessToken || !cfg.phoneNumberId) return false;
+    try {
+      const components: any[] = [];
+      if (body.length) components.push({ type: 'body', parameters: body.map(text => ({ type: 'text', text: String(text).slice(0, 300) })) });
+      buttonPayloads.forEach((payload, index) => components.push({ type: 'button', sub_type: 'quick_reply', index: String(index), parameters: [{ type: 'payload', payload: payload.slice(0, 256) }] }));
+      const res = await fetch(`https://graph.facebook.com/${cfg.apiVersion}/${cfg.phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${cfg.accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'template', template: { name, language: { code: language }, components } })
+      });
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        this.logger.warn(`Could not send WhatsApp template "${name}": ${JSON.stringify(errJson)}`);
+        this.credentials?.noteSendResult(errJson);
+        return false;
+      }
+      this.credentials?.noteSendResult(null);
+      return true;
+    } catch (err: any) {
+      this.logger.warn(`Error sending WhatsApp template "${name}": ${err?.message || err}`);
       return false;
     }
   }

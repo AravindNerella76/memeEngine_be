@@ -4,6 +4,12 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { AuthController } from './auth/auth.controller';
 import { WhatsAppLoginController } from './auth/whatsapp-login.controller';
 import { WhatsAppLoginService } from './auth/whatsapp-login.service';
+import { PushController } from './controllers/push.controller';
+import { ImageConvertController } from './controllers/image-convert.controller';
+import { PushService } from './services/push.service';
+import { PushDevice, PushDeviceSchema, PushKeys, PushKeysSchema } from './schemas/push.schemas';
+import { SignInAlertService } from './services/signin-alerts.service';
+import { HealthService } from './services/health.service';
 import { AuthGuard } from './auth/auth.guard';
 import { AuthService } from './auth/auth.service';
 import { AuthSession, AuthSessionSchema, AuthUser, AuthUserSchema } from './auth/auth.schemas';
@@ -62,7 +68,9 @@ import { getConfig } from './config/app-config';
       { name: AuthUser.name, schema: AuthUserSchema },
       { name: AuthSession.name, schema: AuthSessionSchema },
       { name: ReactionImage.name, schema: ReactionImageSchema },
-      { name: MemeImage.name, schema: MemeImageSchema }
+      { name: MemeImage.name, schema: MemeImageSchema },
+      { name: PushDevice.name, schema: PushDeviceSchema },
+      { name: PushKeys.name, schema: PushKeysSchema }
     ])
   ],
   controllers: [
@@ -77,7 +85,9 @@ import { getConfig } from './config/app-config';
     InstagramController,
     WhatsAppController,
     FormatController,
-    ReactionController
+    ReactionController,
+    PushController,
+    ImageConvertController
   ],
   providers: [
     AuthService,
@@ -104,7 +114,10 @@ import { getConfig } from './config/app-config';
     InstagramPublisherService,
     WhatsAppService,
     FormatLibraryService,
-    WhatsAppCredentialsService
+    WhatsAppCredentialsService,
+    PushService,
+    SignInAlertService,
+    HealthService
   ],
 })
 export class AppModule {}

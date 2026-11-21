@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 /**
  * Runs viral adaptations in the background so the app can watch real progress, leave the page, refresh or close the
  * tab, and come back to the finished meme. The pipeline is the same one POST /api/memes/adapt-viral runs; this only
@@ -32,6 +33,8 @@ export function jobErrorFrom(err: unknown): JobError {
 export class AdaptationJobService {
   private readonly logger = new Logger(AdaptationJobService.name);
   private readonly jobs = new Map<string, AdaptationJob>();
+  /** 'finished' (JobView) once a job is done or failed: push notifications listen. Listener errors never reach the job. */
+  readonly events = new EventEmitter();
 
   /**
    * Starts `run` in the background and returns at once. `onFailure` runs if it fails (e.g. to delete the uploads
@@ -52,6 +55,7 @@ export class AdaptationJobService {
     void (async () => {
       try {
         job.succeed(await run(sink));
+        this.announce(job);
       } catch (err) {
         const error = jobErrorFrom(err);
         if (error.status >= 500) this.logger.error(`Adaptation job ${job.id} failed: ${(err as Error)?.message || err}`);
@@ -61,9 +65,18 @@ export class AdaptationJobService {
           /* cleanup is best effort */
         }
         job.fail(error);
+        this.announce(job);
       }
     })();
     return job.view();
+  }
+
+  private announce(job: AdaptationJob): void {
+    try {
+      this.events.emit('finished', job.view());
+    } catch (err) {
+      this.logger.warn(`A job listener failed: ${(err as Error)?.message || err}`);
+    }
   }
 
   get(id: string): JobView | undefined {
