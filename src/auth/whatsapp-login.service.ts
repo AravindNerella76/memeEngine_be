@@ -63,6 +63,10 @@ export class WhatsAppLoginService {
   private readonly logger = new Logger(WhatsAppLoginService.name);
   readonly challenges: WhatsAppChallenges;
   private botCache: { at: number; ok: boolean; value: BotNumber | null; reason?: string } | null = null;
+  /** The request each page is waiting with, per code. Only the newest may collect the session (see poll). */
+  private readonly holders = new Map<string, AbortController>();
+  /** Sessions being written, per code, so a second collection waits for the first to finish. */
+  private readonly writes = new Map<string, Promise<unknown>>();
 
   constructor(
     private readonly auth: AuthService,
@@ -142,26 +146,70 @@ export class WhatsAppLoginService {
   async poll(token: unknown, client: ClientInfo, signal?: AbortSignal, holdMs = POLL_HOLD_MS): Promise<PollOutcome> {
     const c = this.challenges.lookup(token);
     if (!c) return { status: 'expired' }; // unknown: it ran out long ago, or the server restarted
-    if (c.state === 'pending') {
-      await this.challenges.waitForChange(c, holdMs, signal);
-      this.challenges.lookup(token); // applies the expiry
-      if (c.state === 'pending') return { status: 'pending', expiresAt: c.expiresAt, ...(c.rejectedFrom ? { rejectedFrom: c.rejectedFrom } : {}) };
-    }
-    if (c.state === 'approved') {
-      if (signal?.aborted) return { status: 'pending', expiresAt: c.expiresAt }; // nobody is listening: leave it for the next ask
-      const mine = this.challenges.consume(token);
-      if (!mine || !mine.approvedBy) return { status: 'used' };
-      const s = await this.auth.signInWithWhatsApp(mine.approvedBy, client, mine.id);
-      // "That wasn't me" may have been tapped while the session was being written: honour it
-      if (this.challenges.get(mine.id)?.state === 'cancelled') {
-        await this.auth.endSessionsOfChallenge(mine.id);
-        return { status: 'cancelled', by: 'whatsapp' };
+
+    // Only the page's newest request may collect the session. When a page gives up on a request and asks again (it does
+    // when its tab comes back into view), a proxy in between may keep the old one open here; if that one collected, the
+    // session would go to a request nobody reads, and the page would be told "used" and show a new code forever.
+    this.holders.get(c.id)?.abort();
+    const mine = new AbortController();
+    this.holders.set(c.id, mine);
+    const gone = () => mine.abort();
+    if (signal?.aborted) mine.abort();
+    signal?.addEventListener('abort', gone, { once: true });
+    try {
+      if (c.state === 'pending') {
+        await this.challenges.waitForChange(c, holdMs, mine.signal);
+        this.challenges.lookup(token); // applies the expiry
+        if (c.state === 'pending') return { status: 'pending', expiresAt: c.expiresAt, ...(c.rejectedFrom ? { rejectedFrom: c.rejectedFrom } : {}) };
       }
-      return { status: 'approved', token: s.token, username: s.username, maxAgeSeconds: s.maxAgeSeconds, phoneTail: phoneTail(mine.approvedBy) };
+      if (c.state === 'approved') {
+        // replaced by a newer request, or nobody is listening any more: leave it for the request that is
+        if (mine.signal.aborted) return { status: 'pending', expiresAt: c.expiresAt };
+        const won = this.challenges.consume(token);
+        if (!won || !won.approvedBy) return { status: 'used' };
+        return await this.collect(won, client, false);
+      }
+      if (c.state === 'consumed') {
+        if (mine.signal.aborted) return { status: 'used' };
+        // the same page asking again right after collecting: its session never arrived, so it gets a new one
+        const again = this.challenges.recollect(token);
+        if (again) return await this.collect(again, client, true);
+        return { status: 'used' };
+      }
+      if (c.state === 'cancelled') return { status: 'cancelled', by: c.cancelledBy };
+      return { status: 'expired' };
+    } finally {
+      signal?.removeEventListener('abort', gone);
+      if (this.holders.get(c.id) === mine) this.holders.delete(c.id);
     }
-    if (c.state === 'consumed') return { status: 'used' };
-    if (c.state === 'cancelled') return { status: 'cancelled', by: c.cancelledBy };
-    return { status: 'expired' };
+  }
+
+  /** Writes the session for an approved code. `again`: the first one was lost on the way, so it is replaced, not added. */
+  private async collect(c: Challenge, client: ClientInfo, again: boolean): Promise<PollOutcome> {
+    const approvedBy = c.approvedBy as string;
+    const previous = this.writes.get(c.id);
+    // starts one tick later, so it is registered in `writes` before any of it runs
+    const write = Promise.resolve().then(async () => {
+      if (again) {
+        await previous?.catch(() => undefined); // the lost session may still be being written: let it land, then end it
+        await this.auth.endSessionsOfChallenge(c.id);
+        this.logger.log(`Sign-in code ${formatCode(c.code)}: the page did not receive its session, so it was replaced with a new one.`);
+      }
+      return this.auth.signInWithWhatsApp(approvedBy, client, c.id, { announce: !again });
+    });
+    this.writes.set(c.id, write);
+    try {
+      const s = await write;
+      // "That wasn't me" (or "Sign out everywhere") may have been tapped while the session was being written: honour it
+      const now = this.challenges.get(c.id);
+      if (now?.state === 'cancelled' || now?.sealed) {
+        await this.auth.endSessionsOfChallenge(c.id);
+        return { status: 'cancelled', by: now.cancelledBy || (now.sealed ? 'everywhere' : 'whatsapp') };
+      }
+      return { status: 'approved', token: s.token, username: s.username, maxAgeSeconds: s.maxAgeSeconds, phoneTail: phoneTail(approvedBy) };
+    } finally {
+      if (this.writes.get(c.id) === write) this.writes.delete(c.id);
+    }
   }
 
   /** The page moved on (password tab, closed dialog): its code stops working. */

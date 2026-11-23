@@ -31,6 +31,10 @@ export interface Challenge {
   /** The allowed number that approved it (digits). */
   approvedBy?: string;
   approvedAt?: number;
+  /** When the page collected its session; for a short while the same page may collect again (see `recollect`). */
+  collectedAt?: number;
+  /** "Sign out everywhere" happened after it was collected: it can never be collected again. */
+  sealed?: boolean;
   /** The code arrived from a number that is NOT allowed: the last digits, so the page can say so. */
   rejectedFrom?: string;
   /** Why it was cancelled: from the browser itself, from WhatsApp ("That wasn't me"), or by "Sign out everywhere". */
@@ -189,6 +193,20 @@ export class WhatsAppChallenges {
     const c = this.lookup(token);
     if (!c || c.state !== 'approved') return null;
     c.state = 'consumed';
+    c.collectedAt = this.now();
+    return c;
+  }
+
+  /**
+   * The page that collected this code asks again shortly after: the answer carrying its session never reached it (the
+   * connection dropped, or a proxy delivered it to a request the page had already given up on). Only the page holds the
+   * token, so it may collect once more within `collectMs`; the caller replaces the lost session with a new one.
+   */
+  recollect(token: unknown): Challenge | null {
+    const c = this.lookup(token);
+    if (!c || c.state !== 'consumed' || c.sealed || !c.approvedBy || c.collectedAt === undefined) return null;
+    if (this.now() - c.collectedAt > this.o.collectMs) return null;
+    c.collectedAt = this.now();
     return c;
   }
 
@@ -210,7 +228,7 @@ export class WhatsAppChallenges {
       if (s === 'pending' || s === 'approved') {
         this.finish(c, 'cancelled', 'everywhere');
         n++;
-      }
+      } else if (s === 'consumed') c.sealed = true; // its session ends with all the others; it must not come back
     }
     return n;
   }

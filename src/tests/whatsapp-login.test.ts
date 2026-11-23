@@ -32,19 +32,22 @@ const ENV = {
 /** Stands in for AuthService: remembers the sessions WhatsApp sign-ins create. */
 function fakeAuth() {
   const sessions: { phone: string; challengeId: string; ip: string }[] = [];
+  const announced: string[] = []; // sign-ins that would send an alert
   let beforeWrite: (() => void) | null = null;
   return {
     sessions,
+    announced,
     /** runs while a session is being written (to test what happens when WhatsApp answers at that very moment) */
     duringWrite(fn: () => void) {
       beforeWrite = fn;
     },
     ownerExists: async () => true,
     staticFlags: () => ({}),
-    async signInWithWhatsApp(phone: string, c: { ip: string }, challengeId: string) {
+    async signInWithWhatsApp(phone: string, c: { ip: string }, challengeId: string, opts: { announce?: boolean } = {}) {
       beforeWrite?.();
       beforeWrite = null;
       sessions.push({ phone, challengeId, ip: c.ip });
+      if (opts.announce !== false) announced.push(challengeId);
       return { token: 'A'.repeat(43), username: 'owner', maxAgeSeconds: 3600 };
     },
     async endSessionsOfChallenge(id: string) {
@@ -227,7 +230,69 @@ describe('WhatsApp sign-in', () => {
       assert.equal(out.status, 'approved');
       assert.equal((out as any).phoneTail, '8120');
       assert.deepEqual(auth.sessions, [{ phone: OWNER, challengeId: challenge.id, ip: '203.0.113.7' }]);
-      assert.equal((await svc.poll(token, client())).status, 'used', 'a second tab cannot collect it again');
+    });
+
+    // The bug the owner hit (2026-11-24): WhatsApp said "Signed in", the page kept showing new codes. The page had asked
+    // again (tab back in view) while the dev proxy kept its abandoned request open; that one collected the session, the
+    // answer went nowhere, and the live request was told "used".
+    it('an abandoned request still held open never takes the session from the page\'s newest request', async () => {
+      const { auth, svc } = setup();
+      const { challenge, token } = svc.start(client());
+      const abandoned = svc.poll(token, client()); // the proxy keeps it open; nobody reads its answer
+      const live = svc.poll(token, client());
+      await svc.onWhatsAppText(OWNER, challenge.code, true);
+      assert.equal((await abandoned).status, 'pending', 'stepped aside the moment a newer request arrived');
+      const out = await live;
+      assert.equal(out.status, 'approved');
+      assert.equal(auth.sessions.length, 1);
+    });
+
+    it('when the answer with the session is lost, the same page asking again gets a new one (replacing it, no second alert)', async () => {
+      const { auth, svc } = setup();
+      const { challenge, token } = svc.start(client());
+      await svc.onWhatsAppText(OWNER, challenge.code, true);
+      assert.equal((await svc.poll(token, client())).status, 'approved'); // ...but this answer never arrives
+      const again = await svc.poll(token, client());
+      assert.equal(again.status, 'approved');
+      assert.equal(auth.sessions.length, 1, 'the lost session was ended, not kept beside the new one');
+      assert.deepEqual(auth.announced, [challenge.id], 'one sign-in, one alert');
+    });
+
+    it('collecting again works only for a short while, never after "That wasn\'t me" or "Sign out everywhere"', async () => {
+      const t = clock();
+      const auth = fakeAuth();
+      const svc = new WhatsAppLoginService(auth as unknown as AuthService, undefined, new WhatsAppChallenges({}, t.now));
+      const late = svc.start(client());
+      await svc.onWhatsAppText(OWNER, late.challenge.code, true);
+      await svc.poll(late.token, client());
+      t.advance(2 * 60_000 + 1);
+      assert.equal((await svc.poll(late.token, client())).status, 'used');
+
+      const denied = svc.start(client());
+      await svc.onWhatsAppText(OWNER, denied.challenge.code, true);
+      await svc.poll(denied.token, client());
+      await svc.onWhatsAppButton(OWNER, `${DENY_PREFIX}${denied.challenge.id}`, true);
+      assert.equal((await svc.poll(denied.token, client())).status, 'cancelled');
+
+      const everywhere = svc.start(client());
+      await svc.onWhatsAppText(OWNER, everywhere.challenge.code, true);
+      await svc.poll(everywhere.token, client());
+      await svc.onWhatsAppText(OWNER, 'Sign out everywhere', true);
+      assert.equal((await svc.poll(everywhere.token, client())).status, 'used');
+      assert.equal(auth.sessions.length, 0, 'nothing came back');
+    });
+
+    it('a second collection waits for the first session to be written, then ends it', async () => {
+      const { auth, svc } = setup();
+      const { challenge, token } = svc.start(client());
+      await svc.onWhatsAppText(OWNER, challenge.code, true);
+      let second: Promise<unknown> | null = null;
+      auth.duringWrite(() => {
+        second = svc.poll(token, client()); // the page asks again while the first session is still being written
+      });
+      await svc.poll(token, client());
+      assert.equal(((await second) as { status: string }).status, 'approved');
+      assert.equal(auth.sessions.length, 1);
     });
 
     it('keeps the page waiting (and says why) when a stranger sends the code', async () => {

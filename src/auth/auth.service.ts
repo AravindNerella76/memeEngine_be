@@ -202,14 +202,15 @@ export class AuthService implements OnModuleInit {
   }
 
   /** Signs the owner in because an allowed WhatsApp number sent this browser's code (checked by the caller). */
-  async signInWithWhatsApp(phone: string, client: ClientInfo, challengeId: string): Promise<{ token: string; username: string; maxAgeSeconds: number }> {
+  /** `announce: false` when it only replaces a session of the same sign-in that never reached the browser (no second alert). */
+  async signInWithWhatsApp(phone: string, client: ClientInfo, challengeId: string, { announce = true }: { announce?: boolean } = {}): Promise<{ token: string; username: string; maxAgeSeconds: number }> {
     const owner = await this.ownerAccount();
     if (!owner) throw new ConflictException({ statusCode: 409, code: 'setup_required', message: 'Create the owner account first (npm run auth:create-owner).' });
     const tail = String(phone).replace(/\D/g, '').slice(-4);
     await this.users.updateOne({ _id: owner.id }, { $set: { lastLoginAt: new Date() } });
     const created = await this.createSession(owner.id, client, { method: 'whatsapp', phoneTail: tail, challengeId });
     this.logger.log(`Signed in "${owner.username}" with WhatsApp (number ending ${tail}) from ${client.ip}`);
-    this.emit('signin', { sessionId: created.sessionId, username: owner.username, method: 'whatsapp', ip: client.ip, userAgent: client.userAgent, approvedBy: String(phone).replace(/\D/g, ''), at: new Date() } satisfies SignInEvent);
+    if (announce) this.emit('signin', { sessionId: created.sessionId, username: owner.username, method: 'whatsapp', ip: client.ip, userAgent: client.userAgent, approvedBy: String(phone).replace(/\D/g, ''), at: new Date() } satisfies SignInEvent);
     return { ...created, username: owner.username };
   }
 
