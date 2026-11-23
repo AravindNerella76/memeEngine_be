@@ -59,8 +59,18 @@ async function fromHeic(buf: Buffer): Promise<NormalizedImage> {
     throw new ImageValidationError(`HEIC image is too large (${width}x${height}); the limit is ${MAX_IMAGE_PIXELS / 1_000_000} megapixels`);
   }
   const canvas = createCanvas(width, height);
-  canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength), width, height), 0, 0);
-  const { buffer, type } = encodeCanvas(canvas);
+  const pixels = new Uint8ClampedArray(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
+  canvas.getContext('2d').putImageData(new ImageData(pixels, width, height), 0, 0);
+  // HEIC is a camera format: a photo. JPEG quality 95 looks the same and is a fraction of a PNG's size (a 12 MP PNG is
+  // tens of MB). PNG only when the picture really has transparency.
+  let transparent = false;
+  for (let i = 3; i < pixels.length; i += 4) {
+    if (pixels[i] !== 255) {
+      transparent = true;
+      break;
+    }
+  }
+  const { buffer, type } = transparent ? encodeCanvas(canvas) : { buffer: canvas.toBuffer('image/jpeg', 95), type: 'jpeg' as ImageType };
   return { buffer, type, mime: MIME_BY_TYPE[type], ext: EXT_BY_TYPE[type], width, height, convertedFrom: 'heic' };
 }
 

@@ -183,10 +183,10 @@ export async function verifyAndNormalizeUploads(files: MulterUploadedFile[]): Pr
  * original, so every later step works with an ordinary image. Anything else is left alone.
  */
 async function convertHeicUpload(f: MulterUploadedFile): Promise<void> {
-  const head = Buffer.alloc(16);
+  const head = Buffer.alloc(32); // the HEIC signature ("ftyp" + brand) sits in the first 12 bytes; isHeic wants a little more
   const fd = fs.openSync(f.path, 'r');
   try {
-    fs.readSync(fd, head, 0, 16, 0);
+    fs.readSync(fd, head, 0, head.length, 0);
   } finally {
     fs.closeSync(fd);
   }
