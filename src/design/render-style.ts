@@ -11,7 +11,7 @@
  */
 import type { DesignSpecifications } from '../types/meme.types';
 import { ENGLISH_FONTS, TELUGU_FONTS } from './fonts';
-import { AppSettings, CANVAS_SIZES, CanvasSettings, hexToRgba, ImageProcessingSettings, parseCssColor, RoleEffects, RoleTypography, TEXT_ROLES, TextRoleId } from './settings';
+import { AppSettings, CANVAS_SIZES, CanvasSettings, hexToRgba, ImageProcessingSettings, parseCssColor, RoleEffects, RoleTypography, TEXT_ROLES, TextRoleId, WatermarkSettings } from './settings';
 
 export interface StyleKnobs {
   fontFamily: string;
@@ -164,6 +164,8 @@ export interface RenderStyle {
   elements: Record<TextElementId, ElementStyle>;
   canvas: { background: string; headerBackground: string; cornerRadius: number; outputScale: number; punchlineMaxGrowRatio: number; maxHeaderRatio: number; punchlineSetupScale: number };
   image: { subjectFit: 'cover' | 'contain'; reactionFit: 'cover' | 'contain'; portraitAnchorY: number; landscapeAnchorY: number; reactionAnchorY: number; useFocalPoint: boolean; jpegQuality: number | null; trimBorders: boolean };
+  /** The page's logo on the finished meme; null = none (older memes, or switched off). */
+  watermark: WatermarkSettings | null;
 }
 
 /** The renderer's original constants (memes without a style snapshot). Do not change: old memes must render identically. */
@@ -211,7 +213,8 @@ export function legacyRenderStyle(specs: DesignSpecifications): RenderStyle {
       }
     },
     canvas: { background: '#000000', headerBackground: specs.headerBgColor || '#000000', cornerRadius: 0, outputScale: 1, punchlineMaxGrowRatio: 0.62, maxHeaderRatio: 0.2, punchlineSetupScale: 0.74 },
-    image: { subjectFit: specs.subjectFit || 'cover', reactionFit: 'cover', portraitAnchorY: 0.28, landscapeAnchorY: 0.4, reactionAnchorY: 0.36, useFocalPoint: true, jpegQuality: null, trimBorders: false }
+    image: { subjectFit: specs.subjectFit || 'cover', reactionFit: 'cover', portraitAnchorY: 0.28, landscapeAnchorY: 0.4, reactionAnchorY: 0.36, useFocalPoint: true, jpegQuality: null, trimBorders: false },
+    watermark: null
   };
 }
 
@@ -300,7 +303,9 @@ function snapshotRenderStyle(specs: DesignSpecifications, snap: StyleSnapshot): 
       maxHeaderRatio: c.maxHeaderRatio,
       punchlineSetupScale: typeof c.punchlineSetupScale === 'number' ? c.punchlineSetupScale : 0.74
     },
-    image: { ...snap.image, trimBorders: snap.image.trimBorders === true, ...(specs.subjectFit ? { subjectFit: specs.subjectFit } : {}) }
+    image: { ...snap.image, trimBorders: snap.image.trimBorders === true, ...(specs.subjectFit ? { subjectFit: specs.subjectFit } : {}) },
+    // snapshots taken before the watermark existed have none: those memes stay exactly as they were made
+    watermark: c.watermark?.enabled ? { ...c.watermark } : null
   };
 }
 

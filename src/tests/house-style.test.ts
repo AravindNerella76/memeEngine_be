@@ -147,6 +147,17 @@ describe('text rules', () => {
       [false, 0, 'first', false, 0.74]
     );
   });
+
+  it('the logo goes on new memes only; older memes and snapshots never get it', () => {
+    assert.deepEqual(resolveRenderStyle(designFromSettings(defaultSettings())).watermark, { enabled: true, position: 'auto', size: 0.14, opacity: 1 });
+    assert.equal(resolveRenderStyle(profileToDesignSpecs(KANYARAASI_DEFAULT_PROFILE)).watermark, null);
+    const old = designFromSettings(defaultSettings()) as any;
+    delete old.style.canvas.watermark;
+    assert.equal(resolveRenderStyle(old).watermark, null);
+    const off = defaultSettings();
+    off.canvas.watermark.enabled = false;
+    assert.equal(resolveRenderStyle(designFromSettings(off)).watermark, null);
+  });
 });
 
 describe('rendering in the house style', () => {
@@ -161,14 +172,14 @@ describe('rendering in the house style', () => {
   });
   after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-  async function render(design: any, punchline = '') {
+  async function render(design: any, punchline = '', extra: Record<string, string> = {}) {
     const asset = (f: string, i: number, role: string): any => ({ id: `a${i}`, originalName: f, filename: f, path: path.join(tmp, f), mimeType: 'image/png', role, orderIndex: i });
     const { render: r } = await layoutAndRender(
       layoutEngine,
       renderer,
       design,
       { memeType: 'trending_news' },
-      { topic: 't', punchline: punchline || 'X' },
+      { topic: 't', punchline: punchline || 'X', ...extra },
       { subjectImages: [asset('s.png', 0, 'subject_item'), asset('s.png', 1, 'subject_item')], reactionImage: asset('rx.png', 99, 'reaction_punchline') },
       { subjectAspectRatios: [0.75, 0.75], reactionAspectRatio: 1350 / 640 }
     );
@@ -183,7 +194,8 @@ describe('rendering in the house style', () => {
       for (let i = 0; i < d.length; i += 4) if (d[i] < 20 && d[i + 1] < 20 && d[i + 2] < 20) n++;
       return n / img.width;
     };
-    return { blackRow, height: img.height };
+    const px = (x: number, y: number) => Array.from(g.getImageData(x, y, 1, 1).data.slice(0, 3));
+    return { blackRow, height: img.height, px };
   }
 
   it('a letterboxed reaction picture fills its panel: no black bands at its top and bottom', async () => {
@@ -202,6 +214,24 @@ describe('rendering in the house style', () => {
     const plain = await render(designFromSettings(s), 'THE KING IS\nBACK TO DEN');
     const y = height - 200; // above the punchline
     assert.equal(blackRow(y), plain.blackRow(y), 'no shade above the words');
+  });
+
+  it('the logo is stamped centred on the top pictures, just above the text there', async () => {
+    const withLogo = defaultSettings();
+    const without = defaultSettings();
+    without.canvas.watermark.enabled = false;
+    const content = { statement: 'NVIDIA BOARD REINSTATES JENSEN HUANG AS C.E.O.' };
+    const a = await render(designFromSettings(withLogo), 'OK', content);
+    const b = await render(designFromSettings(without), 'OK', content);
+    // compare a band across the middle of the canvas: the logo changes pixels only around the centre line
+    let changedCentre = 0;
+    let changedEdge = 0;
+    for (let y = 0; y < a.height; y += 6) {
+      if (a.px(540, y).join() !== b.px(540, y).join()) changedCentre++;
+      if (a.px(60, y).join() !== b.px(60, y).join()) changedEdge++;
+    }
+    assert.ok(changedCentre > 10, `logo found on the centre line (${changedCentre} rows changed)`);
+    assert.equal(changedEdge, 0, 'nothing else changes');
   });
 
   it('with trimming off the bars stay, as they always did', async () => {

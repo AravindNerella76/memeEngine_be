@@ -13,6 +13,7 @@ import { ComputedMemeLayout } from './layout-engine.service';
 import { analyzeReactionImage, drawReactionPlan, drawSoftBackground, planReactionPanel } from './reaction-framing';
 import { EMOJI_FONT, ENGLISH_FONTS, FONT_FILES, TELUGU_FONTS } from '../design/fonts';
 import { ElementStyle, RenderStyle, resolveRenderStyle } from '../design/render-style';
+import type { WatermarkSettings } from '../design/settings';
 import { trimImageBorders } from './border-trim';
 
 export interface RenderResult {
@@ -524,6 +525,52 @@ export class CanvasRendererService implements OnModuleInit {
     }
   }
 
+  /** The page's logo, read once from be/brand/watermark.png (null when the file is not there). */
+  private static watermarkImage: Promise<any | null> | null = null;
+  static watermarkPath = path.join(__dirname, '..', '..', 'brand', 'watermark.png');
+  private loadWatermark(): Promise<any | null> {
+    if (!CanvasRendererService.watermarkImage) {
+      const p = CanvasRendererService.watermarkPath;
+      CanvasRendererService.watermarkImage = fs.existsSync(p) ? loadImage(p).catch(() => null) : Promise.resolve(null);
+    }
+    return CanvasRendererService.watermarkImage;
+  }
+  /** A new logo file was saved: read it again next time. */
+  static forgetWatermark() {
+    CanvasRendererService.watermarkImage = null;
+  }
+
+  /**
+   * Stamps the logo on the finished meme. `auto` follows how the page places it by hand: centred on the seam of the
+   * top pictures, a little above the text that sits there (or above the bottom of the pictures when there is none).
+   */
+  private async drawWatermark(ctx: SKRSContext2D, wm: WatermarkSettings, layout: ComputedMemeLayout, textTop: number | null) {
+    const logo = await this.loadWatermark();
+    if (!logo) return;
+    const W = layout.canvasWidth;
+    const H = layout.canvasHeight;
+    const d = Math.round(W * wm.size);
+    const margin = Math.round(W * 0.025);
+    const section = layout.subjectSectionBox;
+    let x: number;
+    let y: number;
+    if (wm.position === 'auto' && section && section.height > d * 1.6) {
+      x = Math.round((W - d) / 2);
+      const above = textTop !== null && textTop > section.y ? textTop : section.y + section.height;
+      y = Math.round(Math.max(section.y + margin, above - d - margin * 0.6));
+    } else {
+      const pos = wm.position === 'auto' ? 'top-right' : wm.position;
+      x = pos.endsWith('left') ? margin : W - d - margin;
+      y = pos.startsWith('top') ? margin : H - d - margin;
+    }
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, Math.min(1, wm.opacity));
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(logo, 0, 0, logo.width, logo.height, x, y, d, d);
+    ctx.restore();
+  }
+
   private async loadAssetImage(p: string, what: string, loader?: (path: string) => Promise<any>) {
     try {
       return await (loader ? loader(p) : loadImage(p));
@@ -559,6 +606,7 @@ export class CanvasRendererService implements OnModuleInit {
 
     ctx.fillStyle = style.canvas.background;
     ctx.fillRect(0, 0, width, height);
+    let sectionTextTop: number | null = null; // top of the text over the top pictures (the logo sits just above it)
 
     // 1. Subject images
     const subjectImages = assets.subjectImages || [];
@@ -646,6 +694,7 @@ export class CanvasRendererService implements OnModuleInit {
       }
       if (!fit) throw new TextFitError('statement', 'The statement text is too long for the image area.');
       textFit.statement = { size: fit.size, lines: fit.lines.length };
+      sectionTextTop = this.blockBounds(fit, box, el).top;
       this.drawShade(ctx, layout.subjectSectionBox, this.blockBounds(fit, box, el), el.shadeAlpha);
       this.drawFitted(ctx, fit, box, el, (idx, line) => line.startsWith('-') || line.includes('PRODUCER') || this.patternLine(el, idx));
     }
@@ -684,6 +733,7 @@ export class CanvasRendererService implements OnModuleInit {
       textFit.bullets = { size: fit.size, lines: fit.blocks.reduce((a, b) => a + b.length, 0) };
       const totalLines = fit.blocks.reduce((a, b) => a + b.length, 0);
       let y = this.firstLineY(box, totalLines * fit.lineH, fit.lineH, el);
+      sectionTextTop = sectionTextTop === null ? y - fit.lineH / 2 : Math.min(sectionTextTop, y - fit.lineH / 2);
       this.drawShade(ctx, layout.subjectSectionBox, { top: y - fit.lineH / 2, bottom: y - fit.lineH / 2 + totalLines * fit.lineH }, el.shadeAlpha);
       const x = el.align === 'center' ? width / 2 : this.anchorX(box, el);
       fit.blocks.forEach((block, idx) => {
@@ -749,6 +799,9 @@ export class CanvasRendererService implements OnModuleInit {
       textFit.punchline = { size: fit.size, lines: fit.lines.length };
       this.drawPunchline(ctx, fit, box, el, style.canvas.punchlineSetupScale, layout.reactionBox || undefined);
     }
+
+    // 9. The page's logo, on the finished meme
+    if (style.watermark) await this.drawWatermark(ctx, style.watermark, layout, sectionTextTop);
 
     this.validateOutput(ctx, layout, assets, scale);
 

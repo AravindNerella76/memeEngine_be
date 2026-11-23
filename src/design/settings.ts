@@ -90,6 +90,19 @@ export interface CanvasSettings {
   cornerRadius: number;
   /** Smallest image area the automatic layout may produce (px); smaller grids are equalised. */
   minSlotSize: number;
+  /**
+   * The page's logo (be/brand/watermark.png) stamped on every finished meme. `auto`: centred on the seam of the top
+   * pictures, just above the text there, as the page has always placed it by hand. `size` = diameter / meme width.
+   */
+  watermark: WatermarkSettings;
+}
+
+export type WatermarkPosition = 'auto' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+export interface WatermarkSettings {
+  enabled: boolean;
+  position: WatermarkPosition;
+  size: number;
+  opacity: number;
 }
 
 export interface ImageProcessingSettings {
@@ -235,7 +248,8 @@ export function defaultSettings(env?: AppConfig): AppSettings {
       imageGap: 0,
       sectionGap: 0,
       cornerRadius: 0,
-      minSlotSize: 140
+      minSlotSize: 140,
+      watermark: { enabled: true, position: 'auto', size: 0.14, opacity: 1 }
     },
     imageProcessing: {
       subjectFit: 'cover',
@@ -349,7 +363,13 @@ export const SETTINGS_SCHEMA: { [K in SettingsSection]: Spec } & { name: Spec } 
     imageGap: num(0, 24, 1, 'px'),
     sectionGap: num(0, 24, 1, 'px'),
     cornerRadius: num(0, 40, 1, 'px'),
-    minSlotSize: num(100, 400, 10, 'px')
+    minSlotSize: num(100, 400, 10, 'px'),
+    watermark: {
+      enabled: bool,
+      position: oneOf('auto', 'top-left', 'top-right', 'bottom-left', 'bottom-right'),
+      size: num(0.06, 0.3, 0.01),
+      opacity: num(0.2, 1, 0.05)
+    }
   },
   imageProcessing: {
     subjectFit: oneOf('cover', 'contain'),
