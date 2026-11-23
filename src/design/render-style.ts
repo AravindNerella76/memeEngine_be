@@ -28,11 +28,16 @@ export interface StyleKnobs {
 
 export type StyleImageSettings = Pick<
   ImageProcessingSettings,
-  'subjectFit' | 'reactionFit' | 'portraitAnchorY' | 'landscapeAnchorY' | 'reactionAnchorY' | 'useFocalPoint' | 'jpegQuality' | 'primaryFormat'
+  'subjectFit' | 'reactionFit' | 'portraitAnchorY' | 'landscapeAnchorY' | 'reactionAnchorY' | 'useFocalPoint' | 'jpegQuality' | 'primaryFormat' | 'trimBorders'
 >;
 
 export interface StyleSnapshot {
   version: 2;
+  /**
+   * Text rules in force when the snapshot was taken. 2 (2026-11-24): a number stays on the line of the word after it
+   * ("4 TRILLION", never "OVER 4" / "TRILLION"). Missing on older snapshots, which keep wrapping as they did.
+   */
+  rev?: number;
   roles: Record<TextRoleId, { typography: RoleTypography; effects: RoleEffects }>;
   canvas: CanvasSettings;
   image: StyleImageSettings;
@@ -65,6 +70,7 @@ export function styleSnapshotFromSettings(s: AppSettings): StyleSnapshot {
   const ip = s.imageProcessing;
   return {
     version: 2,
+    rev: 2,
     roles: Object.fromEntries(TEXT_ROLES.map(r => [r, { typography: clone(s.typography.roles[r]), effects: clone(s.effects.roles[r]) }])) as StyleSnapshot['roles'],
     canvas: clone(s.canvas),
     image: {
@@ -74,6 +80,7 @@ export function styleSnapshotFromSettings(s: AppSettings): StyleSnapshot {
       landscapeAnchorY: ip.landscapeAnchorY,
       reactionAnchorY: ip.reactionAnchorY,
       useFocalPoint: ip.useFocalPoint,
+      trimBorders: ip.trimBorders,
       jpegQuality: ip.jpegQuality,
       primaryFormat: ip.primaryFormat
     },
@@ -136,6 +143,12 @@ export interface ElementStyle {
   fillCss: string;
   /** null = highlighting off (every line uses the fill colour). */
   highlightCss: string | null;
+  /** Heading and supporting text: highlight only the first line, or every other line. */
+  highlightPattern: 'first' | 'alternate';
+  /** Opacity of the dark shade behind the text (0 = none). */
+  shadeAlpha: number;
+  /** A number is never left at the end of a line: it moves down with the word it counts. */
+  keepNumbersWithWords: boolean;
   /** null = no outline. */
   strokeCss: string | null;
   strokeWidth: number;
@@ -149,8 +162,8 @@ export interface ElementStyle {
 export interface RenderStyle {
   legacy: boolean;
   elements: Record<TextElementId, ElementStyle>;
-  canvas: { background: string; headerBackground: string; cornerRadius: number; outputScale: number; punchlineMaxGrowRatio: number; maxHeaderRatio: number };
-  image: { subjectFit: 'cover' | 'contain'; reactionFit: 'cover' | 'contain'; portraitAnchorY: number; landscapeAnchorY: number; reactionAnchorY: number; useFocalPoint: boolean; jpegQuality: number | null };
+  canvas: { background: string; headerBackground: string; cornerRadius: number; outputScale: number; punchlineMaxGrowRatio: number; maxHeaderRatio: number; punchlineSetupScale: number };
+  image: { subjectFit: 'cover' | 'contain'; reactionFit: 'cover' | 'contain'; portraitAnchorY: number; landscapeAnchorY: number; reactionAnchorY: number; useFocalPoint: boolean; jpegQuality: number | null; trimBorders: boolean };
 }
 
 /** The renderer's original constants (memes without a style snapshot). Do not change: old memes must render identically. */
@@ -170,6 +183,9 @@ export function legacyRenderStyle(specs: DesignSpecifications): RenderStyle {
     position: 'middle',
     fillCss: secondary,
     highlightCss: highlight,
+    highlightPattern: 'first',
+    shadeAlpha: 0,
+    keepNumbersWithWords: false,
     strokeCss: specs.outlineColor || '#000000',
     strokeWidth: specs.outlineThickness || 8,
     shadowCss: specs.shadowColor || 'rgba(0, 0, 0, 0.95)',
@@ -194,8 +210,8 @@ export function legacyRenderStyle(specs: DesignSpecifications): RenderStyle {
         shadowOffsetY: 0
       }
     },
-    canvas: { background: '#000000', headerBackground: specs.headerBgColor || '#000000', cornerRadius: 0, outputScale: 1, punchlineMaxGrowRatio: 0.62, maxHeaderRatio: 0.2 },
-    image: { subjectFit: specs.subjectFit || 'cover', reactionFit: 'cover', portraitAnchorY: 0.28, landscapeAnchorY: 0.4, reactionAnchorY: 0.36, useFocalPoint: true, jpegQuality: null }
+    canvas: { background: '#000000', headerBackground: specs.headerBgColor || '#000000', cornerRadius: 0, outputScale: 1, punchlineMaxGrowRatio: 0.62, maxHeaderRatio: 0.2, punchlineSetupScale: 0.74 },
+    image: { subjectFit: specs.subjectFit || 'cover', reactionFit: 'cover', portraitAnchorY: 0.28, landscapeAnchorY: 0.4, reactionAnchorY: 0.36, useFocalPoint: true, jpegQuality: null, trimBorders: false }
   };
 }
 
@@ -250,6 +266,10 @@ function snapshotRenderStyle(specs: DesignSpecifications, snap: StyleSnapshot): 
       position: t.position,
       fillCss: hexToRgba(e.fill.color, e.fill.opacity),
       highlightCss: e.highlight.enabled ? hexToRgba(e.highlight.color, e.fill.opacity) : null,
+      // snapshots taken before these existed have neither: first line only, no shade (they render as they always did)
+      highlightPattern: e.highlight.pattern === 'alternate' ? 'alternate' : 'first',
+      shadeAlpha: e.shade?.enabled ? Math.max(0, Math.min(1, Number(e.shade.opacity) || 0)) : 0,
+      keepNumbersWithWords: (snap.rev || 0) >= 2,
       strokeCss: e.stroke.enabled && e.stroke.width > 0 ? hexToRgba(e.stroke.color, e.stroke.opacity) : null,
       strokeWidth: e.stroke.width,
       shadowCss: e.shadow.enabled ? hexToRgba(e.shadow.color, e.shadow.opacity) : null,
@@ -277,9 +297,10 @@ function snapshotRenderStyle(specs: DesignSpecifications, snap: StyleSnapshot): 
       cornerRadius: c.cornerRadius,
       outputScale: c.outputScale,
       punchlineMaxGrowRatio: c.punchlineMaxGrowRatio,
-      maxHeaderRatio: c.maxHeaderRatio
+      maxHeaderRatio: c.maxHeaderRatio,
+      punchlineSetupScale: typeof c.punchlineSetupScale === 'number' ? c.punchlineSetupScale : 0.74
     },
-    image: { ...snap.image, ...(specs.subjectFit ? { subjectFit: specs.subjectFit } : {}) }
+    image: { ...snap.image, trimBorders: snap.image.trimBorders === true, ...(specs.subjectFit ? { subjectFit: specs.subjectFit } : {}) }
   };
 }
 

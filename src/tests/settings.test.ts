@@ -39,15 +39,16 @@ describe('settings model', () => {
     assert.equal(s.canvas.aspect, 'portrait_4_5');
     assert.deepEqual(
       { h: s.typography.roles.heading.size, l: s.typography.roles.labels.size, s: s.typography.roles.supporting.size, p: s.typography.roles.punchline.size, c: s.typography.roles.caption.size },
-      { h: 48, l: 33, s: 38, p: 46, c: 34 }
+      { h: 48, l: 33, s: 42, p: 64, c: 34 }
     );
     assert.deepEqual(KANYARAASI_DEFAULT_PROFILE, {
       profileId: 'kanyaraasi-default',
       name: '@kanyaraasi_memes house style',
       canvas: { preset: 'portrait_4_5', width: 1080, height: 1350 },
-      typography: { englishFont: 'Arial Black', teluguFont: 'Ramabhadra', fontSizeScale: 1, textScales: {} },
-      colors: { primary: '#FFE500', secondary: '#FFFFFF', headerBackground: '#000000', headerText: '#FFE500', outline: '#000000', shadow: '#000000' },
-      effects: { outlineThickness: 4, shadowBlur: 13, shadowOffsetX: 0, shadowOffsetY: 0 },
+      // the house style since 2026-11-24 (matched to the owner's own PixelLab memes)
+      typography: { englishFont: 'Intrepid ExtraBold', teluguFont: 'Ramabhadra', fontSizeScale: 1, textScales: {} },
+      colors: { primary: '#FAE944', secondary: '#FFFFFF', headerBackground: '#000000', headerText: '#FAE944', outline: '#000000', shadow: 'rgba(0,0,0,0.9)' },
+      effects: { outlineThickness: 5, shadowBlur: 3, shadowOffsetX: 3, shadowOffsetY: 3 },
       imagery: { subjectAspectPreference: [0.75, 0.667], reactionAspect: 16 / 9, gaps: 0, dividerLines: false, borders: false },
       layout: { headerHeightRatio: 0.082 }
     });
@@ -103,7 +104,7 @@ describe('settings model', () => {
     const v1 = { ...clone(KANYARAASI_DEFAULT_PROFILE), colors: { ...KANYARAASI_DEFAULT_PROFILE.colors, primary: '#00FF00', shadow: 'rgba(0,0,0,0.5)' }, effects: { ...KANYARAASI_DEFAULT_PROFILE.effects, outlineThickness: 12 } };
     const s = settingsFromLegacyProfile(v1, defaultSettings());
     assert.equal(s.effects.roles.punchline.highlight.color, '#00FF00');
-    assert.equal(s.effects.roles.heading.highlight.color, '#FFE500', 'the heading has its own highlight (headerText)');
+    assert.equal(s.effects.roles.heading.highlight.color, '#FAE944', 'the heading has its own highlight (headerText)');
     assert.ok(Object.values(s.effects.roles).every(fx => fx.stroke.width === 12 && fx.shadow.opacity === 0.5));
     const view = profileFromSettings(s);
     assert.equal(view.colors.primary, '#00FF00');
@@ -191,12 +192,12 @@ describe('render style', () => {
     const st = resolveRenderStyle(design);
     assert.equal(st.legacy, false);
     assert.equal(st.elements.reactionContext.strokeWidth, 2);
-    const regen = resolveRenderStyle({ ...design, fontFamily: 'Anton', outlineThickness: 8, primaryTextColor: '#00FF00', shadowColor: 'rgba(255,0,0,0.5)' });
+    const regen = resolveRenderStyle({ ...design, fontFamily: 'Anton', outlineThickness: 10, primaryTextColor: '#00FF00', shadowColor: 'rgba(255,0,0,0.5)' });
     assert.ok(Object.values(regen.elements).every(e => e.englishFont === 'Anton'));
-    assert.equal(regen.elements.punchline.strokeWidth, 8, 'outline doubled (4 -> 8)');
+    assert.equal(regen.elements.punchline.strokeWidth, 10, 'outline doubled (5 -> 10)');
     assert.equal(regen.elements.reactionContext.strokeWidth, 4, 'proportional: the caption 2 -> 4');
     assert.equal(regen.elements.punchline.highlightCss, '#00FF00');
-    assert.equal(regen.elements.headline.highlightCss, '#FFE500', 'the heading keeps its own highlight colour');
+    assert.equal(regen.elements.headline.highlightCss, '#FAE944', 'the heading keeps its own highlight colour');
     assert.equal(regen.elements.punchline.shadowCss, 'rgba(255,0,0,0.5)');
   });
 });

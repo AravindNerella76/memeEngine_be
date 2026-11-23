@@ -11,6 +11,7 @@ export const FONT_FILES: { file: string; family: string; script: 'english' | 'te
   { file: 'NotoSansTelugu-Bold.ttf', family: 'Noto Sans Telugu', script: 'telugu' },
   { file: 'AnekTelugu-VariableFont_wdth,wght.ttf', family: 'Anek Telugu', script: 'telugu' },
   { file: 'AnekTelugu-VariableFont_wdth,wght.ttf', family: 'AnekTelugu', script: 'telugu' },
+  { file: 'Poppins-Black.ttf', family: 'Poppins Black', script: 'english' },
   { file: 'Anton-Regular.ttf', family: 'Anton', script: 'english' },
   { file: 'Arial-Black.ttf', family: 'Arial Black', script: 'english' },
   { file: 'Impact.ttf', family: 'Impact', script: 'english' },
@@ -21,5 +22,5 @@ export const FONT_FILES: { file: string; family: string; script: 'english' | 'te
 /** The family emoji are drawn with (last in every meme font stack, before the generic fallback). */
 export const EMOJI_FONT = 'Noto Color Emoji';
 
-export const ENGLISH_FONTS =['Arial Black', 'Anton', 'Impact', 'Intrepid ExtraBold', 'Intrepid'];
+export const ENGLISH_FONTS = ['Poppins Black', 'Arial Black', 'Anton', 'Impact', 'Intrepid ExtraBold', 'Intrepid'];
 export const TELUGU_FONTS = ['Ramabhadra', 'Mandali', 'Noto Sans Telugu', 'Anek Telugu'];

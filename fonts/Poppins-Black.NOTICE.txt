@@ -1,0 +1,9 @@
+Poppins-Black.ttf
+=================
+
+Poppins Black (weight 900), by the Indian Type Foundry (https://github.com/itfoundry/Poppins), from Google Fonts.
+Licensed under the SIL Open Font License, Version 1.1 (https://openfontlicense.org).
+Copyright 2020 The Poppins Project Authors.
+
+Why it is here: the house style's English meme text (chosen 2026-11-24 to match the look the owner builds by hand in
+PixelLab: heavy geometric capitals, round dots, a thin outline). Taken from the npm package @expo-google-fonts/poppins.

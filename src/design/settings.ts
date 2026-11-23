@@ -52,10 +52,15 @@ export interface RoleTypography {
 
 export interface RoleEffects {
   fill: { color: string; opacity: number };
-  /** The yellow emphasis (first line, numbers, alternating bullets ... depending on the role). */
-  highlight: { enabled: boolean; color: string };
+  /**
+   * The yellow emphasis (first line, numbers, alternating bullets ... depending on the role). `pattern` (heading and
+   * supporting text): only the first line, or every other line (yellow, white, yellow).
+   */
+  highlight: { enabled: boolean; color: string; pattern: 'first' | 'alternate' };
   stroke: { enabled: boolean; width: number; color: string; opacity: number };
   shadow: { enabled: boolean; color: string; blur: number; offsetX: number; offsetY: number; opacity: number };
+  /** A soft dark shade behind the text that fades out upwards (supporting text and punchline over pictures). */
+  shade: { enabled: boolean; opacity: number };
 }
 
 export type CanvasAspect = 'portrait_4_5' | 'square_1_1' | 'story_9_16';
@@ -76,6 +81,8 @@ export interface CanvasSettings {
   punchlineRatio: number;
   /** A long punchline may grow its area up to this share of the reaction image. */
   punchlineMaxGrowRatio: number;
+  /** Two-line punchline: the first (yellow, setup) line's size as a share of the second (white) line. */
+  punchlineSetupScale: number;
   /** Space between subject images (px); the background colour shows through. */
   imageGap: number;
   /** Space between header, subject images and reaction image (px). */
@@ -94,6 +101,8 @@ export interface ImageProcessingSettings {
   reactionAnchorY: number;
   /** Centre crops on the face found by visual verification. */
   useFocalPoint: boolean;
+  /** Cut away black or white bars around a picture (movie letterboxing, screenshot borders) before it is placed. */
+  trimBorders: boolean;
   jpegQuality: number;
   primaryFormat: 'png' | 'jpeg';
   /** Picture-hash distance treated as "the same picture" (higher = more aggressive duplicate detection). */
@@ -158,24 +167,31 @@ export const HARD_MAX_UPLOAD_MB = 20;
 // Defaults (= the existing house style and the .env configuration)
 // ------------------------------------------------------------------------------------------------
 
-const typo = (size: number, minSize: number, lineHeight: number): RoleTypography => ({
-  englishFont: 'Arial Black',
+// Intrepid ExtraBold: the font the owner uses in PixelLab (their Intreb__.ttf is the same file, checked byte for byte)
+const typo = (size: number, minSize: number, lineHeight: number, position: RoleTypography['position'] = 'middle', letterSpacing = 0): RoleTypography => ({
+  englishFont: 'Intrepid ExtraBold',
   teluguFont: 'Ramabhadra',
   weight: 'bold',
   size,
   minSize,
   maxSize: 160,
   lineHeight,
-  letterSpacing: 0,
+  letterSpacing,
   align: 'center',
-  position: 'middle'
+  position
 });
 
-const fx = (): RoleEffects => ({
+/**
+ * The house style (2026-11-24, matched to the owner's own PixelLab memes): soft lemon yellow over white, a thin dark
+ * outline with a soft offset shadow (instead of the old heavy 8 px outline that filled the gaps between letters), and
+ * a dark shade fading up behind text that sits on a picture.
+ */
+const fx = (shade = false, pattern: RoleEffects['highlight']['pattern'] = 'first', shadeOpacity = 0.65): RoleEffects => ({
   fill: { color: '#FFFFFF', opacity: 1 },
-  highlight: { enabled: true, color: '#FFE500' },
-  stroke: { enabled: true, width: 8, color: '#000000', opacity: 1 },
-  shadow: { enabled: true, color: '#000000', blur: 8, offsetX: 3, offsetY: 3, opacity: 0.95 }
+  highlight: { enabled: true, color: '#FAE944', pattern },
+  stroke: { enabled: true, width: 5, color: '#000000', opacity: 1 },
+  shadow: { enabled: true, color: '#000000', blur: 3, offsetX: 3, offsetY: 3, opacity: 0.9 },
+  shade: { enabled: shade, opacity: shadeOpacity }
 });
 
 /** Built-in defaults; the pipeline sections follow the given .env configuration when provided. */
@@ -191,22 +207,17 @@ export function defaultSettings(env?: AppConfig): AppSettings {
       roles: {
         heading: typo(48, 26, 1.08),
         labels: typo(33, 18, 1.2),
-        supporting: typo(38, 22, 1.17),
-        punchline: typo(46, 24, 1.15),
+        supporting: typo(42, 22, 1.11, 'bottom', 2),
+        punchline: typo(64, 24, 0.94, 'middle', 2),
         caption: typo(34, 20, 1.1)
       }
     },
     effects: {
       roles: {
-        heading: fx(),
+        heading: fx(false, 'alternate'),
         labels: fx(),
-        supporting: fx(),
-        punchline: {
-          fill: { color: '#FFFFFF', opacity: 1 },
-          highlight: { enabled: true, color: '#FFE500' },
-          stroke: { enabled: true, width: 4, color: '#000000', opacity: 1 },
-          shadow: { enabled: true, color: '#000000', blur: 13, offsetX: 0, offsetY: 0, opacity: 1 }
-        },
+        supporting: fx(true, 'alternate'),
+        punchline: fx(true, 'first', 1), // fades to solid black at the bottom edge
         caption: fx()
       }
     },
@@ -220,6 +231,7 @@ export function defaultSettings(env?: AppConfig): AppSettings {
       maxHeaderRatio: 0.2,
       punchlineRatio: 0.38,
       punchlineMaxGrowRatio: 0.62,
+      punchlineSetupScale: 0.82,
       imageGap: 0,
       sectionGap: 0,
       cornerRadius: 0,
@@ -232,6 +244,7 @@ export function defaultSettings(env?: AppConfig): AppSettings {
       landscapeAnchorY: 0.4,
       reactionAnchorY: 0.36,
       useFocalPoint: true,
+      trimBorders: true,
       jpegQuality: 92,
       primaryFormat: 'png',
       duplicateSensitivity: d?.duplicateHamming ?? 6,
@@ -298,9 +311,10 @@ const ROLE_TYPO_SPEC: Spec = {
 
 const ROLE_FX_SPEC: Spec = {
   fill: { color, opacity: num(0.1, 1, 0.05) },
-  highlight: { enabled: bool, color },
+  highlight: { enabled: bool, color, pattern: oneOf('first', 'alternate') },
   stroke: { enabled: bool, width: num(0, 24, 0.5, 'px'), color, opacity: num(0, 1, 0.05) },
-  shadow: { enabled: bool, color, blur: num(0, 40, 1, 'px'), offsetX: num(-20, 20, 1, 'px'), offsetY: num(-20, 20, 1, 'px'), opacity: num(0, 1, 0.05) }
+  shadow: { enabled: bool, color, blur: num(0, 40, 1, 'px'), offsetX: num(-20, 20, 1, 'px'), offsetY: num(-20, 20, 1, 'px'), opacity: num(0, 1, 0.05) },
+  shade: { enabled: bool, opacity: num(0.1, 1, 0.05) }
 };
 
 const perRole = (s: Spec): Spec => Object.fromEntries(TEXT_ROLES.map(r => [r, s]));
@@ -331,6 +345,7 @@ export const SETTINGS_SCHEMA: { [K in SettingsSection]: Spec } & { name: Spec } 
     maxHeaderRatio: num(0.12, 0.3, 0.01),
     punchlineRatio: num(0.2, 0.6, 0.01),
     punchlineMaxGrowRatio: num(0.4, 0.8, 0.01),
+    punchlineSetupScale: num(0.6, 1, 0.01),
     imageGap: num(0, 24, 1, 'px'),
     sectionGap: num(0, 24, 1, 'px'),
     cornerRadius: num(0, 40, 1, 'px'),
@@ -343,6 +358,7 @@ export const SETTINGS_SCHEMA: { [K in SettingsSection]: Spec } & { name: Spec } 
     landscapeAnchorY: num(0, 1, 0.01),
     reactionAnchorY: num(0, 1, 0.01),
     useFocalPoint: bool,
+    trimBorders: bool,
     jpegQuality: num(50, 100, 1),
     primaryFormat: oneOf('png', 'jpeg'),
     duplicateSensitivity: num(4, 10, 1),

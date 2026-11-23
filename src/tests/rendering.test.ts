@@ -207,11 +207,11 @@ describe('rendering: text, images and validation', () => {
 });
 
 describe('design profile', () => {
-  it('house style: 4:5, yellow/white/black, bold outline, no gaps or dividers', () => {
+  it('house style: 4:5, yellow/white/black, outlined text, no gaps or dividers', () => {
     const p = KANYARAASI_DEFAULT_PROFILE;
     assert.equal(p.canvas.width, 1080);
     assert.equal(p.canvas.height, 1350);
-    assert.equal(p.colors.primary, '#FFE500');
+    assert.equal(p.colors.primary, '#FAE944');
     assert.equal(p.imagery.gaps, 0);
     assert.equal(p.imagery.dividerLines, false);
     assert.ok(Math.abs(p.imagery.reactionAspect - 16 / 9) < 0.01);
@@ -221,7 +221,7 @@ describe('design profile', () => {
     assert.throws(() => mergeProfileUpdate(KANYARAASI_DEFAULT_PROFILE, { typography: { englishFont: 'Comic Sans' } }), /englishFont/);
     assert.throws(() => mergeProfileUpdate(KANYARAASI_DEFAULT_PROFILE, { colors: { primary: 'yellow' } }), /primary/);
     assert.throws(() => mergeProfileUpdate(KANYARAASI_DEFAULT_PROFILE, { punchline: 'x' }), /cannot be changed/);
-    assert.equal(profileToDesignSpecs(KANYARAASI_DEFAULT_PROFILE, 'Not A Font').fontFamily, 'Arial Black', 'unknown font override ignored');
+    assert.equal(profileToDesignSpecs(KANYARAASI_DEFAULT_PROFILE, 'Not A Font').fontFamily, 'Intrepid ExtraBold', 'unknown font override ignored');
   });
 });
 

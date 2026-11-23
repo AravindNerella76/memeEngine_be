@@ -13,6 +13,7 @@ import { ComputedMemeLayout } from './layout-engine.service';
 import { analyzeReactionImage, drawReactionPlan, drawSoftBackground, planReactionPanel } from './reaction-framing';
 import { EMOJI_FONT, ENGLISH_FONTS, FONT_FILES, TELUGU_FONTS } from '../design/fonts';
 import { ElementStyle, RenderStyle, resolveRenderStyle } from '../design/render-style';
+import { trimImageBorders } from './border-trim';
 
 export interface RenderResult {
   pngBuffer: Buffer;
@@ -254,12 +255,26 @@ export class CanvasRendererService implements OnModuleInit {
     ctx.restore();
   }
 
-  /** Word wrap against a maximum width. Explicit newlines are kept. Never drops or changes characters. */
-  wrapText(ctx: SKRSContext2D, text: string, maxWidth: number): string[] {
+  /**
+   * Word wrap against a maximum width. Explicit newlines are kept. Never drops or changes characters.
+   * `keepNumbers`: a bare number ("4", "1,200", "50%", "₹10") is never the last word of a line; it moves down with the
+   * word after it, the way a person sets "4 TRILLION" by hand.
+   */
+  wrapText(ctx: SKRSContext2D, text: string, maxWidth: number, keepNumbers = false): string[] {
     if (!text) return [];
     const resultLines: string[] = [];
     for (const paragraph of text.split('\n')) {
-      const words = paragraph.split(/\s+/).filter(w => w.length > 0);
+      let words = paragraph.split(/\s+/).filter(w => w.length > 0);
+      if (keepNumbers) {
+        const glued: string[] = [];
+        for (let i = 0; i < words.length; i++) {
+          if (/^[₹$€£]?\d[\d.,]*[%+]?$/.test(words[i]) && i + 1 < words.length) {
+            glued.push(`${words[i]} ${words[i + 1]}`); // a space inside one "word": wrapping never splits them
+            i++;
+          } else glued.push(words[i]);
+        }
+        words = glued;
+      }
       if (words.length === 0) continue;
       let currentLine = '';
       for (const word of words) {
@@ -347,7 +362,7 @@ export class CanvasRendererService implements OnModuleInit {
     this.setSpacing(ctx, el);
     for (let size = start; size >= minSize; size -= 2) {
       ctx.font = this.fontFor(text, el, size);
-      const lines = this.wrapText(ctx, text, box.width);
+      const lines = this.wrapText(ctx, text, box.width, el.keepNumbersWithWords);
       if (lines.some(l => ctx.measureText(l).width > box.width)) continue;
       const lineH = Math.round(size * lineHeight);
       if (lines.length * lineH <= box.height) return { size, lines, lineH };
@@ -365,6 +380,51 @@ export class CanvasRendererService implements OnModuleInit {
     return box.y + (box.height - totalH) / 2 + lineH / 2;
   }
 
+  /** Heading and supporting text: is line `idx` one of the highlighted ones (the first, or every other one)? */
+  private patternLine(el: ElementStyle, idx: number): boolean {
+    return el.highlightPattern === 'alternate' ? idx % 2 === 0 : idx === 0;
+  }
+
+  /** Top and bottom of a fitted text block as drawFitted places it. */
+  private blockBounds(fit: FitResult, box: BoundingBox, el: ElementStyle): { top: number; bottom: number } {
+    const top = this.firstLineY(box, fit.lines.length * fit.lineH, fit.lineH, el) - fit.lineH / 2;
+    return { top, bottom: top + fit.lines.length * fit.lineH };
+  }
+
+  /**
+   * A dark shade behind text that sits on a picture: clear well above the text, fully dark from a little below its top
+   * line down to the bottom of the picture. It keeps the words readable on any picture without a hard-edged box.
+   */
+  private drawShade(ctx: SKRSContext2D, area: BoundingBox, text: { top: number; bottom: number }, alpha: number, mode: 'soft' | 'fade' = 'soft') {
+    if (!(alpha > 0)) return;
+    const h = Math.max(1, text.bottom - text.top);
+    const end = area.y + area.height;
+    // soft: clear well above the text, evenly dark from just below its top line to the bottom of the picture.
+    // fade (the punchline, as the owner sets it in PixelLab): the picture is untouched behind the words and darkens
+    // only from about three quarters down the text block, reaching `alpha` (solid black by default) at the bottom edge.
+    const start = mode === 'fade' ? Math.max(area.y, text.top + h * 0.72) : Math.max(area.y, text.top - h * 0.9 - 24);
+    if (end <= start) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(area.x, area.y, area.width, area.height);
+    ctx.clip();
+    const g = ctx.createLinearGradient(0, start, 0, end);
+    const at = (y: number) => Math.max(0, Math.min(1, (y - start) / (end - start)));
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    if (mode === 'fade') {
+      g.addColorStop(0.5, `rgba(0,0,0,${(alpha * 0.55).toFixed(3)})`);
+      g.addColorStop(0.85, `rgba(0,0,0,${(alpha * 0.92).toFixed(3)})`);
+    } else {
+      const full = Math.min(end, Math.max(start + 1, text.top + h * 0.3));
+      g.addColorStop(at((start + full) / 2), `rgba(0,0,0,${(alpha * 0.45).toFixed(3)})`);
+      g.addColorStop(at(full), `rgba(0,0,0,${alpha.toFixed(3)})`);
+    }
+    g.addColorStop(1, `rgba(0,0,0,${alpha.toFixed(3)})`);
+    ctx.fillStyle = g;
+    ctx.fillRect(area.x, start, area.width, end - start);
+    ctx.restore();
+  }
+
   private drawFitted(ctx: SKRSContext2D, fit: FitResult, box: BoundingBox, el: ElementStyle, highlightLine: (lineIdx: number, line: string) => boolean) {
     const startY = this.firstLineY(box, fit.lines.length * fit.lineH, fit.lineH, el);
     const x = this.anchorX(box, el);
@@ -376,15 +436,13 @@ export class CanvasRendererService implements OnModuleInit {
   }
 
   /**
-   * Reaction punchline drawing:
+   * Where each punchline line goes:
    * - Anchored low on the reaction image panel (near bottom).
-   * - 4px stroke with 13px blur shadow (matching house style).
-   * - Multi-line hierarchy: when 2 lines are present, line 1 is setup (yellow highlight, ~74% font size),
-   *   and line 2 is the punchline delivery (white fill, 100% font size, larger than line 1).
+   * - Multi-line hierarchy: when 2 lines are present, line 1 is setup (yellow highlight, `setupScale` of the size: 0.74
+   *   originally, 0.84 in the house style), and line 2 is the punchline delivery (white fill, full size).
    */
-  private drawPunchline(ctx: SKRSContext2D, fit: FitResult, box: BoundingBox, el: ElementStyle) {
+  private punchlinePlacements(ctx: SKRSContext2D, fit: FitResult, box: BoundingBox, el: ElementStyle, setupScale = 0.74): { line: string; size: number; y: number; h: number; color: string }[] {
     const lines = fit.lines;
-    const x = this.anchorX(box, el);
 
     // Single line punchline: render with standard position & highlight/fill
     if (lines.length <= 1) {
@@ -392,26 +450,23 @@ export class CanvasRendererService implements OnModuleInit {
       const lineH = Math.round(fit.size * el.lineHeight);
       const bottomY = box.y + box.height - 8;
       const y = el.position === 'middle' ? box.y + box.height / 2 : bottomY - lineH / 2;
-      ctx.font = this.fontFor(line, el, fit.size);
-      const color = el.highlightCss || el.fillCss;
-      this.drawStyledText(ctx, line, x, y, el, color);
-      return;
+      return [{ line, size: fit.size, y, h: lineH, color: el.highlightCss || el.fillCss }];
     }
 
-    // Two lines: line 2 is distinctly larger than line 1 (~1.35x), with line 1 in yellow and line 2 in white
+    // Two lines: line 2 is distinctly larger than line 1, with line 1 in yellow and line 2 in white
     if (lines.length === 2) {
       const line1 = lines[0];
       const line2 = lines[1];
 
       let size2 = fit.size;
-      let size1 = Math.max(el.minSize, Math.round(size2 * 0.74));
+      let size1 = Math.max(el.minSize, Math.round(size2 * setupScale));
 
       // Ensure line 2 fits horizontally within box.width
       ctx.font = this.fontFor(line2, el, size2);
       const w2 = ctx.measureText(line2).width;
       if (w2 > box.width) {
         size2 = Math.max(el.minSize, Math.floor(size2 * (box.width / w2)));
-        size1 = Math.max(el.minSize, Math.round(size2 * 0.74));
+        size1 = Math.max(el.minSize, Math.round(size2 * setupScale));
       }
 
       // Ensure line 1 fits horizontally within box.width
@@ -440,28 +495,33 @@ export class CanvasRendererService implements OnModuleInit {
         y1 = y2 - h2 / 2 - h1 / 2;
       }
 
-      // Draw Line 1 (Yellow setup)
-      ctx.font = this.fontFor(line1, el, size1);
-      const color1 = el.highlightCss || '#FFE500';
-      this.drawStyledText(ctx, line1, x, y1, el, color1);
-
-      // Draw Line 2 (White punchline, larger)
-      ctx.font = this.fontFor(line2, el, size2);
-      const color2 = el.fillCss || '#FFFFFF';
-      this.drawStyledText(ctx, line2, x, y2, el, color2);
-      return;
+      return [
+        { line: line1, size: size1, y: y1, h: h1, color: el.highlightCss || '#FFE500' },
+        { line: line2, size: size2, y: y2, h: h2, color: el.fillCss || '#FFFFFF' }
+      ];
     }
 
     // 3 or more lines: progressive scaling with last line largest
     const startY = this.firstLineY(box, fit.lines.length * fit.lineH, fit.lineH, el);
-    lines.forEach((line, idx) => {
+    return lines.map((line, idx) => {
       const isLast = idx === lines.length - 1;
       const scaleFactor = isLast ? 1.0 : 0.75 + (idx / lines.length) * 0.15;
       const lineSize = Math.max(el.minSize, Math.round(fit.size * scaleFactor));
-      ctx.font = this.fontFor(line, el, lineSize);
       const color = idx === 0 && el.highlightCss ? el.highlightCss : el.fillCss;
-      this.drawStyledText(ctx, line, x, startY + idx * fit.lineH, el, color);
+      return { line, size: lineSize, y: startY + idx * fit.lineH, h: fit.lineH, color };
     });
+  }
+
+  private drawPunchline(ctx: SKRSContext2D, fit: FitResult, box: BoundingBox, el: ElementStyle, setupScale?: number, shadeArea?: BoundingBox) {
+    const placed = this.punchlinePlacements(ctx, fit, box, el, setupScale);
+    if (shadeArea && el.shadeAlpha > 0 && placed.length) {
+      this.drawShade(ctx, shadeArea, { top: Math.min(...placed.map(p => p.y - p.h / 2)), bottom: Math.max(...placed.map(p => p.y + p.h / 2)) }, el.shadeAlpha, 'fade');
+    }
+    const x = this.anchorX(box, el);
+    for (const p of placed) {
+      ctx.font = this.fontFor(p.line, el, p.size);
+      this.drawStyledText(ctx, p.line, x, p.y, el, p.color);
+    }
   }
 
   private async loadAssetImage(p: string, what: string, loader?: (path: string) => Promise<any>) {
@@ -506,16 +566,22 @@ export class CanvasRendererService implements OnModuleInit {
       const slot = layout.subjectSlots[i];
       const asset = subjectImages[i];
       if (asset && asset.path) {
-        const img = await this.loadAssetImage(asset.path, `Subject image ${i + 1}`, options.loadImage);
+        const original = await this.loadAssetImage(asset.path, `Subject image ${i + 1}`, options.loadImage);
         const forceCover = (asset as any)?.fit === 'cover';
         const forceContain = (asset as any)?.fit === 'contain' || style.image.subjectFit === 'contain';
-        const bg = this.detectImageBackgroundColor(img);
+        const bg = this.detectImageBackgroundColor(original);
 
         // If contain is requested, or if the subject image has a uniform card/text background
         // and cover was not explicitly forced, use contain with background extension so text
         // is never cropped/overflowed and the slot is completely filled.
-        if (forceContain || (!forceCover && bg.isUniform)) {
-          this.drawContainImage(ctx, img, slot.box, radius, bg.isUniform ? bg.color : undefined);
+        if (!forceCover && bg.isUniform) {
+          this.drawContainImage(ctx, original, slot.box, radius, bg.color);
+          continue;
+        }
+        // black or white bars around the picture would become bands in the meme: cut them first
+        const img = style.image.trimBorders ? trimImageBorders(original) : original;
+        if (forceContain) {
+          this.drawContainImage(ctx, img, slot.box, radius, undefined);
           continue;
         }
         const isPortrait = (img.width / img.height) < 0.95;
@@ -562,7 +628,7 @@ export class CanvasRendererService implements OnModuleInit {
       const fit = this.fitText(ctx, headerText, headerBox, el, this.startSize(specs, 'headline', el));
       if (!fit) throw new TextFitError('headline', 'The headline does not fit in the header banner.');
       textFit.headline = { size: fit.size, lines: fit.lines.length };
-      this.drawFitted(ctx, fit, headerBox, el, idx => idx === 0);
+      this.drawFitted(ctx, fit, headerBox, el, idx => this.patternLine(el, idx));
     }
 
     // 4. Statement / quote overlay (grows upward within the subject section if needed)
@@ -580,7 +646,8 @@ export class CanvasRendererService implements OnModuleInit {
       }
       if (!fit) throw new TextFitError('statement', 'The statement text is too long for the image area.');
       textFit.statement = { size: fit.size, lines: fit.lines.length };
-      this.drawFitted(ctx, fit, box, el, (idx, line) => line.startsWith('-') || line.includes('PRODUCER') || idx === 0);
+      this.drawShade(ctx, layout.subjectSectionBox, this.blockBounds(fit, box, el), el.shadeAlpha);
+      this.drawFitted(ctx, fit, box, el, (idx, line) => line.startsWith('-') || line.includes('PRODUCER') || this.patternLine(el, idx));
     }
 
     // 5. Bullet points: one size for all bullets, each bullet may wrap
@@ -595,7 +662,7 @@ export class CanvasRendererService implements OnModuleInit {
           const lineH = Math.round(size * el.lineHeight);
           const blocks = bullets.map(t => {
             ctx.font = this.fontFor(t, el, size);
-            return this.wrapText(ctx, t, b.width);
+            return this.wrapText(ctx, t, b.width, el.keepNumbersWithWords);
           });
           const tooWide = bullets.some((t, i) => {
             ctx.font = this.fontFor(t, el, size);
@@ -617,6 +684,7 @@ export class CanvasRendererService implements OnModuleInit {
       textFit.bullets = { size: fit.size, lines: fit.blocks.reduce((a, b) => a + b.length, 0) };
       const totalLines = fit.blocks.reduce((a, b) => a + b.length, 0);
       let y = this.firstLineY(box, totalLines * fit.lineH, fit.lineH, el);
+      this.drawShade(ctx, layout.subjectSectionBox, { top: y - fit.lineH / 2, bottom: y - fit.lineH / 2 + totalLines * fit.lineH }, el.shadeAlpha);
       const x = el.align === 'center' ? width / 2 : this.anchorX(box, el);
       fit.blocks.forEach((block, idx) => {
         const color = el.highlightCss && idx % 2 === 0 ? el.highlightCss : el.fillCss;
@@ -637,7 +705,7 @@ export class CanvasRendererService implements OnModuleInit {
         const plan = planReactionPanel(analyzeReactionImage(reactionImg), framing, layout.reactionBox, style.image.reactionAnchorY);
         if (plan.kind === 'single' && !framing?.focus?.length) {
           // one picture, no choice made: the long-standing crop, unchanged
-          this.drawIntelligentCoverImage(ctx, reactionImg, layout.reactionBox, {
+          this.drawIntelligentCoverImage(ctx, style.image.trimBorders ? trimImageBorders(reactionImg) : reactionImg, layout.reactionBox, {
             isReaction: true,
             anchorX: 0.5,
             anchorY: style.image.reactionAnchorY,
@@ -679,7 +747,7 @@ export class CanvasRendererService implements OnModuleInit {
         throw new TextFitError('punchline', `The punchline (${punchText.length} characters) is too long to render legibly in the reaction panel. It is never shortened automatically; please use a shorter punchline.`);
       }
       textFit.punchline = { size: fit.size, lines: fit.lines.length };
-      this.drawPunchline(ctx, fit, box, el);
+      this.drawPunchline(ctx, fit, box, el, style.canvas.punchlineSetupScale, layout.reactionBox || undefined);
     }
 
     this.validateOutput(ctx, layout, assets, scale);
