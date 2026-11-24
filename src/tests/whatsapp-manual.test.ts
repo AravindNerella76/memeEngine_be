@@ -12,6 +12,7 @@ function build(viral: any = {}, selection: any = {}) {
   let doc: any = null;
   const make = (phoneNumber: string) => ({
     phoneNumber, state: 'IDLE', mode: 'viral', manualSubjects: [], punchline: null, reactionImagePath: null,
+    markModified() {},
     async save() { return this; }
   });
   const model: any = {
@@ -68,6 +69,27 @@ describe('WhatsApp manual flow', () => {
     assert.equal(input.assets.subjectImages[0].role, 'subject_primary');
     assert.equal(input.assets.reactionImage.role, 'reaction_punchline');
     assert.ok(t.sent.some(m => m.startsWith('[image]')));
+  });
+
+  it('shows the pictures numbered after "done"; the order and the labels can be fixed in one message', async () => {
+    const t = build();
+    const sheets: string[][] = [];
+    t.svc.sendSubjectSheet = async (session: any) => void sheets.push(session.manualSubjects.map((x: any) => `${x.path.split('/').pop()}:${x.label || ''}`));
+    for (const m of ['manual', '1', 'skip', 'skip']) await t.text(m);
+    for (let i = 0; i < 4; i++) await t.image('');   // sent together: they may arrive in any order
+    await t.text('done');
+    assert.equal(sheets.length, 1, 'the order is shown after done');
+    await t.text('order 2 3 1 4');
+    assert.deepEqual(sheets[sheets.length - 1], ['wa_2.jpg:', 'wa_3.jpg:', 'wa_1.jpg:', 'wa_4.jpg:']);
+    await t.text('order 1 1 2 3');                     // not every number once: refused, nothing changes
+    assert.ok(t.sent[t.sent.length - 1].includes('Send every number once'));
+    await t.text('labels 7 HILLS | 3550 STEPS | HOURS OF WAITING | 5 SEC DARSHANAM');
+    assert.deepEqual(sheets[sheets.length - 1], ['wa_2.jpg:7 HILLS', 'wa_3.jpg:3550 STEPS', 'wa_1.jpg:HOURS OF WAITING', 'wa_4.jpg:5 SEC DARSHANAM']);
+    await t.text('label 2 -');                         // "-" clears one
+    assert.equal(t.doc.manualSubjects[1].label, undefined);
+    await t.image('OM NAMO VENKATESHAYA');             // reaction + punchline: the meme gets the fixed order and labels
+    assert.deepEqual(t.engineInput.assets.subjectImages.map((a: any) => a.path.split('/').pop()), ['wa_2.jpg', 'wa_3.jpg', 'wa_1.jpg', 'wa_4.jpg']);
+    assert.deepEqual(t.engineInput.content.itemLabels, ['7 HILLS', '', 'HOURS OF WAITING', '5 SEC DARSHANAM']);
   });
 
   it('a caption on the reaction image is the punchline, and Reset clears manual state', async () => {

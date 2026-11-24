@@ -157,7 +157,7 @@ export class CanvasRendererService implements OnModuleInit {
    * Detects whether an image has a uniform card/screenshot background (e.g. tweet, news clip, quote),
    * and samples its edge color so we can extend the background to fill the container without cropping.
    */
-  detectImageBackgroundColor(img: any): { color: string; isUniform: boolean } {
+  detectImageBackgroundColor(img: any): { color: string; isUniform: boolean; share?: number } {
     try {
       const sampleW = Math.min(img.width, 160);
       const sampleH = Math.min(img.height, 160);
@@ -217,9 +217,19 @@ export class CanvasRendererService implements OnModuleInit {
       const avgG = Math.round(bestCluster.reduce((s, c) => s + c.g, 0) / (bestCluster.length || 1));
       const avgB = Math.round(bestCluster.reduce((s, c) => s + c.b, 0) / (bestCluster.length || 1));
 
+      // how much of the whole picture is that colour: a text card is mostly background; a photo with a dark frame or
+      // letterbox bars around it is not (it must fill its slot, not be shrunk onto a coloured block)
+      let share: number | undefined;
+      if (isUniform) {
+        const all = ctx.getImageData(0, 0, sampleW, sampleH).data;
+        let same = 0;
+        for (let p = 0; p < all.length; p += 4) if (Math.hypot(all[p] - avgR, all[p + 1] - avgG, all[p + 2] - avgB) < 28) same++;
+        share = same / (sampleW * sampleH);
+      }
       return {
         color: `rgb(${avgR},${avgG},${avgB})`,
-        isUniform
+        isUniform,
+        share
       };
     } catch {
       return { color: '#000000', isUniform: false };
@@ -544,7 +554,7 @@ export class CanvasRendererService implements OnModuleInit {
    * Stamps the logo on the finished meme. `auto` follows how the page places it by hand: centred on the seam of the
    * top pictures, a little above the text that sits there (or above the bottom of the pictures when there is none).
    */
-  private async drawWatermark(ctx: SKRSContext2D, wm: WatermarkSettings, layout: ComputedMemeLayout, textTop: number | null) {
+  private async drawWatermark(ctx: SKRSContext2D, wm: WatermarkSettings, layout: ComputedMemeLayout, textTop: number | null, labelTops: (number | undefined)[] = []) {
     const logo = await this.loadWatermark();
     if (!logo) return;
     const W = layout.canvasWidth;
@@ -554,10 +564,16 @@ export class CanvasRendererService implements OnModuleInit {
     const section = layout.subjectSectionBox;
     let x: number;
     let y: number;
-    if (wm.position === 'auto' && section && section.height > d * 1.6) {
+    // the top row of pictures (all of them in a side-by-side meme): the logo sits on its centre seam, above any text there
+    const slots = layout.subjectSlots || [];
+    const firstY = slots.length ? Math.min(...slots.map(s => s.box.y)) : section?.y ?? 0;
+    const topRow = slots.map((s, i) => ({ s, i })).filter(({ s }) => Math.abs(s.box.y - firstY) < 2);
+    let above = topRow.length ? Math.max(...topRow.map(({ s }) => s.box.y + s.box.height)) : section ? section.y + section.height : 0;
+    for (const { i } of topRow) if (typeof labelTops[i] === 'number') above = Math.min(above, labelTops[i] as number);
+    if (textTop !== null && textTop > firstY) above = Math.min(above, textTop);
+    if (wm.position === 'auto' && section && above - firstY > d * 1.3) {
       x = Math.round((W - d) / 2);
-      const above = textTop !== null && textTop > section.y ? textTop : section.y + section.height;
-      y = Math.round(Math.max(section.y + margin, above - d - margin * 0.6));
+      y = Math.round(Math.max(firstY + margin, above - d - margin * 0.6));
     } else {
       const pos = wm.position === 'auto' ? 'top-right' : wm.position;
       x = pos.endsWith('left') ? margin : W - d - margin;
@@ -607,6 +623,7 @@ export class CanvasRendererService implements OnModuleInit {
     ctx.fillStyle = style.canvas.background;
     ctx.fillRect(0, 0, width, height);
     let sectionTextTop: number | null = null; // top of the text over the top pictures (the logo sits just above it)
+    const labelTops: (number | undefined)[] = []; // top of each picture's caption
 
     // 1. Subject images
     const subjectImages = assets.subjectImages || [];
@@ -617,7 +634,9 @@ export class CanvasRendererService implements OnModuleInit {
         const original = await this.loadAssetImage(asset.path, `Subject image ${i + 1}`, options.loadImage);
         const forceCover = (asset as any)?.fit === 'cover';
         const forceContain = (asset as any)?.fit === 'contain' || style.image.subjectFit === 'contain';
-        const bg = this.detectImageBackgroundColor(original);
+        const found = this.detectImageBackgroundColor(original);
+        // house style rev 3: only a real text card (mostly background colour) is shown whole
+        const bg = style.rev >= 3 && found.isUniform && (found.share ?? 0) < 0.45 ? { ...found, isUniform: false } : found;
 
         // If contain is requested, or if the subject image has a uniform card/text background
         // and cover was not explicitly forced, use contain with background extension so text
@@ -663,6 +682,9 @@ export class CanvasRendererService implements OnModuleInit {
       }
       if (!fit) throw new TextFitError('label', `The label "${labelText.slice(0, 40)}" does not fit in its image section.`);
       textFit[`label${i + 1}`] = { size: fit.size, lines: fit.lines.length };
+      const bounds = this.blockBounds(fit, box, el);
+      labelTops[i] = bounds.top;
+      this.drawShade(ctx, slot.box, bounds, el.shadeAlpha, 'fade');
       this.drawFitted(ctx, fit, box, el, (idx, line) => idx === 0 && (isComparison || /\d+/.test(line)));
     }
 
@@ -801,7 +823,7 @@ export class CanvasRendererService implements OnModuleInit {
     }
 
     // 9. The page's logo, on the finished meme
-    if (style.watermark) await this.drawWatermark(ctx, style.watermark, layout, sectionTextTop);
+    if (style.watermark) await this.drawWatermark(ctx, style.watermark, layout, sectionTextTop, labelTops);
 
     this.validateOutput(ctx, layout, assets, scale);
 

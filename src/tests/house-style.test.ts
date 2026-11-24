@@ -160,6 +160,19 @@ describe('text rules', () => {
   });
 });
 
+describe('layout of several pictures', () => {
+  it('4 pictures in a news or movie meme make a 2 x 2 grid, not four thin columns (comparisons keep columns)', () => {
+    const engine = new LayoutEngineService();
+    const lay = (memeType: any) => engine.calculateLayout({ memeType, subjectCount: 4, hasHeader: false, hasPunchline: true, subjectAspectRatios: [1, 1, 1, 1], reactionAspectRatio: 16 / 9 } as any);
+    for (const t of ['trending_news', 'movie_update', 'facts_collage']) {
+      const l = lay(t);
+      assert.equal(l.arrangement, 'grid_2x2', t);
+      assert.equal(new Set(l.subjectSlots.map((s: any) => s.box.y)).size, 2, `${t}: two rows`);
+    }
+    assert.equal(lay('comparison').arrangement, 'columns_4');
+  });
+});
+
 describe('rendering in the house style', () => {
   const layoutEngine = new LayoutEngineService();
   const renderer = new CanvasRendererService();

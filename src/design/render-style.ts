@@ -35,7 +35,8 @@ export interface StyleSnapshot {
   version: 2;
   /**
    * Text rules in force when the snapshot was taken. 2 (2026-11-24): a number stays on the line of the word after it
-   * ("4 TRILLION", never "OVER 4" / "TRILLION"). Missing on older snapshots, which keep wrapping as they did.
+   * ("4 TRILLION", never "OVER 4" / "TRILLION"). 3 (2026-11-24): a picture counts as a text card (shown whole) only
+   * when most of it is its background colour. Missing on older snapshots, which keep everything as it was.
    */
   rev?: number;
   roles: Record<TextRoleId, { typography: RoleTypography; effects: RoleEffects }>;
@@ -70,7 +71,7 @@ export function styleSnapshotFromSettings(s: AppSettings): StyleSnapshot {
   const ip = s.imageProcessing;
   return {
     version: 2,
-    rev: 2,
+    rev: 3,
     roles: Object.fromEntries(TEXT_ROLES.map(r => [r, { typography: clone(s.typography.roles[r]), effects: clone(s.effects.roles[r]) }])) as StyleSnapshot['roles'],
     canvas: clone(s.canvas),
     image: {
@@ -166,6 +167,8 @@ export interface RenderStyle {
   image: { subjectFit: 'cover' | 'contain'; reactionFit: 'cover' | 'contain'; portraitAnchorY: number; landscapeAnchorY: number; reactionAnchorY: number; useFocalPoint: boolean; jpegQuality: number | null; trimBorders: boolean };
   /** The page's logo on the finished meme; null = none (older memes, or switched off). */
   watermark: WatermarkSettings | null;
+  /** Text and picture rules of the snapshot (see StyleSnapshot.rev); 0 for memes without one. */
+  rev: number;
 }
 
 /** The renderer's original constants (memes without a style snapshot). Do not change: old memes must render identically. */
@@ -214,7 +217,8 @@ export function legacyRenderStyle(specs: DesignSpecifications): RenderStyle {
     },
     canvas: { background: '#000000', headerBackground: specs.headerBgColor || '#000000', cornerRadius: 0, outputScale: 1, punchlineMaxGrowRatio: 0.62, maxHeaderRatio: 0.2, punchlineSetupScale: 0.74 },
     image: { subjectFit: specs.subjectFit || 'cover', reactionFit: 'cover', portraitAnchorY: 0.28, landscapeAnchorY: 0.4, reactionAnchorY: 0.36, useFocalPoint: true, jpegQuality: null, trimBorders: false },
-    watermark: null
+    watermark: null,
+    rev: 0
   };
 }
 
@@ -305,7 +309,8 @@ function snapshotRenderStyle(specs: DesignSpecifications, snap: StyleSnapshot): 
     },
     image: { ...snap.image, trimBorders: snap.image.trimBorders === true, ...(specs.subjectFit ? { subjectFit: specs.subjectFit } : {}) },
     // snapshots taken before the watermark existed have none: those memes stay exactly as they were made
-    watermark: c.watermark?.enabled ? { ...c.watermark } : null
+    watermark: c.watermark?.enabled ? { ...c.watermark } : null,
+    rev: snap.rev || 0
   };
 }
 
@@ -329,6 +334,8 @@ export interface LayoutStyle {
   minSlotSize: number;
   punchlineRatio: number;
   defaultHeaderRatio: number | null;
+  /** The snapshot's rules (StyleSnapshot.rev): 3 = captions get a box tall enough for the big house-style size. */
+  rev?: number;
 }
 
 /** Layout geometry of a meme's snapshot; undefined for older memes (the layout engine's original values). */
@@ -341,6 +348,7 @@ export function layoutStyleFromDesign(specs: DesignSpecifications | undefined): 
     sectionGap: s.canvas.sectionGap,
     minSlotSize: s.canvas.minSlotSize,
     punchlineRatio: s.canvas.punchlineRatio,
-    defaultHeaderRatio: s.canvas.headerRatio
+    defaultHeaderRatio: s.canvas.headerRatio,
+    rev: s.rev || 0
   };
 }

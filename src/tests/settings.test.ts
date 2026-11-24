@@ -39,7 +39,7 @@ describe('settings model', () => {
     assert.equal(s.canvas.aspect, 'portrait_4_5');
     assert.deepEqual(
       { h: s.typography.roles.heading.size, l: s.typography.roles.labels.size, s: s.typography.roles.supporting.size, p: s.typography.roles.punchline.size, c: s.typography.roles.caption.size },
-      { h: 48, l: 33, s: 42, p: 64, c: 34 }
+      { h: 48, l: 56, s: 42, p: 64, c: 34 }
     );
     assert.deepEqual(KANYARAASI_DEFAULT_PROFILE, {
       profileId: 'kanyaraasi-default',

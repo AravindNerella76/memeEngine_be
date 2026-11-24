@@ -219,7 +219,7 @@ export function defaultSettings(env?: AppConfig): AppSettings {
       textScales: {},
       roles: {
         heading: typo(48, 26, 1.08),
-        labels: typo(33, 18, 1.2),
+        labels: typo(56, 18, 1.1, 'middle', 1),
         supporting: typo(42, 22, 1.11, 'bottom', 2),
         punchline: typo(64, 24, 0.94, 'middle', 2),
         caption: typo(34, 20, 1.1)
@@ -228,7 +228,7 @@ export function defaultSettings(env?: AppConfig): AppSettings {
     effects: {
       roles: {
         heading: fx(false, 'alternate'),
-        labels: fx(),
+        labels: fx(true, 'first', 0.85),
         supporting: fx(true, 'alternate'),
         punchline: fx(true, 'first', 1), // fades to solid black at the bottom edge
         caption: fx()

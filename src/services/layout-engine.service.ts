@@ -192,10 +192,9 @@ export class LayoutEngineService {
         else if (subjectCount === 4) arrangement = 'columns_4';
         else if (subjectCount === 2) arrangement = 'side_by_side';
         else arrangement = 'stacked_rows';
-      } else if (memeType === 'trending_news') {
-        arrangement = subjectCount === 1 ? 'single_hero' : 'side_by_side';
-      } else if (memeType === 'movie_update') {
-        arrangement = subjectCount === 1 ? 'single_hero' : 'side_by_side';
+      } else if (memeType === 'trending_news' || memeType === 'movie_update') {
+        // 3 pictures side by side, 4 in a 2 x 2 grid (four thin columns crop every picture to a sliver)
+        arrangement = subjectCount === 1 ? 'single_hero' : subjectCount === 2 ? 'side_by_side' : subjectCount === 3 ? 'columns_3' : subjectCount === 4 ? 'grid_2x2' : 'stacked_rows';
       } else {
         arrangement = subjectCount === 1 ? 'single_hero' : (subjectCount === 2 ? 'side_by_side' : 'grid_2x2');
       }
@@ -266,6 +265,8 @@ export class LayoutEngineService {
         { x: colW, y: subjectSectionBox.y + rowH, w: colW2, h: rowH2 }
       ];
 
+      // captions in the house style (rev 3) are big, like the page's own: give them the room (older memes keep 50 px)
+      const capH = (st?.rev ?? 0) >= 3 ? 78 : 50;
       for (let i = 0; i < Math.min(subjectCount, 4); i++) {
         const p = positions[i];
         subjectSlots.push({
@@ -274,9 +275,9 @@ export class LayoutEngineService {
           box: { x: p.x, y: p.y, width: p.w, height: p.h },
           labelBox: {
             x: p.x + 10,
-            y: p.y + p.h - 58,
+            y: p.y + p.h - capH - 8,
             width: p.w - 20,
-            height: 50
+            height: capH
           },
           targetAspectRatio: p.w / p.h
         });

@@ -1802,6 +1802,7 @@ export class WhatsAppService {
           await this.sendTextMessage(from, '✅ Set to *Fill & Crop*. Send more images, or *done*.');
           return;
         }
+        if (await this.subjectOrderCommand(session, from, text)) return;
         if (['done', 'next', 'finish'].includes(lower)) {
           if (!session.manualSubjects?.length) {
             await this.sendTextMessage(from, 'Please send at least one subject image first.');
@@ -1814,6 +1815,7 @@ export class WhatsAppService {
           session.state = 'MANUAL_REACTION';
           await session.save();
           const framingNote = session.manualSubjectFit === 'contain' ? ' (Framing: *Fit Whole Image*)' : '';
+          await this.sendSubjectSheet(session, from);
           await this.sendTextMessage(from, `🎭 ${session.manualSubjects.length} subject image(s) saved${framingNote}. Now send the *reaction image* (a caption becomes the punchline).` + (await this.libraryHint()));
           return;
         }
@@ -1821,7 +1823,9 @@ export class WhatsAppService {
         return;
       }
       case 'MANUAL_REACTION':
-        await this.sendTextMessage(from, 'Please send the *reaction image*.' + (await this.libraryHint()));
+        // the order and the captions can still be fixed after the last picture
+        if (await this.subjectOrderCommand(session, from, text)) return;
+        await this.sendTextMessage(from, 'Please send the *reaction image*. (To change the subject pictures: *order 2 1 3 4*, *labels A | B | C*, or *show*.)' + (await this.libraryHint()));
         return;
       case 'MANUAL_PUNCHLINE':
         session.punchline = text;
@@ -1875,6 +1879,7 @@ export class WhatsAppService {
         // A saved layout has an exact number of images: continue by itself
         session.state = 'MANUAL_REACTION';
         await session.save();
+        await this.sendSubjectSheet(updated || session, from);
         await this.sendTextMessage(from, `${added} That is all ${n} images.\n🎭 Now send the *reaction image* (a caption becomes the punchline).` + (await this.libraryHint()));
         return;
       }
@@ -2443,6 +2448,88 @@ export class WhatsAppService {
     }
   }
 
+  /**
+   * Photos sent together reach the bot as separate messages, in no guaranteed order, so the subject pictures are shown
+   * back numbered (the order they will have in the meme) and can be corrected in one message:
+   *   order 2 1 3 4                     the new order, by the numbers on the sheet
+   *   labels 7 HILLS | 3550 STEPS | …   a caption for each picture, in order ("-" leaves one without)
+   *   label 3 HOURS OF WAITING          one picture's caption
+   *   show                              the sheet again
+   * Returns false when the text is none of these.
+   */
+  private async subjectOrderCommand(session: WhatsAppSessionDocument, from: string, text: string): Promise<boolean> {
+    const t = text.trim();
+    const subjects = session.manualSubjects || [];
+    const n = subjects.length;
+    if (/^(show|preview|pictures|order)$/i.test(t)) {
+      if (!n) return false;
+      await this.sendSubjectSheet(session, from);
+      return true;
+    }
+    const order = t.match(/^order[:\s]+([\d,\s]+)$/i);
+    if (order) {
+      const nums = order[1].split(/[\s,]+/).filter(Boolean).map(Number);
+      const valid = nums.length === n && nums.every(x => Number.isInteger(x) && x >= 1 && x <= n) && new Set(nums).size === n;
+      if (!valid) {
+        await this.sendTextMessage(from, `Send every number once, in the new order. For your ${n} pictures, for example: *order ${Array.from({ length: n }, (_, i) => n - i).join(' ')}*`);
+        return true;
+      }
+      session.manualSubjects = nums.map(x => subjects[x - 1]) as any;
+      session.markModified('manualSubjects');
+      await session.save();
+      await this.sendSubjectSheet(session, from, '✅ New order.');
+      return true;
+    }
+    const one = t.match(/^label\s+(\d+)[:\s]+(.+)$/is);
+    if (one) {
+      const i = Number(one[1]) - 1;
+      if (i < 0 || i >= n) {
+        await this.sendTextMessage(from, `There is no picture ${one[1]}. Pick 1 to ${n}.`);
+        return true;
+      }
+      const v = one[2].trim();
+      subjects[i].label = v === '-' ? undefined : v;
+      session.markModified('manualSubjects');
+      await session.save();
+      await this.sendSubjectSheet(session, from, `✅ Label for picture ${i + 1} set.`);
+      return true;
+    }
+    const all = t.match(/^labels?[:\s]+(.+)$/is);
+    if (all && n) {
+      const parts = all[1].split(/\s*\|\s*|\n+/).map(x => x.trim());
+      parts.slice(0, n).forEach((v, i) => (subjects[i].label = !v || v === '-' ? undefined : v));
+      session.markModified('manualSubjects');
+      await session.save();
+      await this.sendSubjectSheet(session, from, parts.length > n ? `✅ Labels set (you sent ${parts.length}, there are ${n} pictures: the extra ones were left out).` : '✅ Labels set.');
+      return true;
+    }
+    return false;
+  }
+
+  /** The subject pictures as one numbered sheet, in meme order, with their labels. */
+  private async sendSubjectSheet(session: WhatsAppSessionDocument, from: string, heading?: string): Promise<void> {
+    const subjects = session.manualSubjects || [];
+    if (!subjects.length) return;
+    try {
+      const tiles = await Promise.all(subjects.map(async s => ({ image: await fs.promises.readFile(s.path), label: s.label || undefined })));
+      const sheet = await renderSheet(tiles, {
+        title: 'Your pictures, in meme order',
+        subtitle: 'left to right, top to bottom',
+        columns: subjects.length === 4 ? 2 : Math.min(subjects.length, 3)
+      });
+      const url = await this.writeSheet(sheet);
+      const caption =
+        (heading ? `${heading}\n` : '') +
+        `This is the order they go in the meme.\n` +
+        `Wrong order? Reply *order ${subjects.map((_, i) => subjects.length - i).join(' ')}* (the numbers in the new order).\n` +
+        `Labels: *labels ${subjects.map((s, i) => s.label || `TEXT ${i + 1}`).join(' | ')}*`;
+      const sent = await this.sendPicture(from, { buffer: sheet, mimeType: 'image/jpeg', url }, caption);
+      if (!sent) await this.sendTextMessage(from, caption);
+    } catch (e: any) {
+      this.logger.warn(`Could not show the subject pictures: ${e.message}`);
+    }
+  }
+
   /** Moves the manual flow on, skipping the headline/statement questions a saved layout does not have. */
   private async manualNextStep(session: WhatsAppSessionDocument, from: string, after: 'type' | 'headline' | 'statement'): Promise<void> {
     const f = session.manualFormatId ? await this.formats.get(session.manualFormatId) : null;
@@ -2465,9 +2552,9 @@ export class WhatsAppService {
         session.manualSlotCount
           ? `🖼️ Send the *${session.manualSlotCount} subject image${session.manualSlotCount === 1 ? '' : 's'}* in layout order (left to right, top to bottom).\n` +
             `Add a *caption* to an image to use it as its label. I continue by myself after image ${session.manualSlotCount}.`
-          : `🖼️ Now send the *subject images* one by one (up to ${WhatsAppService.MAX_MANUAL_SUBJECTS}).\n` +
+          : `🖼️ Now send the *subject images* (up to ${WhatsAppService.MAX_MANUAL_SUBJECTS}), in meme order: left to right, top to bottom.\n` +
             `Add a *caption* to an image to use it as its label.\n` +
-            `Send *done* when all subject images are in.`
+            `Send *done* when all subject images are in. I then show them numbered, so the order and labels can be fixed.`
       );
     }
   }
